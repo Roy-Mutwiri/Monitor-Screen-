@@ -135,7 +135,9 @@ class LiveRules:
             if phrase_in(p, norm):
                 return Classification(LiveState.UNKNOWN, reason=f"transitional screen: '{p}'")
         has_timer = self.timer_regex.search(text) is not None
-        skip = set(self.CONTROL_RULES) if control_label else set()
+        # with OCR geometry the Go/End LIVE *control* is only ever read from the control slot (control_label); the
+        # phrase rules stay for geometry-less backends. Promos ('Top Experts Go Live!'), chips and cards never count.
+        skip = set(self.CONTROL_RULES) if (control_label or boxes) else set()
         live_ev = [e for e in (r.check(norm, has_timer) for r in self.live_rules if r.name not in skip) if e]
         not_live_ev = [e for e in (r.check(norm, has_timer) for r in self.not_live_rules if r.name not in skip) if e]
         if control_label:

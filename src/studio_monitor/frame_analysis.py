@@ -86,9 +86,10 @@ def analyze_frame(frame: Image.Image, frame_id: int, captured_at: float, capture
             x, y, x2, y2 = lc.box
             inside = [b.text for b in boxes if x - 4 <= b.cx <= x2 + 4 and y - 4 <= b.cy <= y2 + 4]
             control_label = " ".join(inside).strip()
-        elif lc is None and boxes and classifier is not None and getattr(classifier, "reocr", None) is not None:
-            # no red button located (while LIVE the slot shows the elapsed timer, which full-frame OCR tends to miss):
-            # rescan the control slot at 2x. The slot = bottom-right of the preview band, left of the right panel.
+        if not control_label and boxes and classifier is not None and getattr(classifier, "reocr", None) is not None:
+            # no red button located, or nothing readable inside a cached control box (while LIVE the slot shows the
+            # elapsed timer, which full-frame OCR tends to miss): rescan the control slot at 2x. The slot = bottom-right
+            # of the preview band, left of the right panel.
             w, h = frame.size
             rp, sb = layout.get("right_panel"), layout.get("status_bar")
             x0, x1 = int(w * 0.62), (rp.box[0] if rp is not None else int(w * 0.8))
@@ -106,6 +107,26 @@ def analyze_frame(frame: Image.Image, frame_id: int, captured_at: float, capture
                 except Exception:
                     pass
                 fa.timings_ms["control_slot_rescan"] = (mono() - t1) * 1000
+    if not control_label and boxes:
+        # last fallback: the control bar's own text (never the preview band, chips, chat or promos). The bar is the
+        # located control_bar element, or the strip just above the status bar when the layout has none.
+        from .detection.rules import normalize_text as _norm2
+        from .broadcast import phrase_in as _pin
+        w, h = frame.size
+        cb = layout.get("control_bar") if layout is not None else None
+        sb = layout.get("status_bar") if layout is not None else None
+        if cb is not None:
+            bx, by, bx2, by2 = cb.box
+        else:
+            by2 = sb.box[1] if sb is not None else int(h * 0.96)
+            bx, by, bx2 = 0, max(0, by2 - int(h * 0.08)), w
+        bar = [b for b in boxes if bx <= b.cx <= bx2 and by - 2 <= b.cy <= by2 + 2 and not fa.obscures((b.x, b.y, b.x2, b.y2), 0.5)]
+        for b in bar:
+            n = _norm2(b.text)
+            if any(_pin(p, n) for p in ("end live", "end broadcast", "end stream", "stop live", "stop streaming",
+                                        "go live", "start live", "start broadcast", "start stream", "start streaming")):
+                control_label = b.text.strip()
+                break
     end_dialog = fa.popup_of_type(END_CONFIRMATION)
     summary = fa.popup_of_type(POST_LIVE_SUMMARY)
     if end_dialog is not None and not boxes:

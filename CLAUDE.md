@@ -126,5 +126,8 @@ src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy
 - Real Studio while LIVE (2026-10-09): the red 'Go LIVE' button is replaced by the elapsed timer; no 'End LIVE' label.
   LIVE evidence = timer in the control slot (frame_analysis rescans the slot at 2x when no red control is located, score 1)
   + status-bar 'Upload: N kbps' with N>0 (score 1). Never exclude the status bar from broadcast evidence.
+  With OCR geometry the Go/End LIVE phrase rules are OFF: control evidence comes only from the located red button, the
+  2x control-slot rescan, or text inside the control bar. A promo 'Go Live' elsewhere caused a false end+restart on
+  2026-10-09 16:43 before this rule.
 - Detectors never evaluate when the broadcast is not LIVE; a 'reconnecting' overlay keeps the LIVE episode open (UNKNOWN,
   not NOT_LIVE) so RECONNECTING can be reported.
