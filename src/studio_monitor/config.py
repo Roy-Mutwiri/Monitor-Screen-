@@ -112,6 +112,11 @@ class HealthConfig:
     recover_after_seconds: float = 10.0
 
 
+@dataclass
+class UiConfig:
+    theme: str = "bootstrap-dark"   # ttkbootstrap theme name (bootstrap-dark | bootstrap-light)
+
+
 CONFIG_VERSION = 4
 
 
@@ -130,6 +135,7 @@ class AppConfig:
     health: HealthConfig = field(default_factory=HealthConfig)
     account_label: str = ""                    # optional operator label shown in broadcast alerts
     owner_name: str = ""                       # "Whose PC?" -> notification label "<owner>'s Live"
+    ui: UiConfig = field(default_factory=UiConfig)
     config_version: int = CONFIG_VERSION
 
     # -- serialisation ----------------------------------------------------
@@ -157,6 +163,9 @@ class AppConfig:
         cfg.activity = ActivityConfig(**_known(ActivityConfig, data.get("activity", {})))
         cfg.capture = CaptureConfig(**_known(CaptureConfig, data.get("capture", {})))
         cfg.health = HealthConfig(**_known(HealthConfig, data.get("health", {})))
+        cfg.ui = UiConfig(**_known(UiConfig, data.get("ui", {})))
+        if cfg.ui.theme not in ("bootstrap-dark", "bootstrap-light"):
+            cfg.ui.theme = "bootstrap-dark"
         cfg.account_label = str(data.get("account_label", "") or "")
         from .labels import validate_owner_name, OwnerNameError
         try:

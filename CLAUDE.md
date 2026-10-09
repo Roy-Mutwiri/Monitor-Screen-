@@ -43,7 +43,9 @@ src/studio_monitor/
   bot_tests.py                    getMe validation, synthetic test notifications
   telegram.py / alerts.py         Bot API client, retries, alert text
   monitor.py                      the loop that wires everything per poll
-  gui/app.py, cli.py, startup.py  Tkinter UI, CLI, HKCU Run sign-in startup
+  gui/app.py, cli.py, startup.py  ttkbootstrap 2 UI (header/sidebar/pages), CLI, HKCU Run sign-in startup
+                                  -> use bootstyle tokens ('primary', 'secondary-outline', '@success' surfaces),
+                                     Icon(name) for icons, setup_typography() fonts; tests/test_gui.py drives every button
 ```
 
 ## Commands

@@ -1,17 +1,29 @@
-"""Tkinter GUI: Monitor tab (window picker, preview, regions, status, Studio
-activity, history with per-bot delivery details) and Telegram Bots tab."""
+"""Desktop interface (Tkinter + ttkbootstrap 2).
+
+Layout: header (brand, owner label, live status pills, Start/Stop), sidebar
+navigation, pages (Monitor, Telegram Bots, History, Settings, Diagnostics)
+and a status bar. Typography follows the Windows type ramp (Segoe UI
+Variable); icons are Bootstrap Icons rendered by ttkbootstrap, not emoji.
+All network and capture work stays off the Tk thread.
+"""
 from __future__ import annotations
 
+import os
 import queue as _queue
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog
 from typing import Callable, Optional
 
+import ttkbootstrap as tb
 from PIL import Image, ImageTk
+from ttkbootstrap import Fonts, Icon, ScrolledFrame, ScrolledText, ToolTip
 
 from .. import SOURCE_LABEL, __version__
 from ..alerts import format_duration
@@ -30,17 +42,25 @@ from ..tracker import Status
 from ..win32.capture import CaptureStatus, Win32Capturer
 from ..win32.windows import WindowInfo, Win32WindowSystem, looks_like_studio, selectable_windows
 
-STATUS_COLORS = {
-    Status.STOPPED: "#9e9e9e",
-    Status.RUNNING: "#2e7d32",
-    Status.DEGRADED: "#ef6c00",
-    Status.LOST: "#c62828",
-}
-LIVE_COLORS = {"LIVE": "#c62828", "NOT_LIVE": "#1565c0", "UNKNOWN": "#757575"}
-REGION_COLORS = {"detect": "#ffeb3b", "redact": "#f44336", "live": "#00e676"}
+THEMES = {"Dark": "bootstrap-dark", "Light": "bootstrap-light"}
+PAGES = [("monitor", "Monitor", "display"), ("bots", "Telegram Bots", "robot"), ("history", "History", "clock-history"),
+         ("settings", "Settings", "gear-fill"), ("diagnostics", "Diagnostics", "activity")]
+STATUS_STYLE = {Status.STOPPED: "secondary", Status.RUNNING: "success", Status.DEGRADED: "warning", Status.LOST: "danger"}
+LIVE_STYLE = {"LIVE": "danger", "NOT_LIVE": "info", "UNKNOWN": "secondary"}
+HEALTH_STYLE = {"OK": "success", "DEGRADED": "warning", "NONE": "secondary"}
+REGION_COLORS = {"detect": "#ffcd39", "redact": "#e35d6a", "live": "#479f76"}
+BACKEND_NAMES = {"wgc": "Windows Graphics Capture", "printwindow": "PrintWindow", "desktop-crop": "Desktop crop (fallback)"}
 TOKEN_HELP = ("Enter the bot token from @BotFather. This is not your Telegram account password or a Telegram "
-              "developer API ID/API hash.\nThe token identifies the sending bot; the chat ID identifies the recipient. "
+              "developer API ID/API hash. The token identifies the sending bot; the chat ID identifies the recipient. "
               "Both are required for delivery.")
+
+
+def ico(name: str, size: int = 16, color: str = "fg"):
+    """Bootstrap icon as a Tk image (None if the glyph is unavailable)."""
+    try:
+        return Icon(name, size=size, color=color)
+    except Exception:
+        return None
 
 
 def _local(iso_utc: str) -> str:
@@ -53,15 +73,46 @@ def _local(iso_utc: str) -> str:
 
 
 def _fmt_ts(ts) -> str:
-    if not ts:
-        return "-"
-    return datetime.fromtimestamp(float(ts)).strftime("%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(float(ts)).strftime("%m-%d %H:%M:%S") if ts else "-"
+
+
+def _fmt_ts_iso(iso: str) -> str:
+    try:
+        return datetime.fromisoformat(iso).astimezone().strftime("%m-%d %H:%M")
+    except ValueError:
+        return iso
+
+
+def setup_typography() -> dict:
+    """Windows type ramp on Segoe UI Variable: body 10pt, caption 9pt, subtitle 12pt semibold, title 16pt."""
+    try:
+        Fonts.set_global_family("Segoe UI Variable Text", mono_family="Cascadia Mono")
+    except Exception:
+        pass
+    fams = set(tkfont.families())
+    body = "Segoe UI Variable Text" if "Segoe UI Variable Text" in fams else "Segoe UI"
+    display = "Segoe UI Variable Display" if "Segoe UI Variable Display" in fams else body
+    mono = "Cascadia Mono" if "Cascadia Mono" in fams else "Consolas"
+    for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+        try:
+            tkfont.nametofont(name).configure(family=body, size=10)
+        except tk.TclError:
+            pass
+    return {
+        "title": tkfont.Font(family=display, size=16, weight="bold"),
+        "subtitle": tkfont.Font(family=display, size=12, weight="bold"),
+        "strong": tkfont.Font(family=body, size=10, weight="bold"),
+        "body": tkfont.Font(family=body, size=10),
+        "caption": tkfont.Font(family=body, size=9),
+        "value": tkfont.Font(family=display, size=14, weight="bold"),
+        "mono": tkfont.Font(family=mono, size=9),
+    }
 
 
 class Background:
     """Run a callable off the Tk thread and deliver its result on the Tk thread."""
 
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Misc) -> None:
         self.root = root
         self._results: _queue.Queue = _queue.Queue()
         self.root.after(150, self._pump)
@@ -84,198 +135,106 @@ class Background:
                     pass
         except _queue.Empty:
             pass
-        self.root.after(150, self._pump)
-
-
-# ---------------------------------------------------------------- settings dialog
-
-class SettingsDialog(simpledialog.Dialog):
-    def __init__(self, parent, cfg: AppConfig):
-        self.cfg = cfg
-        super().__init__(parent, "Settings")
-
-    def _entry(self, master, row, label, key, value):
-        ttk.Label(master, text=label).grid(row=row, column=0, sticky="w", padx=4, pady=1)
-        var = tk.StringVar(value=value)
-        ttk.Entry(master, textvariable=var, width=44).grid(row=row, column=1, padx=4, pady=1)
-        self.vars[key] = var
-
-    def _check(self, master, row, label, key, value):
-        var = tk.BooleanVar(value=value)
-        ttk.Checkbutton(master, text=label, variable=var).grid(row=row, column=0, columnspan=2, sticky="w", padx=4)
-        self.bools[key] = var
-
-    def body(self, master):
-        self.vars, self.bools = {}, {}
-        c = self.cfg
-        nb = ttk.Notebook(master)
-        nb.grid(row=0, column=0, sticky="nsew")
-
-        gen = ttk.Frame(nb, padding=6); nb.add(gen, text="General")
-        r = 0
-        for label, key, value in (
-            ("Machine label", "label", c.machine_label),
-            ("Poll interval (s)", "poll", str(c.detection.poll_interval_seconds)),
-            ("Confirm polls (popups)", "confirm", str(c.detection.confirm_polls)),
-            ("Dedup cooldown (s)", "cooldown", str(c.detection.dedup_cooldown_seconds)),
-            ("Screenshot retention (days)", "retention", str(c.privacy.screenshot_retention_days)),
-            ("Max text chars in alert", "maxtext", str(c.privacy.max_text_in_alert)),
-            ("Popup rules file (blank = bundled)", "rules", c.detection.rules_file),
-            ("Delivery dead-letter age (hours)", "dead_age", str(c.telegram.delivery_max_age_hours)),
-            ("Bots delivered in parallel", "concurrency", str(c.telegram.delivery_concurrency)),
-            ("Account label in broadcast alerts (optional)", "account", c.account_label),
-            ("Capture backend (auto | wgc | printwindow)", "backend", c.capture.backend),
-            ("Health alert after degraded for (s)", "degrade_after", str(c.health.degrade_after_seconds)),
-            ("Health recovery after stable for (s)", "recover_after", str(c.health.recover_after_seconds)),
-        ):
-            self._entry(gen, r, label, key, value); r += 1
-        self._check(gen, r, "Attach screenshots to Telegram alerts", "send_shots", c.privacy.send_screenshots); r += 1
-        self._check(gen, r, "Store detected text in local incident history", "store_text", c.privacy.store_detected_text); r += 1
-        self._check(gen, r, "Also capture separate Studio dialogs/windows", "dialogs", c.detection.include_dialogs); r += 1
-        ttk.Label(gen, foreground="#555", wraplength=420, justify="left",
-                  text="Telegram bots (tokens, destinations, subscriptions) are managed in the Telegram Bots tab "
-                       "of the main window.").grid(row=r, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 0))
-
-        act = ttk.Frame(nb, padding=6); nb.add(act, text="Studio activity")
-        a = c.activity
-        r = 0
-        self._check(act, r, "Notify when Studio opens", "notify_opened", a.notify_opened); r += 1
-        self._check(act, r, "Notify when Studio closes", "notify_closed", a.notify_closed); r += 1
-        self._check(act, r, "Notify if Studio is already running when monitoring starts", "notify_already",
-                    a.notify_already_running); r += 1
-        self._check(act, r, "Not-live reminders", "reminders", a.reminders_enabled); r += 1
-        self._entry(act, r, "Offline threshold (minutes)", "threshold", str(a.offline_threshold_minutes)); r += 1
-        self._check(act, r, "Repeat reminders", "repeat", a.repeat_enabled); r += 1
-        self._entry(act, r, "Repeat interval (minutes)", "repeat_interval", str(a.repeat_interval_minutes)); r += 1
-        self._entry(act, r, "Maximum repeats", "repeat_max", str(a.repeat_max_count)); r += 1
-        self._entry(act, r, "Open screenshot timeout (s)", "open_timeout", str(a.open_screenshot_timeout_seconds)); r += 1
-        self._entry(act, r, "Close debounce (s)", "close_debounce", str(a.close_debounce_seconds)); r += 1
-        self._entry(act, r, "Max observation gap (s)", "max_gap", str(a.max_observation_gap_seconds)); r += 1
-        self._entry(act, r, "Confirm observations (live state)", "confirm_obs", str(a.confirm_observations)); r += 1
-        self._entry(act, r, "Live-state rules file (blank = bundled)", "live_rules", a.live_rules_file); r += 1
-        self._check(act, r, "Start Monitor Screen when I sign in to Windows (starts monitoring the saved target)",
-                    "signin", a.start_at_signin); r += 1
-        ttk.Label(act, foreground="#555", wraplength=420, justify="left",
-                  text="Studio activity is observed only while the monitor is running. Nothing is reported for "
-                       "periods when the monitor was stopped. Use 'Calibrate live state' in the Monitor tab to "
-                       "check the live-state rules against real Studio screenshots.").grid(
-            row=r, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 0))
-        return None
-
-    def validate(self):
         try:
-            float(self.vars["poll"].get()); int(self.vars["confirm"].get()); float(self.vars["cooldown"].get())
-            int(self.vars["retention"].get()); int(self.vars["maxtext"].get())
-            float(self.vars["threshold"].get()); float(self.vars["repeat_interval"].get()); int(self.vars["repeat_max"].get())
-            float(self.vars["open_timeout"].get()); float(self.vars["close_debounce"].get())
-            float(self.vars["max_gap"].get()); int(self.vars["confirm_obs"].get())
-            float(self.vars["dead_age"].get()); int(self.vars["concurrency"].get())
-            float(self.vars["degrade_after"].get()); float(self.vars["recover_after"].get())
-        except ValueError:
-            messagebox.showerror("Settings", "Numeric fields must be numbers.")
-            return False
-        return True
+            self.root.after(150, self._pump)
+        except tk.TclError:
+            pass
 
-    def apply(self):
-        c, v, b = self.cfg, self.vars, self.bools
-        c.machine_label = v["label"].get().strip() or c.machine_label
-        c.detection.poll_interval_seconds = max(0.5, float(v["poll"].get()))
-        c.detection.confirm_polls = max(1, int(v["confirm"].get()))
-        c.detection.dedup_cooldown_seconds = float(v["cooldown"].get())
-        c.privacy.screenshot_retention_days = int(v["retention"].get())
-        c.privacy.max_text_in_alert = int(v["maxtext"].get())
-        c.detection.rules_file = v["rules"].get().strip()
-        c.telegram.delivery_max_age_hours = max(1.0, float(v["dead_age"].get()))
-        c.telegram.delivery_concurrency = max(1, min(10, int(v["concurrency"].get())))
-        c.account_label = v["account"].get().strip()
-        c.capture.backend = v["backend"].get().strip() or "auto"
-        c.health.degrade_after_seconds = max(1.0, float(v["degrade_after"].get()))
-        c.health.recover_after_seconds = max(1.0, float(v["recover_after"].get()))
-        c.privacy.send_screenshots = b["send_shots"].get()
-        c.privacy.store_detected_text = b["store_text"].get()
-        c.detection.include_dialogs = b["dialogs"].get()
-        a = c.activity
-        a.notify_opened = b["notify_opened"].get()
-        a.notify_closed = b["notify_closed"].get()
-        a.notify_already_running = b["notify_already"].get()
-        a.reminders_enabled = b["reminders"].get()
-        a.offline_threshold_minutes = max(1.0, float(v["threshold"].get()))
-        a.repeat_enabled = b["repeat"].get()
-        a.repeat_interval_minutes = max(1.0, float(v["repeat_interval"].get()))
-        a.repeat_max_count = max(0, int(v["repeat_max"].get()))
-        a.open_screenshot_timeout_seconds = max(1.0, float(v["open_timeout"].get()))
-        a.close_debounce_seconds = max(1.0, float(v["close_debounce"].get()))
-        a.max_observation_gap_seconds = max(1.0, float(v["max_gap"].get()))
-        a.confirm_observations = max(1, int(v["confirm_obs"].get()))
-        a.live_rules_file = v["live_rules"].get().strip()
-        a.start_at_signin = b["signin"].get()
-        self.result = True
+
+class Pill(tb.Label):
+    """Compact status badge: ``set(text, style)``."""
+
+    def __init__(self, master, text: str = "-", style: str = "secondary", **kw):
+        super().__init__(master, text=text, bootstyle=f"@{style}", padding=(10, 3), **kw)
+
+    def set(self, text: str, style: str) -> None:
+        self.configure(text=text, bootstyle=f"@{style}")
+
+
+class Tile(tb.Labelframe):
+    """Stat tile: big value, caption, optional detail line."""
+
+    def __init__(self, master, title: str, fonts: dict):
+        super().__init__(master, text=f"  {title}", padding=(12, 8))
+        self.value = tb.Label(self, text="-", font=fonts["value"])
+        self.value.pack(anchor="w")
+        self.caption = tb.Label(self, text="", font=fonts["caption"], bootstyle="secondary", wraplength=230, justify="left")
+        self.caption.pack(anchor="w")
+        self.detail = tb.Label(self, text="", font=fonts["caption"], wraplength=230, justify="left")
+        self.detail.pack(anchor="w")
+
+    def set(self, value: str, caption: str = "", detail: str = "", style: str = "") -> None:
+        self.value.configure(text=value, bootstyle=style or "default")
+        self.caption.configure(text=caption)
+        self.detail.configure(text=detail)
 
 
 # ---------------------------------------------------------------- bot add/edit dialog
 
 class BotDialog(simpledialog.Dialog):
-    """Add or edit a bot. Network calls (getMe) run off the UI thread; the
-    dialog stays open until validation finishes or fails."""
+    """Add or edit a bot. getMe runs off the UI thread; the dialog stays open
+    until validation finishes or fails."""
 
     def __init__(self, parent, registry: BotRegistry, factory: ClientFactory, bg: Background, bot=None):
-        self.registry = registry
-        self.factory = factory
-        self.bg = bg
-        self.bot = bot
+        self.registry, self.factory, self.bg, self.bot = registry, factory, bg, bot
         self.result = None
         self._busy = False
         super().__init__(parent, "Edit bot" if bot else "Add bot")
 
     def body(self, master):
         b = self.bot
-        ttk.Label(master, text=TOKEN_HELP, wraplength=460, justify="left", foreground="#444").grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=4, pady=(0, 6))
-        ttk.Label(master, text="Bot name").grid(row=1, column=0, sticky="w", padx=4, pady=2)
+        tb.Label(master, text=TOKEN_HELP, wraplength=470, justify="left", bootstyle="secondary").grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=4, pady=(0, 8))
+        tb.Label(master, text="Bot name").grid(row=1, column=0, sticky="w", padx=4, pady=3)
         self.name = tk.StringVar(value=b.name if b else "")
-        ttk.Entry(master, textvariable=self.name, width=40).grid(row=1, column=1, columnspan=2, sticky="w", padx=4)
-        ttk.Label(master, text="Bot API token").grid(row=2, column=0, sticky="w", padx=4, pady=2)
+        tb.Entry(master, textvariable=self.name, width=40).grid(row=1, column=1, columnspan=2, sticky="w", padx=4)
+        tb.Label(master, text="Bot API token").grid(row=2, column=0, sticky="w", padx=4, pady=3)
         self.token = tk.StringVar()
-        self.token_entry = ttk.Entry(master, textvariable=self.token, width=40, show="•")
+        self.token_entry = tb.Entry(master, textvariable=self.token, width=40, show="•")
         self.token_entry.grid(row=2, column=1, sticky="w", padx=4)
         self._shown = False
-        ttk.Button(master, text="Show", width=6, command=self._toggle).grid(row=2, column=2, padx=2)
+        self.show_btn = tb.Button(master, image=ico("eye"), command=self._toggle, bootstyle="secondary-outline", width=3)
+        self.show_btn.grid(row=2, column=2, padx=2)
+        ToolTip(self.show_btn, text="Show / hide token")
         if b:
-            ttk.Label(master, foreground="#555", wraplength=460, justify="left",
-                      text="Leave the token blank to keep the current one. A new token is validated with getMe and "
-                           "must belong to the same bot as before (otherwise add it as a new bot).").grid(
+            tb.Label(master, bootstyle="secondary", wraplength=470, justify="left",
+                     text="Leave the token blank to keep the current one. A new token is validated with getMe and must "
+                          "belong to the same bot as before (otherwise add it as a new bot).").grid(
                 row=3, column=0, columnspan=3, sticky="w", padx=4)
-        ttk.Label(master, text="Destination chat ID").grid(row=4, column=0, sticky="w", padx=4, pady=2)
+        tb.Label(master, text="Destination chat ID").grid(row=4, column=0, sticky="w", padx=4, pady=3)
         self.chat = tk.StringVar(value=b.chat_id if b else "")
-        ttk.Entry(master, textvariable=self.chat, width=40).grid(row=4, column=1, columnspan=2, sticky="w", padx=4)
-        ttk.Label(master, text="Forum topic ID (optional)").grid(row=5, column=0, sticky="w", padx=4, pady=2)
+        tb.Entry(master, textvariable=self.chat, width=40).grid(row=4, column=1, columnspan=2, sticky="w", padx=4)
+        tb.Label(master, text="Forum topic ID (optional)").grid(row=5, column=0, sticky="w", padx=4, pady=3)
         self.topic = tk.StringVar(value=str(b.thread_id) if b and b.thread_id else "")
-        ttk.Entry(master, textvariable=self.topic, width=40).grid(row=5, column=1, columnspan=2, sticky="w", padx=4)
+        tb.Entry(master, textvariable=self.topic, width=40).grid(row=5, column=1, columnspan=2, sticky="w", padx=4)
         self.enabled = tk.BooleanVar(value=b.enabled if b else True)
-        ttk.Checkbutton(master, text="Enabled", variable=self.enabled).grid(row=6, column=0, columnspan=3, sticky="w", padx=4)
-        ttk.Label(master, text="Send this bot:").grid(row=7, column=0, sticky="nw", padx=4, pady=(6, 0))
-        subf = ttk.Frame(master)
+        tb.Checkbutton(master, text="Enabled", variable=self.enabled, bootstyle="round-toggle").grid(
+            row=6, column=0, columnspan=3, sticky="w", padx=4, pady=4)
+        tb.Label(master, text="Send this bot:").grid(row=7, column=0, sticky="nw", padx=4, pady=(6, 0))
+        subf = tb.Frame(master)
         subf.grid(row=7, column=1, columnspan=2, sticky="w")
         self.subs: dict[str, tk.BooleanVar] = {}
         current = set(b.subscriptions) if b else set(EVENT_CATEGORIES)
         for i, (key, label) in enumerate(EVENT_CATEGORIES.items()):
             var = tk.BooleanVar(value=key in current)
-            ttk.Checkbutton(subf, text=label, variable=var).grid(row=i, column=0, sticky="w")
+            tb.Checkbutton(subf, text=label, variable=var).grid(row=i, column=0, sticky="w", pady=1)
             self.subs[key] = var
         self.status = tk.StringVar(value="")
-        ttk.Label(master, textvariable=self.status, foreground="#1565c0", wraplength=460, justify="left").grid(
-            row=8, column=0, columnspan=3, sticky="w", padx=4, pady=(6, 0))
+        tb.Label(master, textvariable=self.status, bootstyle="info", wraplength=470, justify="left").grid(
+            row=8, column=0, columnspan=3, sticky="w", padx=4, pady=(8, 0))
         return self.token_entry if not b else None
 
     def _toggle(self):
         self._shown = not self._shown
         self.token_entry.configure(show="" if self._shown else "•")
+        self.show_btn.configure(image=ico("eye-slash" if self._shown else "eye"))
 
     def buttonbox(self):
-        box = ttk.Frame(self)
-        self.ok_btn = ttk.Button(box, text="Save", width=10, command=self.ok, default="active")
-        self.ok_btn.pack(side="left", padx=5, pady=5)
-        ttk.Button(box, text="Cancel", width=10, command=self.cancel).pack(side="left", padx=5, pady=5)
+        box = tb.Frame(self)
+        self.ok_btn = tb.Button(box, text="Save", width=10, command=self.ok, bootstyle="primary",
+                                image=ico("save2", color="light"), compound="left")
+        self.ok_btn.pack(side="left", padx=5, pady=8)
+        tb.Button(box, text="Cancel", width=10, command=self.cancel, bootstyle="secondary-outline").pack(side="left", padx=5, pady=8)
         self.bind("<Escape>", self.cancel)
         box.pack()
 
@@ -293,7 +252,8 @@ class BotDialog(simpledialog.Dialog):
             self._busy = True
             self.ok_btn.configure(state="disabled")
             self.status.set("Validating token with Telegram (getMe)…")
-            self.bg.run(lambda: validate_token(self.factory, token), lambda info, exc: self._validated(info, exc, token, kwargs))
+            self.bg.run(lambda: validate_token(self.factory, token),
+                        lambda info, exc: self._validated(info, exc, token, kwargs))
         else:
             self._save(kwargs, None, None)
 
@@ -319,7 +279,7 @@ class BotDialog(simpledialog.Dialog):
         except BotError as exc:
             self.status.set(str(exc))
             return
-        except Exception as exc:  # credential store etc.
+        except Exception as exc:
             self.status.set(f"Could not save: {sanitize(str(exc))}")
             return
         self.withdraw()
@@ -328,17 +288,22 @@ class BotDialog(simpledialog.Dialog):
         self.destroy()
 
 
-# ---------------------------------------------------------------- main window
+# ---------------------------------------------------------------- main application
 
 class App:
-    def __init__(self, root: tk.Tk, cfg: AppConfig, cfg_path: Path, autostart: bool = False) -> None:
+    def __init__(self, root: tk.Misc, cfg: AppConfig, cfg_path: Path, autostart: bool = False) -> None:
         self.root = root
         self.cfg = cfg
         self.cfg_path = cfg_path
+        self.style = tb.Style()
+        try:
+            self.style.theme_use(cfg.ui.theme)
+        except Exception:
+            pass
+        self.fonts = setup_typography()
         self.system = Win32WindowSystem()
         self.capturer = Win32Capturer(allow_screen_fallback=False, system=self.system)
         self.capture_service = make_capture_service(cfg, self.system)
-        self._diag_visible = False
         self.monitor: Optional[Monitor] = None
         self.monitor_thread: Optional[threading.Thread] = None
         self.events: _queue.Queue = _queue.Queue()
@@ -348,19 +313,16 @@ class App:
         self._photo = None
         self._drag_start = None
         self._drag_rect = None
-        self._monitor_capture = None
-        self._lock = threading.Lock()
-        self._history_kind = tk.StringVar(value="all")
         self._history_items: list[dict] = []
         self._detail_rows: list = []
+        self._last_activity: Optional[ActivitySnapshot] = None
         self.bg = Background(root)
 
-        # Outbox + bot registry are available even while monitoring is stopped.
         self.queue: DeliveryQueue = open_queue(cfg)
         try:
             self.registry: BotRegistry = make_registry(cfg, cfg_path, self.queue)
             self.registry_error = ""
-        except Exception as exc:  # credential store unavailable
+        except Exception as exc:
             from ..credentials import MemoryCredentialStore
             self.registry = BotRegistry(cfg, MemoryCredentialStore(), save=lambda: cfg.save(cfg_path), queue=self.queue)
             self.registry_error = sanitize(str(exc))
@@ -368,8 +330,12 @@ class App:
         self.registry.listeners.append(lambda action, bot_id: self.factory.invalidate(bot_id))
         self._migration_notes = run_migrations(cfg, cfg_path, self.registry, self.queue)
 
-        root.title(f"{SOURCE_LABEL} Monitor {__version__}")
-        root.geometry("1320x900")
+        root.title(f"Monitor Screen — {SOURCE_LABEL}")
+        try:
+            root.geometry("1360x900")
+            root.minsize(1100, 720)
+        except tk.TclError:
+            pass
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._build()
         for note in self._migration_notes:
@@ -380,206 +346,432 @@ class App:
         self._restore_target()
         self.refresh_history()
         self.refresh_bots()
+        self.refresh_settings()
         self.root.after(200, self._pump_events)
         self.root.after(500, self._refresh_preview)
         self.root.after(1000, self._refresh_capture_panel)
+        self.root.after(2000, self._refresh_diagnostics)
         if not any(b.enabled for b in self.registry.bots):
-            self.notebook.select(self.bots_tab)
-            self.log_line("Setup: add at least one Telegram bot in the Telegram Bots tab, then select the Studio "
-                          "window in the Monitor tab and start monitoring.")
+            self.show_page("bots")
+            self.log_line("Setup: add at least one Telegram bot, then select the Studio window on the Monitor page "
+                          "and start monitoring.")
         if autostart and self.cfg.target.is_set:
             self.root.after(1500, self.start)
 
-    # -- layout -----------------------------------------------------------
+    # ================================================================ layout
     def _build(self) -> None:
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill="both", expand=True)
-        self.monitor_tab = ttk.Frame(self.notebook, padding=6)
-        self.bots_tab = ttk.Frame(self.notebook, padding=6)
-        self.notebook.add(self.monitor_tab, text="  Monitor  ")
-        self.notebook.add(self.bots_tab, text="  Telegram Bots  ")
-        self._build_monitor_tab(self.monitor_tab)
-        self._build_bots_tab(self.bots_tab)
+        self._build_header()
+        body = tb.Frame(self.root)
+        body.pack(fill="both", expand=True)
+        self._build_sidebar(body)
+        self.content = tb.Frame(body, padding=(16, 12))
+        self.content.pack(side="left", fill="both", expand=True)
+        self.pages: dict[str, tb.Frame] = {key: tb.Frame(self.content) for key, _t, _i in PAGES}
+        self._build_monitor_page(self.pages["monitor"])
+        self._build_bots_page(self.pages["bots"])
+        self._build_history_page(self.pages["history"])
+        self._build_settings_page(self.pages["settings"])
+        self._build_diagnostics_page(self.pages["diagnostics"])
+        self._build_statusbar()
+        self.show_page("monitor")
 
-    def _build_monitor_tab(self, outer) -> None:
-        owner = ttk.Frame(outer)
-        owner.pack(fill="x", pady=(0, 6))
-        ttk.Label(owner, text="Whose PC?", font=("Segoe UI", 10, "bold")).pack(side="left")
+    def _build_header(self) -> None:
+        hdr = tb.Frame(self.root, padding=(16, 10))
+        hdr.pack(fill="x")
+        brand = tb.Frame(hdr)
+        brand.pack(side="left")
+        tb.Label(brand, image=ico("broadcast", size=28, color="primary")).pack(side="left", padx=(0, 10))
+        tt = tb.Frame(brand)
+        tt.pack(side="left")
+        tb.Label(tt, text="Monitor Screen", font=self.fonts["title"]).pack(anchor="w")
+        tb.Label(tt, text=f"{SOURCE_LABEL} · v{__version__}", font=self.fonts["caption"], bootstyle="secondary").pack(anchor="w")
+
+        owner = tb.Frame(hdr)
+        owner.pack(side="left", padx=(36, 0))
+        tb.Label(owner, text="Whose PC?", font=self.fonts["strong"]).grid(row=0, column=0, sticky="w")
         self.owner_var = tk.StringVar(value=self.cfg.owner_name)
-        entry = ttk.Entry(owner, textvariable=self.owner_var, width=28)
-        entry.pack(side="left", padx=6)
+        entry = tb.Entry(owner, textvariable=self.owner_var, width=22)
+        entry.grid(row=1, column=0, sticky="w")
         entry.bind("<Return>", lambda e: self.save_owner())
-        ttk.Button(owner, text="Save", command=self.save_owner).pack(side="left")
+        self.owner_save_btn = tb.Button(owner, text="Save", command=self.save_owner, bootstyle="primary-outline",
+                                        image=ico("save2", color="primary"), compound="left")
+        self.owner_save_btn.grid(row=1, column=1, padx=(6, 0))
         self.owner_label_var = tk.StringVar()
-        ttk.Label(owner, textvariable=self.owner_label_var, foreground="#1565c0").pack(side="left", padx=12)
-        ttk.Label(owner, text=f"e.g. Roy  \u2192  notifications say \u201cRoy\u2019s Live\u201d (max {MAX_OWNER_NAME} chars; "
-                              "blank = machine label)", foreground="#666").pack(side="left")
+        tb.Label(owner, textvariable=self.owner_label_var, font=self.fonts["caption"], bootstyle="info").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ToolTip(entry, text=f"Example: Roy → notifications say “Roy’s Live”. Max {MAX_OWNER_NAME} characters; "
+                            "blank uses the machine label.")
         self._show_owner_label()
 
-        top = ttk.Panedwindow(outer, orient="horizontal")
+        right = tb.Frame(hdr)
+        right.pack(side="right")
+        self.start_btn = tb.Button(right, text="Start monitoring", command=self.start, bootstyle="success",
+                                   image=ico("play-fill", color="light"), compound="left")
+        self.start_btn.pack(side="right")
+        self.stop_btn = tb.Button(right, text="Stop", command=self.stop, bootstyle="danger-outline", state="disabled",
+                                  image=ico("stop-fill", color="danger"), compound="left")
+        self.stop_btn.pack(side="right", padx=8)
+        pills = tb.Frame(hdr)
+        pills.pack(side="right", padx=(0, 24))
+        self.pill_monitor = Pill(pills, "STOPPED", "secondary")
+        self.pill_capture = Pill(pills, "Capture: not started", "secondary")
+        self.pill_live = Pill(pills, "Broadcast: unknown", "secondary")
+        for p in (self.pill_monitor, self.pill_capture, self.pill_live):
+            p.pack(side="left", padx=4)
+        ToolTip(self.pill_monitor, text="Monitoring status (RUNNING / DEGRADED / LOST / STOPPED)")
+        ToolTip(self.pill_capture, text="Capture health of the selected Studio window")
+        ToolTip(self.pill_live, text="Confirmed broadcast state from Studio UI evidence")
+        tb.Separator(self.root).pack(fill="x")
+
+    def _build_sidebar(self, body) -> None:
+        side = tb.Frame(body, padding=(8, 12), width=190)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+        self.nav_var = tk.StringVar(value="monitor")
+        self.nav_buttons: dict[str, tb.Radiobutton] = {}
+        for key, title, icon in PAGES:
+            btn = tb.Radiobutton(side, text=f"  {title}", value=key, variable=self.nav_var, bootstyle="toolbutton",
+                                 image=ico(icon, size=18), compound="left", command=lambda k=key: self.show_page(k),
+                                 padding=(10, 8), width=18)
+            btn.pack(fill="x", pady=2)
+            self.nav_buttons[key] = btn
+        tb.Separator(body, orient="vertical").pack(side="left", fill="y")
+
+    def _build_statusbar(self) -> None:
+        tb.Separator(self.root).pack(fill="x")
+        bar = tb.Frame(self.root, padding=(16, 4))
+        bar.pack(fill="x")
+        self.status_var = tk.StringVar(value="Ready.")
+        tb.Label(bar, textvariable=self.status_var, font=self.fonts["caption"], bootstyle="secondary").pack(side="left")
+        self.queue_var = tk.StringVar(value="")
+        tb.Label(bar, textvariable=self.queue_var, font=self.fonts["caption"], bootstyle="secondary").pack(side="right")
+
+    def show_page(self, key: str) -> None:
+        for frame in self.pages.values():
+            frame.pack_forget()
+        self.pages[key].pack(fill="both", expand=True)
+        self.nav_var.set(key)
+        if key == "history":
+            self.refresh_history()
+        elif key == "bots":
+            self.refresh_bots()
+        elif key == "diagnostics":
+            self._refresh_diagnostics(once=True)
+
+    def open_settings(self) -> None:
+        self.show_page("settings")
+
+    # ---------------------------------------------------------------- monitor page
+    def _build_monitor_page(self, page) -> None:
+        top = tb.Panedwindow(page, orient="horizontal")
         top.pack(fill="both", expand=True)
 
-        left = ttk.Labelframe(top, text=f"1. Select your {SOURCE_LABEL} window", padding=6)
+        left = tb.Labelframe(top, text="  Studio window", padding=10)
         top.add(left, weight=1)
         cols = ("title", "process", "pid", "size")
-        self.tree = ttk.Treeview(left, columns=cols, show="headings", height=10, selectmode="browse")
-        for col, text, width in (("title", "Window title", 240), ("process", "Process", 140), ("pid", "PID", 60), ("size", "Size", 80)):
+        self.tree = tb.Treeview(left, columns=cols, show="headings", height=9, selectmode="browse", bootstyle="primary")
+        for col, text, width in (("title", "Window title", 230), ("process", "Process", 140), ("pid", "PID", 60), ("size", "Size", 80)):
             self.tree.heading(col, text=text)
             self.tree.column(col, width=width, anchor="w")
-        self.tree.tag_configure("studio", background="#e3f2fd")
+        self.tree.tag_configure("studio", foreground=self.style.colors.primary)
         self.tree.pack(fill="both", expand=True)
-        btns = ttk.Frame(left)
-        btns.pack(fill="x", pady=4)
-        ttk.Button(btns, text="Refresh", command=self.refresh_windows).pack(side="left")
-        ttk.Button(btns, text="Use selected window", command=self.use_selected).pack(side="left", padx=4)
+        row = tb.Frame(left)
+        row.pack(fill="x", pady=(8, 0))
+        self.refresh_btn = tb.Button(row, text="Refresh", command=self.refresh_windows, bootstyle="secondary-outline",
+                                     image=ico("arrow-clockwise"), compound="left")
+        self.refresh_btn.pack(side="left")
+        self.use_btn = tb.Button(row, text="Use selected window", command=self.use_selected, bootstyle="primary",
+                                 image=ico("crosshair", color="light"), compound="left")
+        self.use_btn.pack(side="left", padx=8)
+        ToolTip(self.use_btn, text="Bind capture, preview, OCR and screenshots to this window only")
         self.target_var = tk.StringVar(value="No target selected.")
-        ttk.Label(left, textvariable=self.target_var, wraplength=360, justify="left").pack(fill="x")
+        tb.Label(left, textvariable=self.target_var, wraplength=380, justify="left", font=self.fonts["caption"]).pack(
+            fill="x", pady=(8, 0))
 
-        capf = ttk.Labelframe(left, text="Capture", padding=6)
-        capf.pack(fill="x", pady=(6, 0))
-        self.cap_vars: dict[str, tk.StringVar] = {}
-        for i, (label, key) in enumerate([("Selected window", "window"), ("Capture backend", "backend"),
-                                          ("Last valid frame", "frame"), ("Capture health", "health"),
-                                          ("Broadcast state", "live2"), ("Last confirmed transition", "transition")]):
-            ttk.Label(capf, text=label + ":").grid(row=i, column=0, sticky="nw", padx=(0, 6))
-            var = tk.StringVar(value="-")
-            self.cap_vars[key] = var
-            lbl = ttk.Label(capf, textvariable=var, wraplength=250, justify="left")
-            lbl.grid(row=i, column=1, sticky="w")
-            if key == "health":
-                self.cap_health_label = lbl
-        self.diag_btn = ttk.Button(capf, text="Diagnostics \u25b8", command=self._toggle_diag)
-        self.diag_btn.grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        self.diag = tk.Text(capf, height=7, width=48, state="disabled", font=("Consolas", 8), wrap="word")
-
-        actf = ttk.Labelframe(left, text="Studio activity", padding=6)
-        actf.pack(fill="x", pady=(6, 0))
-        self.act_vars: dict[str, tk.StringVar] = {}
-        rows = [("Studio application", "app"), ("Broadcast state", "live"), ("Evidence", "evidence"),
-                ("Last confirmed observation", "confirmed"), ("Confirmed offline time", "offline"),
-                ("Time until reminder", "remaining"), ("Last lifecycle event", "event"),
-                ("Notification delivery", "delivery")]
-        for i, (label, key) in enumerate(rows):
-            ttk.Label(actf, text=label + ":").grid(row=i, column=0, sticky="nw", padx=(0, 6))
-            var = tk.StringVar(value="-")
-            self.act_vars[key] = var
-            lbl = ttk.Label(actf, textvariable=var, wraplength=250, justify="left")
-            lbl.grid(row=i, column=1, sticky="w")
-            if key == "live":
-                self.live_label = lbl
-        self.live_label.configure(font=("Segoe UI", 10, "bold"))
-
-        right = ttk.Labelframe(top, text="2. Live preview and regions (drag on the preview)", padding=6)
+        right = tb.Labelframe(top, text="  Live preview and regions", padding=10)
         top.add(right, weight=2)
-        self.canvas = tk.Canvas(right, bg="#202020", width=640, height=360, cursor="crosshair")
+        self.canvas = tk.Canvas(right, bg=self.style.colors.inputbg, highlightthickness=0, cursor="crosshair", height=330)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<ButtonPress-1>", self._drag_begin)
         self.canvas.bind("<B1-Motion>", self._drag_move)
         self.canvas.bind("<ButtonRelease-1>", self._drag_end)
-        rrow = ttk.Frame(right)
-        rrow.pack(fill="x", pady=4)
+        rrow = tb.Frame(right)
+        rrow.pack(fill="x", pady=(8, 4))
         self.region_kind = tk.StringVar(value="detect")
-        ttk.Radiobutton(rrow, text="Popup detection region", variable=self.region_kind, value="detect").pack(side="left")
-        ttk.Radiobutton(rrow, text="Redaction (privacy) region", variable=self.region_kind, value="redact").pack(side="left", padx=6)
-        ttk.Radiobutton(rrow, text="Live-status region", variable=self.region_kind, value="live").pack(side="left", padx=6)
-        ttk.Button(rrow, text="Remove selected", command=self.remove_region).pack(side="right")
-        ttk.Button(rrow, text="Clear all", command=self.clear_regions).pack(side="right", padx=4)
-        self.region_list = tk.Listbox(right, height=3)
+        tb.Label(rrow, text="Draw:", font=self.fonts["strong"]).pack(side="left")
+        for text, value, style in (("Popup detection", "detect", "warning"), ("Redaction (privacy)", "redact", "danger"),
+                                   ("Live-status", "live", "success")):
+            tb.Radiobutton(rrow, text=text, variable=self.region_kind, value=value, bootstyle=f"{style}-outline-toolbutton",
+                           padding=(8, 3)).pack(side="left", padx=3)
+        self.region_clear_btn = tb.Button(rrow, text="Clear all", command=self.clear_regions, bootstyle="secondary-link")
+        self.region_clear_btn.pack(side="right")
+        self.region_remove_btn = tb.Button(rrow, text="Remove selected", command=self.remove_region,
+                                           bootstyle="secondary-outline", image=ico("eraser"), compound="left")
+        self.region_remove_btn.pack(side="right", padx=4)
+        self.region_list = tk.Listbox(right, height=3, font=self.fonts["mono"], bg=self.style.colors.inputbg,
+                                      fg=self.style.colors.inputfg, highlightthickness=0, relief="flat")
         self.region_list.pack(fill="x")
-        ttk.Label(right, foreground="#555", wraplength=700, justify="left",
-                  text="No detection regions = scan the whole window for popups. No live-status regions = classify "
-                       "broadcast state from the whole window (less reliable). Separate dialogs are always scanned whole.").pack(anchor="w")
+        tb.Label(right, font=self.fonts["caption"], bootstyle="secondary", wraplength=720, justify="left",
+                 text="Drag on the preview to add a region. No detection regions = scan the whole window; no live-status "
+                      "regions = classify from the whole window (less reliable). Dialogs are always scanned whole.").pack(anchor="w", pady=(4, 0))
 
-        bottom = ttk.Labelframe(outer, text="3. Monitor", padding=6)
-        bottom.pack(fill="both", expand=False, pady=(6, 0))
-        srow = ttk.Frame(bottom)
-        srow.pack(fill="x")
-        self.status_label = tk.Label(srow, text="STOPPED", fg="white", bg=STATUS_COLORS[Status.STOPPED],
-                                     font=("Segoe UI", 14, "bold"), width=12)
-        self.status_label.pack(side="left", padx=(0, 8))
-        self.reason_var = tk.StringVar(value="")
-        ttk.Label(srow, textvariable=self.reason_var, wraplength=480).pack(side="left", fill="x", expand=True)
-        self.start_btn = ttk.Button(srow, text="Start monitoring", command=self.start)
-        self.start_btn.pack(side="right")
-        self.stop_btn = ttk.Button(srow, text="Stop", command=self.stop, state="disabled")
-        self.stop_btn.pack(side="right", padx=4)
-        ttk.Button(srow, text="Settings", command=self.open_settings).pack(side="right", padx=4)
-        ttk.Button(srow, text="Calibrate popups", command=self.calibrate).pack(side="right", padx=4)
-        ttk.Button(srow, text="Calibrate live state", command=self.calibrate_live).pack(side="right", padx=4)
-        self.queue_var = tk.StringVar(value="alert queue: -")
-        ttk.Label(bottom, textvariable=self.queue_var, foreground="#555").pack(anchor="w")
+        tiles = tb.Frame(page)
+        tiles.pack(fill="x", pady=(12, 0))
+        self.tile_capture = Tile(tiles, "Capture", self.fonts)
+        self.tile_studio = Tile(tiles, "Studio", self.fonts)
+        self.tile_live = Tile(tiles, "Broadcast", self.fonts)
+        self.tile_reminder = Tile(tiles, "Go-live reminder", self.fonts)
+        self.tile_delivery = Tile(tiles, "Telegram delivery", self.fonts)
+        for t in (self.tile_capture, self.tile_studio, self.tile_live, self.tile_reminder, self.tile_delivery):
+            t.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        self.tile_capture.set("Not started", "Select the Studio window to begin")
 
-        lower = ttk.Panedwindow(bottom, orient="horizontal")
-        lower.pack(fill="both", expand=True)
-        logf = ttk.Frame(lower)
-        lower.add(logf, weight=2)
-        self.log = tk.Text(logf, height=9, state="disabled", wrap="word", font=("Consolas", 9))
+        logf = tb.Labelframe(page, text="  Activity log", padding=(10, 6))
+        logf.pack(fill="both", expand=True, pady=(12, 0))
+        self.log = ScrolledText(logf, height=7, font=self.fonts["mono"], wrap="word", auto_hide=True)
         self.log.pack(fill="both", expand=True)
-        histf = ttk.Labelframe(lower, text="History (events and per-bot delivery)", padding=4)
-        lower.add(histf, weight=3)
-        hrow = ttk.Frame(histf)
-        hrow.pack(fill="x")
-        ttk.Label(hrow, text="Show:").pack(side="left")
-        for label, value in (("All", "all"), ("Restrictions", "incident"), ("Studio activity", "activity")):
-            ttk.Radiobutton(hrow, text=label, variable=self._history_kind, value=value,
-                            command=self.refresh_history).pack(side="left", padx=3)
-        ttk.Button(hrow, text="Refresh", command=self.refresh_history).pack(side="right")
-        self.retry_btn = ttk.Button(hrow, text="Retry selected delivery", command=self.retry_selected, state="disabled")
-        self.retry_btn.pack(side="right", padx=4)
-        self.history = tk.Listbox(histf, height=5, font=("Consolas", 9), exportselection=False)
-        self.history.pack(fill="x")
-        self.history.bind("<<ListboxSelect>>", lambda e: self._show_event_details())
-        self.details = ttk.Treeview(histf, columns=("bot", "dest", "status", "attempts", "msg", "error"),
-                                    show="headings", height=4, selectmode="browse")
-        for col, text, width in (("bot", "Bot", 110), ("dest", "Destination", 120), ("status", "Status", 70),
-                                 ("attempts", "Att.", 40), ("msg", "Msg id", 60), ("error", "Result", 260)):
-            self.details.heading(col, text=text)
-            self.details.column(col, width=width, anchor="w")
-        self.details.pack(fill="both", expand=True)
-        self.details.bind("<<TreeviewSelect>>", lambda e: self._update_retry_button())
+        self.log.text.configure(state="disabled")
 
-    def _build_bots_tab(self, outer) -> None:
-        head = ttk.Frame(outer)
+    # ---------------------------------------------------------------- bots page
+    def _build_bots_page(self, page) -> None:
+        head = tb.Frame(page)
         head.pack(fill="x")
-        self.bots_count = tk.StringVar(value=f"Bots: 0 / {MAX_BOTS}")
-        ttk.Label(head, textvariable=self.bots_count, font=("Segoe UI", 12, "bold")).pack(side="left")
+        tb.Label(head, text="Telegram bots", font=self.fonts["subtitle"]).pack(side="left")
+        self.bots_count_pill = Pill(head, f"Bots: 0 / {MAX_BOTS}", "primary")
+        self.bots_count_pill.pack(side="left", padx=12)
         self.bots_limit_note = tk.StringVar(value="")
-        ttk.Label(head, textvariable=self.bots_limit_note, foreground="#c62828").pack(side="left", padx=12)
-        ttk.Label(outer, text=TOKEN_HELP, wraplength=900, justify="left", foreground="#444").pack(anchor="w", pady=(4, 6))
+        tb.Label(head, textvariable=self.bots_limit_note, bootstyle="danger", font=self.fonts["caption"]).pack(side="left")
+        tb.Label(page, text=TOKEN_HELP, wraplength=960, justify="left", bootstyle="secondary", font=self.fonts["caption"]).pack(
+            anchor="w", pady=(6, 10))
 
         cols = ("name", "username", "chat", "enabled", "test", "delivery", "pending")
-        self.bots_tree = ttk.Treeview(outer, columns=cols, show="headings", height=11, selectmode="browse")
+        self.bots_tree = tb.Treeview(page, columns=cols, show="headings", height=11, selectmode="browse", bootstyle="primary")
         for col, text, width in (("name", "Name", 150), ("username", "Telegram bot", 140), ("chat", "Destination", 170),
-                                 ("enabled", "Status", 70), ("test", "Last test", 220), ("delivery", "Last delivery", 260),
+                                 ("enabled", "Status", 80), ("test", "Last test", 220), ("delivery", "Last delivery", 260),
                                  ("pending", "Pending", 60)):
             self.bots_tree.heading(col, text=text)
             self.bots_tree.column(col, width=width, anchor="w")
         self.bots_tree.pack(fill="both", expand=True)
         self.bots_tree.bind("<<TreeviewSelect>>", lambda e: self._update_bot_buttons())
-        brow = ttk.Frame(outer)
-        brow.pack(fill="x", pady=6)
-        self.add_btn = ttk.Button(brow, text="Add", command=self.add_bot)
+        bar = tb.Frame(page)
+        bar.pack(fill="x", pady=8)
+        self.add_btn = tb.Button(bar, text="Add", command=self.add_bot, bootstyle="primary", image=ico("plus-lg", color="light"),
+                                 compound="left")
         self.add_btn.pack(side="left")
-        self.bot_btns = {}
-        for text, cmd in (("Edit", self.edit_bot), ("Remove", self.remove_bot), ("Enable/Disable", self.toggle_bot),
-                          ("Validate Bot", self.validate_selected_bot), ("Send Test", self.test_selected_bot)):
-            b = ttk.Button(brow, text=text, command=cmd, state="disabled")
+        self.bot_btns: dict[str, tb.Button] = {}
+        for text, cmd, icon, style in (("Edit", self.edit_bot, "pencil-square", "secondary-outline"),
+                                       ("Remove", self.remove_bot, "trash3", "danger-outline"),
+                                       ("Enable/Disable", self.toggle_bot, "toggle-on", "secondary-outline"),
+                                       ("Validate Bot", self.validate_selected_bot, "patch-check", "info-outline"),
+                                       ("Send Test", self.test_selected_bot, "send", "success-outline")):
+            b = tb.Button(bar, text=text, command=cmd, state="disabled", bootstyle=style, image=ico(icon), compound="left")
             b.pack(side="left", padx=4)
             self.bot_btns[text] = b
-        ttk.Button(brow, text="Refresh", command=self.refresh_bots).pack(side="right")
-        ttk.Label(outer, wraplength=900, justify="left", foreground="#555",
-                  text="Validate Bot calls getMe only (nothing is sent) and shows the bot's Telegram identity; it does not "
-                       "prove the bot may post to the destination. Send Test sends an explicit test message with a synthetic "
-                       "image to this bot's destination only; the desktop is never captured for a test. Tokens are stored in "
-                       "the Windows Credential Manager, never in settings, logs or history. Disabling or removing a bot "
-                       "cancels its pending deliveries; messages Telegram already accepted cannot be recalled. Delivery is "
-                       "at-least-once: after an ambiguous timeout a retry may send a message twice.").pack(anchor="w", pady=(4, 0))
+        ToolTip(self.bot_btns["Validate Bot"], text="getMe only: checks the token, sends nothing")
+        ToolTip(self.bot_btns["Send Test"], text="Sends an explicit test message with a synthetic image to this bot only")
+        self.bots_refresh_btn = tb.Button(bar, text="Refresh", command=self.refresh_bots, bootstyle="secondary-link",
+                                          image=ico("arrow-clockwise"), compound="left")
+        self.bots_refresh_btn.pack(side="right")
+        tb.Label(page, wraplength=960, justify="left", bootstyle="secondary", font=self.fonts["caption"],
+                 text="Tokens are stored in the Windows Credential Manager, never in settings, logs or history. Disabling or "
+                      "removing a bot cancels its pending deliveries; messages Telegram already accepted cannot be recalled. "
+                      "Delivery is at-least-once: after an ambiguous timeout a retry may send a message twice.").pack(anchor="w")
         self.bots_status = tk.StringVar(value="")
-        ttk.Label(outer, textvariable=self.bots_status, foreground="#1565c0", wraplength=900, justify="left").pack(anchor="w", pady=4)
+        tb.Label(page, textvariable=self.bots_status, bootstyle="info", wraplength=960, justify="left").pack(anchor="w", pady=6)
 
-    # -- owner label -------------------------------------------------------
+    # ---------------------------------------------------------------- history page
+    def _build_history_page(self, page) -> None:
+        head = tb.Frame(page)
+        head.pack(fill="x")
+        tb.Label(head, text="History", font=self.fonts["subtitle"]).pack(side="left")
+        self._history_kind = tk.StringVar(value="all")
+        seg = tb.Frame(head)
+        seg.pack(side="left", padx=16)
+        for label, value in (("All", "all"), ("Restrictions", "incident"), ("Studio activity", "activity")):
+            tb.Radiobutton(seg, text=label, variable=self._history_kind, value=value, bootstyle="outline-toolbutton",
+                           command=self.refresh_history, padding=(10, 4)).pack(side="left")
+        self.history_refresh_btn = tb.Button(head, text="Refresh", command=self.refresh_history, bootstyle="secondary-link",
+                                             image=ico("arrow-clockwise"), compound="left")
+        self.history_refresh_btn.pack(side="right")
+        cols = ("time", "kind", "label", "owner", "delivery")
+        self.history = tb.Treeview(page, columns=cols, show="headings", height=10, selectmode="browse", bootstyle="primary")
+        for col, text, width in (("time", "Time", 120), ("kind", "Kind", 80), ("label", "Event", 260), ("owner", "Label", 150),
+                                 ("delivery", "Delivery", 320)):
+            self.history.heading(col, text=text)
+            self.history.column(col, width=width, anchor="w")
+        self.history.pack(fill="both", expand=True, pady=(8, 0))
+        self.history.bind("<<TreeviewSelect>>", lambda e: self._show_event_details())
+        tb.Label(page, text="Per-bot delivery for the selected event", font=self.fonts["strong"]).pack(anchor="w", pady=(10, 4))
+        self.details = tb.Treeview(page, columns=("bot", "dest", "status", "attempts", "msg", "error"), show="headings", height=5,
+                                   selectmode="browse", bootstyle="secondary")
+        for col, text, width in (("bot", "Bot", 130), ("dest", "Destination", 130), ("status", "Status", 80), ("attempts", "Attempts", 70),
+                                 ("msg", "Message id", 90), ("error", "Result", 420)):
+            self.details.heading(col, text=text)
+            self.details.column(col, width=width, anchor="w")
+        self.details.pack(fill="both", expand=True)
+        self.details.bind("<<TreeviewSelect>>", lambda e: self._update_retry_button())
+        bar = tb.Frame(page)
+        bar.pack(fill="x", pady=8)
+        self.retry_btn = tb.Button(bar, text="Retry selected delivery", command=self.retry_selected, state="disabled",
+                                   bootstyle="warning-outline", image=ico("arrow-repeat"), compound="left")
+        self.retry_btn.pack(side="left")
+        ToolTip(self.retry_btn, text="Re-queues only this bot's delivery; bots that already succeeded are never resent")
+        self.evidence_btn = tb.Button(bar, text="Open screenshot", command=self.open_evidence, state="disabled",
+                                      bootstyle="secondary-outline", image=ico("image"), compound="left")
+        self.evidence_btn.pack(side="left", padx=8)
+
+    # ---------------------------------------------------------------- settings page
+    def _build_settings_page(self, page) -> None:
+        head = tb.Frame(page)
+        head.pack(fill="x")
+        tb.Label(head, text="Settings", font=self.fonts["subtitle"]).pack(side="left")
+        self.settings_save_btn = tb.Button(head, text="Save settings", command=self.save_settings, bootstyle="primary",
+                                           image=ico("save2", color="light"), compound="left")
+        self.settings_save_btn.pack(side="right")
+        self.settings_revert_btn = tb.Button(head, text="Revert", command=self.refresh_settings, bootstyle="secondary-outline")
+        self.settings_revert_btn.pack(side="right", padx=8)
+        self.settings_status = tk.StringVar(value="")
+        tb.Label(page, textvariable=self.settings_status, bootstyle="info", font=self.fonts["caption"]).pack(anchor="w", pady=(2, 6))
+
+        scroller = ScrolledFrame(page, auto_hide=True)
+        scroller.pack(fill="both", expand=True)
+        self.set_vars: dict[str, tk.Variable] = {}
+        c = self.cfg
+        self.settings_spec = [
+            ("Appearance & identity", [
+                ("ui_theme", "Theme", ("choice", list(THEMES)), lambda: next((k for k, v in THEMES.items() if v == c.ui.theme), "Dark"),
+                 lambda v: setattr(c.ui, "theme", THEMES.get(v, "bootstrap-dark")), "Applies immediately."),
+                ("machine_label", "Machine label", "str", lambda: c.machine_label, lambda v: setattr(c, "machine_label", v or hostname()),
+                 "Shown as PC in notifications; also the fallback when no owner name is set."),
+                ("account_label", "Account label (optional)", "str", lambda: c.account_label, lambda v: setattr(c, "account_label", v),
+                 "Operator-entered text added to broadcast alerts. Not a verified TikTok identity."),
+            ]),
+            ("Capture & health", [
+                ("backend", "Capture backend", ("choice", ["auto", "wgc", "printwindow"]), lambda: c.capture.backend,
+                 lambda v: setattr(c.capture, "backend", v), "auto prefers Windows Graphics Capture (recommended)."),
+                ("fallback", "Allow explicit desktop-crop fallback", "bool", lambda: c.capture.allow_desktop_fallback,
+                 lambda v: setattr(c.capture, "allow_desktop_fallback", v), "Only when the window is verifiably visible at its rectangle."),
+                ("max_age", "Max frame age for evidence (s)", "float", lambda: c.capture.max_frame_age_seconds,
+                 lambda v: setattr(c.capture, "max_frame_age_seconds", max(5.0, v)), ""),
+                ("refresh", "WGC heartbeat refresh (s)", "float", lambda: c.capture.refresh_interval_seconds,
+                 lambda v: setattr(c.capture, "refresh_interval_seconds", max(3.0, v)), ""),
+                ("degrade_after", "Health alert after degraded for (s)", "float", lambda: c.health.degrade_after_seconds,
+                 lambda v: setattr(c.health, "degrade_after_seconds", max(1.0, v)), ""),
+                ("recover_after", "Health recovery after stable for (s)", "float", lambda: c.health.recover_after_seconds,
+                 lambda v: setattr(c.health, "recover_after_seconds", max(1.0, v)), ""),
+            ]),
+            ("Popup detection", [
+                ("poll", "Poll interval (s)", "float", lambda: c.detection.poll_interval_seconds,
+                 lambda v: setattr(c.detection, "poll_interval_seconds", max(0.5, v)), ""),
+                ("confirm", "Confirm polls", "int", lambda: c.detection.confirm_polls, lambda v: setattr(c.detection, "confirm_polls", max(1, v)), ""),
+                ("cooldown", "Dedup cooldown (s)", "float", lambda: c.detection.dedup_cooldown_seconds,
+                 lambda v: setattr(c.detection, "dedup_cooldown_seconds", v), ""),
+                ("dialogs", "Also capture separate Studio dialogs", "bool", lambda: c.detection.include_dialogs,
+                 lambda v: setattr(c.detection, "include_dialogs", v), ""),
+                ("rules", "Popup rules file (blank = bundled)", "str", lambda: c.detection.rules_file, lambda v: setattr(c.detection, "rules_file", v), ""),
+            ]),
+            ("Studio activity", [
+                ("notify_opened", "Notify when Studio opens", "bool", lambda: c.activity.notify_opened, lambda v: setattr(c.activity, "notify_opened", v), ""),
+                ("notify_closed", "Notify when Studio closes", "bool", lambda: c.activity.notify_closed, lambda v: setattr(c.activity, "notify_closed", v), ""),
+                ("notify_already", "Notify if already running at monitor start", "bool", lambda: c.activity.notify_already_running,
+                 lambda v: setattr(c.activity, "notify_already_running", v), ""),
+                ("reminders", "Go-live reminders", "bool", lambda: c.activity.reminders_enabled, lambda v: setattr(c.activity, "reminders_enabled", v), ""),
+                ("threshold", "Offline threshold (minutes)", "float", lambda: c.activity.offline_threshold_minutes,
+                 lambda v: setattr(c.activity, "offline_threshold_minutes", max(1.0, v)), ""),
+                ("repeat", "Repeat reminders", "bool", lambda: c.activity.repeat_enabled, lambda v: setattr(c.activity, "repeat_enabled", v), ""),
+                ("repeat_interval", "Repeat interval (minutes)", "float", lambda: c.activity.repeat_interval_minutes,
+                 lambda v: setattr(c.activity, "repeat_interval_minutes", max(1.0, v)), ""),
+                ("repeat_max", "Maximum repeats", "int", lambda: c.activity.repeat_max_count, lambda v: setattr(c.activity, "repeat_max_count", max(0, v)), ""),
+                ("open_timeout", "Open screenshot timeout (s)", "float", lambda: c.activity.open_screenshot_timeout_seconds,
+                 lambda v: setattr(c.activity, "open_screenshot_timeout_seconds", max(1.0, v)), ""),
+                ("close_debounce", "Close debounce (s)", "float", lambda: c.activity.close_debounce_seconds,
+                 lambda v: setattr(c.activity, "close_debounce_seconds", max(1.0, v)), ""),
+                ("max_gap", "Max observation gap (s)", "float", lambda: c.activity.max_observation_gap_seconds,
+                 lambda v: setattr(c.activity, "max_observation_gap_seconds", max(1.0, v)), ""),
+                ("confirm_obs", "Confirm observations (live state)", "int", lambda: c.activity.confirm_observations,
+                 lambda v: setattr(c.activity, "confirm_observations", max(1, v)), ""),
+                ("live_rules", "Live-state rules file (blank = bundled)", "str", lambda: c.activity.live_rules_file,
+                 lambda v: setattr(c.activity, "live_rules_file", v), ""),
+            ]),
+            ("Privacy & delivery", [
+                ("send_shots", "Attach screenshots to Telegram alerts", "bool", lambda: c.privacy.send_screenshots,
+                 lambda v: setattr(c.privacy, "send_screenshots", v), ""),
+                ("store_text", "Store detected text in local history", "bool", lambda: c.privacy.store_detected_text,
+                 lambda v: setattr(c.privacy, "store_detected_text", v), ""),
+                ("retention", "Screenshot retention (days)", "int", lambda: c.privacy.screenshot_retention_days,
+                 lambda v: setattr(c.privacy, "screenshot_retention_days", max(0, v)), ""),
+                ("maxtext", "Max detected-text characters in alerts", "int", lambda: c.privacy.max_text_in_alert,
+                 lambda v: setattr(c.privacy, "max_text_in_alert", max(20, v)), ""),
+                ("dead_age", "Dead-letter pending deliveries after (hours)", "float", lambda: c.telegram.delivery_max_age_hours,
+                 lambda v: setattr(c.telegram, "delivery_max_age_hours", max(1.0, v)), ""),
+                ("concurrency", "Bots delivered in parallel", "int", lambda: c.telegram.delivery_concurrency,
+                 lambda v: setattr(c.telegram, "delivery_concurrency", max(1, min(10, v))), ""),
+            ]),
+            ("Startup", [
+                ("signin", "Start Monitor Screen when I sign in to Windows", "bool", lambda: c.activity.start_at_signin,
+                 lambda v: setattr(c.activity, "start_at_signin", v),
+                 "Per-user Run key; starts monitoring the saved target. Nothing is observed while the monitor is not running."),
+            ]),
+        ]
+        for section, items in self.settings_spec:
+            card = tb.Labelframe(scroller, text=f"  {section}", padding=(12, 8))
+            card.pack(fill="x", pady=(0, 10), padx=(0, 12))
+            for r, (key, label, kind, getter, setter, hint) in enumerate(items):
+                if kind == "bool":
+                    var = tk.BooleanVar(value=bool(getter()))
+                    tb.Checkbutton(card, text=label, variable=var, bootstyle="round-toggle").grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
+                else:
+                    tb.Label(card, text=label).grid(row=r, column=0, sticky="w", pady=3, padx=(0, 12))
+                    var = tk.StringVar(value=str(getter()))
+                    if isinstance(kind, tuple):
+                        tb.Combobox(card, textvariable=var, values=kind[1], state="readonly", width=24).grid(row=r, column=1, sticky="w")
+                    else:
+                        tb.Entry(card, textvariable=var, width=36).grid(row=r, column=1, sticky="w")
+                if hint:
+                    tb.Label(card, text=hint, bootstyle="secondary", font=self.fonts["caption"], wraplength=420, justify="left").grid(
+                        row=r, column=2, sticky="w", padx=(14, 0))
+                self.set_vars[key] = var
+
+    # ---------------------------------------------------------------- diagnostics page
+    def _build_diagnostics_page(self, page) -> None:
+        head = tb.Frame(page)
+        head.pack(fill="x")
+        tb.Label(head, text="Diagnostics", font=self.fonts["subtitle"]).pack(side="left")
+        self.diag_copy_btn = tb.Button(head, text="Copy", command=self.copy_diagnostics, bootstyle="secondary-outline",
+                                       image=ico("clipboard"), compound="left")
+        self.diag_copy_btn.pack(side="right")
+        self.open_data_btn = tb.Button(head, text="Open data folder", command=self.open_data_folder, bootstyle="secondary-outline",
+                                       image=ico("folder2-open"), compound="left")
+        self.open_data_btn.pack(side="right", padx=8)
+        self.calib_live_btn = tb.Button(head, text="Calibrate live state", command=self.calibrate_live, bootstyle="info-outline",
+                                        image=ico("record-circle"), compound="left")
+        self.calib_live_btn.pack(side="right", padx=8)
+        self.calib_btn = tb.Button(head, text="Calibrate popups", command=self.calibrate, bootstyle="info-outline",
+                                   image=ico("shield-exclamation"), compound="left")
+        self.calib_btn.pack(side="right")
+        tb.Label(page, bootstyle="secondary", font=self.fonts["caption"], wraplength=960, justify="left",
+                 text="Technical details of capture, identity and delivery. Calibration runs OCR on a real Studio screenshot "
+                      "and reports which rules fire; results appear in the activity log.").pack(anchor="w", pady=(4, 8))
+        self.diag = ScrolledText(page, font=self.fonts["mono"], wrap="none", auto_hide=True)
+        self.diag.pack(fill="both", expand=True)
+        self.diag.text.configure(state="disabled")
+
+    # ================================================================ helpers
+    def log_line(self, msg: str) -> None:
+        self.log.text.configure(state="normal")
+        self.log.text.insert("end", f"{time.strftime('%H:%M:%S')}  {sanitize(msg)}\n")
+        self.log.text.see("end")
+        self.log.text.configure(state="disabled")
+        self.status_var.set(sanitize(msg)[:140])
+
+    def save(self) -> None:
+        try:
+            self.cfg.save(self.cfg_path)
+        except OSError as exc:
+            self.log_line(f"could not save config: {exc}")
+
     def _show_owner_label(self) -> None:
-        self.owner_label_var.set(f"Notifications: \u201c{self.cfg.notification_label}\u201d")
+        self.owner_label_var.set(f"Notifications: “{self.cfg.notification_label}”")
 
     def save_owner(self) -> None:
         try:
@@ -591,72 +783,28 @@ class App:
         self.owner_var.set(name)
         self.save()
         self._show_owner_label()
-        self.log_line(f"owner name saved; new notifications are labelled \u201c{self.cfg.notification_label}\u201d "
+        self.log_line(f"owner name saved; new notifications are labelled “{self.cfg.notification_label}” "
                       "(already queued notifications keep their original label)")
 
-    # -- helpers ----------------------------------------------------------
-    def log_line(self, msg: str) -> None:
-        self.log.configure(state="normal")
-        self.log.insert("end", f"{time.strftime('%H:%M:%S')}  {sanitize(msg)}\n")
-        self.log.see("end")
-        self.log.configure(state="disabled")
-
-    def save(self) -> None:
-        try:
-            self.cfg.save(self.cfg_path)
-        except OSError as exc:
-            self.log_line(f"could not save config: {exc}")
-
+    # ---------------------------------------------------------------- status rendering
     def _set_status(self, status: Status, reason: str = "") -> None:
-        self.status_label.configure(text=status.value, bg=STATUS_COLORS[status])
-        self.reason_var.set(reason)
+        self.pill_monitor.set(status.value, STATUS_STYLE[status])
+        if reason:
+            self.status_var.set(reason)
 
-    def _toggle_diag(self) -> None:
-        self._diag_visible = not self._diag_visible
-        if self._diag_visible:
-            self.diag.grid(row=7, column=0, columnspan=2, sticky="we")
-            self.diag_btn.configure(text="Diagnostics \u25be")
-        else:
-            self.diag.grid_forget()
-            self.diag_btn.configure(text="Diagnostics \u25b8")
-
-    def _show_capture(self, cs: CaptureStatus, health: str = "", reason: str = "", live: str = "",
-                      transition: str = "") -> None:
-        v = self.cap_vars
-        t = self.cfg.target
-        v["window"].set(f'"{t.title}" ({t.exe_name}, pid {t.pid})' if t.is_set else "none selected")
-        names = {"wgc": "Windows Graphics Capture (window)", "printwindow": "PrintWindow (window)",
-                 "desktop-crop": "Desktop crop (explicit fallback)"}
-        v["backend"].set(names.get(cs.backend, cs.backend or "-"))
-        if cs.last_valid_at:
-            age = max(0.0, time.time() - cs.last_valid_at)
-            v["frame"].set(f"{datetime.fromtimestamp(cs.last_valid_at):%H:%M:%S} ({age:.0f}s ago, #{cs.frames})")
-        else:
-            v["frame"].set("none yet")
+    def _show_capture(self, cs: CaptureStatus, health: str = "", reason: str = "") -> None:
         h = health or cs.health
         r = reason or cs.reason
-        text = {"OK": "OK", "DEGRADED": "Degraded", "NONE": "Not capturing"}.get(h, h)
-        v["health"].set(text + (f" \u2014 {r}" if r else ""))
-        self.cap_health_label.configure(foreground={"OK": "#2e7d32", "DEGRADED": "#ef6c00"}.get(h, "#555"))
-        if live:
-            v["live2"].set(live.replace("_", " "))
-        if transition:
-            v["transition"].set(transition)
-        if self._diag_visible:
-            d = cs.diagnostics or {}
-            lines = [f"backend={cs.backend} code={cs.code or '-'} hwnd=0x{cs.hwnd:X}",
-                     f"frames={cs.frames} session_restarts={cs.session_restarts}",
-                     f"heartbeat={'alive' if cs.heartbeat_mono and time.monotonic() - cs.heartbeat_mono < 5 else 'stalled'}",
-                     f"last_valid_mono_age={(time.monotonic() - cs.last_valid_mono):.1f}s" if cs.last_valid_mono else "last_valid=none"]
-            lines += [f"{k}={v_}" for k, v_ in d.items()]
-            if t.is_set:
-                lines.append(f"target pid={t.pid} start={t.process_start:.0f} class={t.class_name}")
-            lines.append(f"hostname={hostname()} machine_label={self.cfg.machine_label} "
-                         f"owner={self.cfg.owner_name or '(blank)'} label={self.cfg.notification_label}")
-            self.diag.configure(state="normal")
-            self.diag.delete("1.0", "end")
-            self.diag.insert("end", "\n".join(lines))
-            self.diag.configure(state="disabled")
+        backend = BACKEND_NAMES.get(cs.backend, cs.backend or "-")
+        if cs.last_valid_at:
+            age = max(0.0, time.time() - cs.last_valid_at)
+            frame = f"last frame {datetime.fromtimestamp(cs.last_valid_at):%H:%M:%S} ({age:.0f}s ago, #{cs.frames})"
+        else:
+            frame = "no frame yet"
+        text = {"OK": "OK", "DEGRADED": "Degraded", "NONE": "Not started"}.get(h, h)
+        self.tile_capture.set(text, backend if cs.backend else "", (r + ("\n" if r else "") + frame).strip(),
+                              HEALTH_STYLE.get(h, "secondary"))
+        self.pill_capture.set(f"Capture: {text}" + (f" — {r}" if r and h != "OK" else ""), HEALTH_STYLE.get(h, "secondary"))
 
     def _refresh_capture_panel(self) -> None:
         try:
@@ -667,65 +815,70 @@ class App:
         self.root.after(1000, self._refresh_capture_panel)
 
     def _show_activity(self, s: ActivitySnapshot) -> None:
-        self._show_capture(s.capture, s.health.capture, s.health.capture_reason, s.live_state, s.last_transition)
-        v = self.act_vars
-        v["app"].set(f"{s.app_state}" + (f"  (session {s.session_id})" if s.session_id else ""))
-        verified = "" if s.live_rules_verified else "  [rules unverified]"
-        v["live"].set(s.live_state.replace("_", " ") + verified)
-        self.live_label.configure(foreground=LIVE_COLORS.get(s.live_state, "#000"))
-        v["evidence"].set((s.live_evidence or s.last_observation or "-")[:160])
-        v["confirmed"].set(_local(s.last_confirmed_utc))
-        off = format_duration(s.offline_seconds) if s.episode_id else "-"
+        self._last_activity = s
+        self._show_capture(s.capture, s.health.capture, s.health.capture_reason)
+        self.tile_studio.set(s.app_state.replace("_", " ").title(), f"session {s.session_id}" if s.session_id else "",
+                             s.last_event or "", "success" if s.app_state == "RUNNING" else "secondary")
+        verified = "" if s.live_rules_verified else "rules unverified · "
+        self.tile_live.set(s.live_state.replace("_", " "),
+                           verified + (f"confirmed {_local(s.last_confirmed_utc)}" if s.last_confirmed_utc else "not confirmed"),
+                           (s.last_transition or s.live_evidence or s.last_observation or "")[:120], LIVE_STYLE.get(s.live_state, "secondary"))
+        self.pill_live.set(f"Broadcast: {s.live_state.replace('_', ' ').lower()}", LIVE_STYLE.get(s.live_state, "secondary"))
         if s.episode_id:
-            off += "  (counting)" if s.accumulating else "  (paused)"
-        v["offline"].set(off)
-        if s.remaining_seconds is None:
-            rem = "-" if not s.episode_id else ("sent" if s.reminders_sent else "disabled")
+            off = format_duration(s.offline_seconds) + ("  (counting)" if s.accumulating else "  (paused)")
+            if s.remaining_seconds is None:
+                rem = "reminder sent" if s.reminders_sent else "reminders disabled"
+            else:
+                rem = f"reminder in {format_duration(s.remaining_seconds)}"
+            self.tile_reminder.set(off, "confirmed offline time", rem,
+                                   "warning" if s.remaining_seconds is not None and s.remaining_seconds < 600 else "")
         else:
-            rem = format_duration(s.remaining_seconds)
-        v["remaining"].set(rem)
-        v["event"].set(s.last_event or "-")
+            self.tile_reminder.set("-", "no offline episode", "")
         self._show_delivery(s.delivery)
 
     def _show_delivery(self, d: dict) -> None:
         c = (d or {}).get("counts", {})
         last = (d or {}).get("last")
-        text = (f"pending {c.get('pending', 0)}, sent {c.get('sent', 0)}, failed {c.get('failed', 0)}, "
-                f"dead {c.get('dead', 0)}")
+        summary = f"{c.get('sent', 0)} sent · {c.get('pending', 0)} pending · {c.get('failed', 0) + c.get('dead', 0)} blocked"
+        detail = ""
+        style = "success" if not c.get("failed") and not c.get("dead") else "warning"
         if last:
-            text += f"; last: {last['id']} -> {last.get('bot', '?')} {last['status']}"
+            detail = f"last: {last['id']} → {last.get('bot', '?')} {last['status']}"
             if last.get("error"):
-                text += f" ({last['error'][:60]})"
-        self.act_vars["delivery"].set(text)
-        self.queue_var.set("alert queue: " + text)
+                detail += f" ({last['error'][:70]})"
+        self.tile_delivery.set(summary, "Telegram outbox", detail, style)
+        self.queue_var.set(f"Outbox: {summary}")
 
-    # -- history ----------------------------------------------------------
+    # ---------------------------------------------------------------- history
     def refresh_history(self) -> None:
         try:
             self._history_items = self.queue.history(80, self._history_kind.get())
         except Exception as exc:
             self.log_line(f"history unavailable: {exc}")
             return
-        self.history.delete(0, "end")
-        for it in self._history_items:
+        self.history.delete(*self.history.get_children())
+        for i, it in enumerate(self._history_items):
             ts = datetime.fromtimestamp(it["ts"]).strftime("%m-%d %H:%M")
-            self.history.insert("end", f"{ts} [{it['kind']}] {it['label']}: {it['detail']}"[:160])
+            self.history.insert("", "end", iid=str(i), values=(ts, it["kind"], it["label"], it.get("owner_label", ""), it["detail"]))
         self.details.delete(*self.details.get_children())
         self._detail_rows = []
         self._update_retry_button()
         self._show_delivery(self.queue.delivery_status())
 
+    def _selected_event(self) -> Optional[dict]:
+        sel = self.history.selection()
+        return self._history_items[int(sel[0])] if sel else None
+
     def _show_event_details(self) -> None:
-        sel = self.history.curselection()
         self.details.delete(*self.details.get_children())
         self._detail_rows = []
-        if not sel:
+        item = self._selected_event()
+        if item is None:
+            self._update_retry_button()
             return
-        item = self._history_items[sel[0]]
         for d in self.queue.deliveries_for(item["id"]):
             dest = d.chat_id + (f"/{d.thread_id}" if d.thread_id else "")
-            self.details.insert("", "end", iid=str(d.id), values=(d.bot_name, dest, d.status, d.attempts,
-                                                                 d.message_id or "-", d.last_error[:120]))
+            self.details.insert("", "end", iid=str(d.id), values=(d.bot_name, dest, d.status, d.attempts, d.message_id or "-", d.last_error[:160]))
             self._detail_rows.append(d)
         self._update_retry_button()
 
@@ -736,6 +889,9 @@ class App:
             d = next((x for x in self._detail_rows if str(x.id) == sel[0]), None)
             ok = d is not None and d.status in ("failed", "dead", "cancelled")
         self.retry_btn.configure(state="normal" if ok else "disabled")
+        item = self._selected_event()
+        has_shot = bool(item and item.get("evidence_path") and Path(item["evidence_path"]).exists())
+        self.evidence_btn.configure(state="normal" if has_shot else "disabled")
 
     def retry_selected(self) -> None:
         sel = self.details.selection()
@@ -743,14 +899,27 @@ class App:
             return
         if self.queue.retry_delivery(int(sel[0])):
             self.log_line(f"delivery {sel[0]} re-queued (only this bot; successful bots are not resent)")
-            if self.monitor is not None:
-                self.monitor.worker and self.monitor.worker.kick()
+            if self.monitor is not None and getattr(self.monitor, "worker", None):
+                self.monitor.worker.kick()
             else:
                 self._deliver_pending_once()
         self._show_event_details()
 
+    def open_evidence(self) -> None:
+        item = self._selected_event()
+        if item and item.get("evidence_path") and Path(item["evidence_path"]).exists():
+            self._open_path(item["evidence_path"])
+
+    def _open_path(self, path: str) -> None:
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # noqa: S606
+            else:  # pragma: no cover
+                subprocess.Popen(["xdg-open", path])
+        except OSError as exc:
+            self.log_line(f"could not open {path}: {exc}")
+
     def _deliver_pending_once(self) -> None:
-        """Without a running monitor, push due deliveries once in the background."""
         worker = DeliveryWorker(self.queue, self._send_without_monitor, concurrency=self.cfg.telegram.delivery_concurrency,
                                 on_event=lambda m: self.events.put(("event", m)))
         self.bg.run(lambda: worker.process_round(parallel=False), lambda r, e: self.refresh_history())
@@ -764,10 +933,10 @@ class App:
         result = deliver(client, d.payload, d.evidence_path)
         return result.get("message_id") if isinstance(result, dict) else None
 
-    # -- bots tab ---------------------------------------------------------
+    # ---------------------------------------------------------------- bots
     def refresh_bots(self) -> None:
         reg = self.registry
-        self.bots_count.set(f"Bots: {reg.count} / {MAX_BOTS}")
+        self.bots_count_pill.set(f"Bots: {reg.count} / {MAX_BOTS}", "primary" if reg.can_add else "warning")
         self.bots_tree.delete(*self.bots_tree.get_children())
         for b in reg.bots:
             st = self.queue.bot_stats(b.bot_id)
@@ -802,7 +971,7 @@ class App:
             return
         dlg = BotDialog(self.root, self.registry, self.factory, self.bg)
         if dlg.result is not None:
-            self.log_line(f"bot '{dlg.result.name}' added -> {dlg.result.destination}")
+            self.log_line(f"bot '{dlg.result.name}' added → {dlg.result.destination}")
         self.refresh_bots()
 
     def edit_bot(self) -> None:
@@ -820,8 +989,7 @@ class App:
             return
         pend = self.queue.bot_stats(bot.bot_id)["pending"]
         if not messagebox.askyesno("Remove bot", f"Remove '{bot.name}' ({bot.destination})?\n\nIts {pend} pending "
-                                                 f"delivery(ies) will be cancelled and its stored token deleted. "
-                                                 f"History is kept."):
+                                                 f"delivery(ies) will be cancelled and its stored token deleted. History is kept."):
             return
         try:
             self.registry.remove(bot.bot_id)
@@ -842,6 +1010,11 @@ class App:
             self.log_line(str(exc))
         self.refresh_bots()
         self.refresh_history()
+        try:
+            self.bots_tree.selection_set(bot.bot_id)
+            self._update_bot_buttons()
+        except tk.TclError:
+            pass
 
     def validate_selected_bot(self) -> None:
         bot = self._selected_bot()
@@ -878,14 +1051,127 @@ class App:
             self.refresh_history()
         self.bg.run(work, done)
 
-    # -- target selection -------------------------------------------------
+    # ---------------------------------------------------------------- settings
+    def refresh_settings(self) -> None:
+        for _section, items in self.settings_spec:
+            for key, _label, kind, getter, _setter, _hint in items:
+                var = self.set_vars[key]
+                if kind == "bool":
+                    var.set(bool(getter()))
+                else:
+                    var.set(str(getter()))
+        self.settings_status.set("")
+
+    def save_settings(self) -> None:
+        before_signin = self.cfg.activity.start_at_signin
+        before_theme = self.cfg.ui.theme
+        pending = []
+        for _section, items in self.settings_spec:
+            for key, label, kind, _getter, setter, _hint in items:
+                raw = self.set_vars[key].get()
+                try:
+                    if kind == "bool":
+                        value = bool(raw)
+                    elif kind == "int":
+                        value = int(str(raw).strip())
+                    elif kind == "float":
+                        value = float(str(raw).strip())
+                    else:
+                        value = str(raw).strip()
+                except ValueError:
+                    messagebox.showerror("Settings", f"“{label}” must be a number.")
+                    return
+                pending.append((setter, value))
+        for setter, value in pending:
+            setter(value)
+        self.save()
+        if self.cfg.ui.theme != before_theme:
+            try:
+                self.style.theme_use(self.cfg.ui.theme)
+                self.canvas.configure(bg=self.style.colors.inputbg)
+                self.region_list.configure(bg=self.style.colors.inputbg, fg=self.style.colors.inputfg)
+                self.tree.tag_configure("studio", foreground=self.style.colors.primary)
+            except Exception as exc:
+                self.log_line(f"theme change failed: {exc}")
+        if self.cfg.activity.start_at_signin != before_signin:
+            try:
+                from ..startup import apply_setting
+                apply_setting(self.cfg.activity.start_at_signin)
+                self.log_line("start at sign-in " + ("enabled" if self.cfg.activity.start_at_signin else "disabled"))
+            except Exception as exc:
+                self.log_line(f"could not update sign-in startup setting: {exc}")
+        self.refresh_settings()
+        self.settings_status.set("Settings saved." + (" Restart monitoring to apply capture/detection changes." if self.monitor else ""))
+        self.log_line("settings saved")
+
+    # ---------------------------------------------------------------- diagnostics
+    def _diagnostics_text(self) -> str:
+        t = self.cfg.target
+        cs = self.monitor.frames.status() if self.monitor is not None else self.capture_service.status()
+        a = self._last_activity
+        lines = [
+            f"Monitor Screen v{__version__}   python {sys.version.split()[0]}   theme {self.cfg.ui.theme}",
+            f"hostname={hostname()}  machine_label={self.cfg.machine_label}  owner={self.cfg.owner_name or '(blank)'}  "
+            f"label={self.cfg.notification_label}",
+            f"config={self.cfg_path}",
+            f"data={self.cfg.data_path}",
+            "",
+            "[target]",
+            (f'title="{t.title}" exe={t.exe_name} path={t.exe_path} pid={t.pid} start={t.process_start:.0f} hwnd=0x{t.hwnd:X} '
+             f'class={t.class_name}') if t.is_set else "none selected",
+            "",
+            "[capture]",
+            f"health={cs.health} code={cs.code or '-'} reason={cs.reason or '-'}",
+            f"backend={cs.backend or '-'} hwnd=0x{cs.hwnd:X} frames={cs.frames} session_restarts={cs.session_restarts}",
+            f"last_valid={datetime.fromtimestamp(cs.last_valid_at).strftime('%H:%M:%S') if cs.last_valid_at else '-'} "
+            f"heartbeat={'alive' if cs.heartbeat_mono and time.monotonic() - cs.heartbeat_mono < 5 else 'stalled'}",
+        ] + [f"{k}={v}" for k, v in (cs.diagnostics or {}).items()]
+        if a is not None:
+            h = a.health
+            lines += ["", "[health]",
+                      f"session={h.session} capture={h.capture} ({h.capture_reason or '-'}) ocr={h.ocr} "
+                      f"broadcast={h.broadcast} delivery={h.delivery} ({h.delivery_reason or '-'})",
+                      "", "[broadcast]", f"state={a.live_state} evidence={a.live_evidence or '-'}",
+                      f"last_observation={a.last_observation or '-'}",
+                      f"episode={a.broadcast_episode or '-'} transition={a.last_transition or '-'}",
+                      "", "[reminder]",
+                      f"episode={a.episode_id or '-'} offline={a.offline_seconds:.0f}s accumulating={a.accumulating} "
+                      f"remaining={a.remaining_seconds} sent={a.reminders_sent}"]
+        counts = self.queue.counts()
+        lines += ["", "[outbox]", " ".join(f"{k}={v}" for k, v in counts.items()),
+                  f"bots={self.registry.count} enabled={sum(1 for b in self.registry.bots if b.enabled)} "
+                  f"credential_store={type(self.registry.store).__name__}"]
+        return "\n".join(lines)
+
+    def _refresh_diagnostics(self, once: bool = False) -> None:
+        try:
+            if self.nav_var.get() == "diagnostics":
+                text = self._diagnostics_text()
+                self.diag.text.configure(state="normal")
+                self.diag.text.delete("1.0", "end")
+                self.diag.text.insert("end", text)
+                self.diag.text.configure(state="disabled")
+        except Exception as exc:  # pragma: no cover
+            self.log_line(f"diagnostics error: {exc}")
+        if not once:
+            self.root.after(2000, self._refresh_diagnostics)
+
+    def copy_diagnostics(self) -> None:
+        text = self._diagnostics_text()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.log_line("diagnostics copied to the clipboard")
+
+    def open_data_folder(self) -> None:
+        self._open_path(str(self.cfg.data_path))
+
+    # ================================================================ target & preview
     def refresh_windows(self) -> None:
         self.windows = selectable_windows(self.system)
         self.tree.delete(*self.tree.get_children())
         for w in self.windows:
             tags = ("studio",) if looks_like_studio(w) else ()
-            self.tree.insert("", "end", iid=str(w.hwnd), values=(w.title, w.exe_name, w.pid,
-                             f"{w.rect.width}x{w.rect.height}"), tags=tags)
+            self.tree.insert("", "end", iid=str(w.hwnd), values=(w.title, w.exe_name, w.pid, f"{w.rect.width}x{w.rect.height}"), tags=tags)
 
     def use_selected(self) -> None:
         sel = self.tree.selection()
@@ -930,20 +1216,11 @@ class App:
         self.target_var.set(f'Target: "{t.title}"\nProcess: {t.exe_name} (pid {t.pid}, hwnd 0x{t.hwnd:X})\nPath: {t.exe_path}')
         self._refresh_region_list()
 
-    # -- preview ----------------------------------------------------------
-    def _current_window(self) -> Optional[WindowInfo]:
-        if not self.cfg.target.is_set:
-            return None
-        return self.system.get_window(self.cfg.target.hwnd)
-
     def _refresh_preview(self) -> None:
         try:
-            img = None
             cap = self.capture_service.frame(max_age=float("inf"))
             if cap is not None and cap.hwnd == self.cfg.target.hwnd:
-                img = cap.image
-            if img is not None:
-                self.preview_image = img
+                self.preview_image = cap.image
                 self._draw_preview()
         except Exception as exc:  # never kill the UI loop
             self.log_line(f"preview error: {exc}")
@@ -964,13 +1241,13 @@ class App:
             l, t, rt, b = r.to_box(disp.width, disp.height)
             color = REGION_COLORS.get(r.kind, "#fff")
             self.canvas.create_rectangle(l, t, rt, b, outline=color, width=2)
-            self.canvas.create_text(l + 3, t + 3, anchor="nw", text=r.name, fill=color, font=("Segoe UI", 9, "bold"))
+            self.canvas.create_text(l + 4, t + 4, anchor="nw", text=r.name, fill=color, font=self.fonts["caption"])
 
     def _drag_begin(self, event) -> None:
         if self.preview_image is None:
             return
         self._drag_start = (event.x, event.y)
-        self._drag_rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline="#00e5ff", width=2, dash=(4, 2))
+        self._drag_rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline="#3dd5f3", width=2, dash=(4, 2))
 
     def _drag_move(self, event) -> None:
         if self._drag_rect is not None and self._drag_start is not None:
@@ -988,9 +1265,8 @@ class App:
         box = (int(x0 / s), int(y0 / s), int(event.x / s), int(event.y / s))
         kind = self.region_kind.get()
         n = sum(1 for r in self.cfg.regions if r.kind == kind) + 1
-        name = f"{kind} {n}"
         try:
-            region = Region.from_pixels(name, box, self.preview_image.size, kind)
+            region = Region.from_pixels(f"{kind} {n}", box, self.preview_image.size, kind)
         except ValueError as exc:
             self.log_line(f"region rejected: {exc}")
             return
@@ -1013,22 +1289,24 @@ class App:
             self._draw_preview()
 
     def clear_regions(self) -> None:
+        if self.cfg.regions and not messagebox.askyesno("Clear regions", "Remove all detection, redaction and live-status regions?"):
+            return
         self.cfg.regions.clear()
         self.save()
         self._refresh_region_list()
         self._draw_preview()
 
-    # -- monitoring -------------------------------------------------------
+    # ================================================================ monitoring
     def start(self) -> None:
         if self.monitor is not None:
             return
         if not self.cfg.target.is_set:
             messagebox.showinfo("Start", f"Select your {SOURCE_LABEL} window first.")
+            self.show_page("monitor")
             return
         if not any(b.enabled for b in self.registry.bots):
-            if not messagebox.askyesno("No Telegram bots",
-                                       "No enabled Telegram bot is configured; events will be recorded with no "
-                                       "deliveries. Start anyway?"):
+            if not messagebox.askyesno("No Telegram bots", "No enabled Telegram bot is configured; events will be recorded "
+                                                           "with no deliveries. Start anyway?"):
                 return
         try:
             setup_logging(self.cfg)
@@ -1036,7 +1314,6 @@ class App:
                 self.cfg, self.cfg_path, registry=self.registry, queue=self.queue,
                 on_event=lambda m: self.events.put(("event", m)),
                 on_status=lambda s: self.events.put(("status", s)),
-                on_capture=self._on_capture,
                 on_identity_change=lambda ident: self.events.put(("identity", ident)),
                 on_activity=lambda a: self.events.put(("activity", a)),
                 frame_service=self.capture_service,
@@ -1049,10 +1326,7 @@ class App:
         self.monitor_thread = self.monitor.start_background()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-
-    def _on_capture(self, cap) -> None:
-        with self._lock:
-            self._monitor_capture = cap
+        self.status_var.set("Monitoring started.")
 
     def stop(self) -> None:
         if self.monitor is not None:
@@ -1060,8 +1334,8 @@ class App:
             self.monitor = None
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
-        self._set_status(Status.STOPPED, "")
-        self.act_vars["app"].set("monitor stopped (not observing)")
+        self._set_status(Status.STOPPED, "Monitoring stopped (nothing is observed while stopped).")
+        self.tile_studio.set("Not observing", "monitor stopped", "", "secondary")
         if self.cfg.target.is_set and self.cfg.target.hwnd:
             self.capture_service.bind(self.cfg.target.hwnd)   # keep the preview of the selected window alive
 
@@ -1072,7 +1346,7 @@ class App:
                 kind, payload = self.events.get_nowait()
                 if kind == "event":
                     self.log_line(payload)
-                    if "queued" in payload or "cancelled" in payload or "delivered" in payload or "failed" in payload:
+                    if any(w in payload for w in ("queued", "cancelled", "delivered", "failed")):
                         refresh_hist = True
                 elif kind == "status":
                     upd: StatusUpdate = payload
@@ -1088,28 +1362,17 @@ class App:
         except _queue.Empty:
             pass
         if refresh_hist:
-            self.refresh_history()
-            self.refresh_bots()
+            if self.nav_var.get() == "history":
+                self.refresh_history()
+            else:
+                self._show_delivery(self.queue.delivery_status())
+            if self.nav_var.get() == "bots":
+                self.refresh_bots()
         self.root.after(200, self._pump_events)
 
-    # -- misc actions -----------------------------------------------------
-    def open_settings(self) -> None:
-        before = self.cfg.activity.start_at_signin
-        dlg = SettingsDialog(self.root, self.cfg)
-        if dlg.result:
-            self.save()
-            if self.cfg.activity.start_at_signin != before:
-                try:
-                    from ..startup import apply_setting
-                    apply_setting(self.cfg.activity.start_at_signin)
-                    self.log_line("start at sign-in " + ("enabled" if self.cfg.activity.start_at_signin else "disabled"))
-                except Exception as exc:
-                    self.log_line(f"could not update sign-in startup setting: {exc}")
-            self.log_line("settings saved" + (" (restart monitoring to apply)" if self.monitor else ""))
-
+    # ================================================================ calibration
     def _pick_image(self, title: str) -> str:
-        return filedialog.askopenfilename(title=title,
-                                          filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")])
+        return filedialog.askopenfilename(title=title, filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")])
 
     def calibrate(self) -> None:
         path = self._pick_image("Choose a real Studio screenshot (popup)")
@@ -1133,6 +1396,7 @@ class App:
                     self.log_line(f"calibrate [{name}] no rule matched; add the wording to the rules file")
         except Exception as exc:
             self.log_line(f"calibrate failed: {exc}")
+        self.show_page("monitor")
 
     def calibrate_live(self) -> None:
         path = self._pick_image("Choose a real Studio screenshot (live or not live)")
@@ -1151,7 +1415,9 @@ class App:
                           f"{'' if live_rules.verified else '  [rules unverified]'}")
         except Exception as exc:
             self.log_line(f"calibrate-live failed: {exc}")
+        self.show_page("monitor")
 
+    # ================================================================ lifecycle
     def on_close(self) -> None:
         self.stop()
         try:
@@ -1166,19 +1432,8 @@ class App:
         self.root.destroy()
 
 
-def _fmt_ts_iso(iso: str) -> str:
-    try:
-        return datetime.fromisoformat(iso).astimezone().strftime("%m-%d %H:%M")
-    except ValueError:
-        return iso
-
-
 def run_gui(cfg: AppConfig, cfg_path: Path, autostart: bool = False) -> int:
-    root = tk.Tk()
-    try:
-        root.tk.call("tk", "scaling", root.winfo_fpixels("1i") / 72.0)
-    except tk.TclError:
-        pass
+    root = tb.Window(theme=cfg.ui.theme, title="Monitor Screen")
     App(root, cfg, cfg_path, autostart=autostart)
     root.mainloop()
     return 0

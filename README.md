@@ -177,6 +177,27 @@ Settings → Studio activity → "Start Monitor Screen when I sign in to Windows
 GUI with `--autostart`, which begins monitoring the saved target. It runs in your interactive
 desktop session (required for capture); nothing runs or is observed before you sign in.
 
+## Interface
+
+The desktop app is built with Tkinter + [ttkbootstrap 2](https://github.com/israel-dryer/ttkbootstrap)
+and follows the Windows type ramp (Segoe UI Variable Text/Display: caption 9 pt, body 10 pt,
+subtitle 12 pt semibold, title 16 pt; Cascadia Mono for logs and diagnostics). Icons are Bootstrap
+Icons rendered by ttkbootstrap, not emoji. Dark and Light themes (Settings → Appearance).
+
+- **Header:** brand, "Whose PC?" owner field with Save, status pills (monitoring, capture health,
+  broadcast state), Start / Stop.
+- **Monitor:** Studio window picker, live preview with region tools (popup detection, redaction,
+  live-status), stat tiles (capture, Studio, broadcast, go-live reminder, Telegram delivery), activity log.
+- **Telegram Bots:** bot table with Add / Edit / Remove / Enable-Disable / Validate / Send Test.
+- **History:** events with delivery summary and owner label, per-bot delivery details, single-delivery
+  retry, open screenshot.
+- **Settings:** all options as grouped forms with Save / Revert and validation.
+- **Diagnostics:** technical capture/identity/outbox details, copy to clipboard, open data folder,
+  calibration of popup and live-state rules on real screenshots.
+
+Every button is exercised by `tests/test_gui.py` against the real (withdrawn) window with dialogs and
+network replaced by test doubles.
+
 ## Whose PC? (owner label)
 
 The "Whose PC?" field at the top of the Monitor tab (or `studio-monitor owner NAME`) sets an operator
