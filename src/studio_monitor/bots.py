@@ -28,6 +28,7 @@ CAT_VERIFICATION = "verification"
 CAT_STUDIO_OPENED = "studio_opened"
 CAT_STUDIO_CLOSED = "studio_closed"
 CAT_REMINDERS = "reminders"
+CAT_BROADCAST = "broadcast_started"
 CAT_HEALTH = "health"
 CAT_TEST = "test"   # internal: explicit test notifications; not subscribable
 
@@ -37,6 +38,7 @@ EVENT_CATEGORIES: dict[str, str] = {
     CAT_STUDIO_OPENED: "Studio opened / already running",
     CAT_STUDIO_CLOSED: "Studio closed",
     CAT_REMINDERS: "Go-live (not-live) reminders",
+    CAT_BROADCAST: "Broadcast started / already live (with screenshot)",
     CAT_HEALTH: "Monitoring health alerts (LOST / DEGRADED / RUNNING)",
 }
 

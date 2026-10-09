@@ -9,6 +9,8 @@ description = "Monitors the TikTok LIVE Studio desktop app for restriction/warni
 requires-python = ">=3.10"
 dependencies = [
     "pillow>=10",
+    "windows-capture>=2.0; sys_platform == 'win32'",
+    "numpy>=1.26",
 ]
 
 [project.optional-dependencies]

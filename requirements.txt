@@ -2,3 +2,5 @@ pillow>=10
 winocr>=0.0.13
 pytest>=8
 pyinstaller>=6
+windows-capture>=2.0
+numpy>=1.26

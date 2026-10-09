@@ -53,6 +53,9 @@ class FakeWindowSystem:
     children: dict[int, set[int]] = field(default_factory=dict)
     foreground: int = 0
     screen: Rect = Rect(0, 0, 2560, 1440)
+    start_times: dict[int, float] = field(default_factory=dict)   # pid -> process creation time
+    locked: bool = False
+    covering: dict[int, int] = field(default_factory=dict)        # hwnd -> hwnd of a window covering it
 
     def add(self, w: WindowInfo):
         self.windows[w.hwnd] = w
@@ -80,6 +83,19 @@ class FakeWindowSystem:
                 return w.exe_path
         return ""
 
+    def process_start_time(self, pid):
+        return self.start_times.get(pid, 1_000.0 + pid)
+
+    def window_at_point(self, x, y):
+        for w in self.windows.values():
+            r = w.rect
+            if w.visible and r.left <= x < r.right and r.top <= y < r.bottom:
+                return self.covering.get(w.hwnd, w.hwnd)
+        return 0
+
+    def desktop_locked(self):
+        return self.locked
+
     def process_tree(self, root_pid):
         tree = {root_pid} if root_pid in self.alive else set()
         for child in self.children.get(root_pid, ()):
@@ -105,8 +121,19 @@ class FakeCapturer:
         self.calls.append(window.hwnd)
         if window.hwnd in self.fail_hwnds or window.minimized:
             return None
-        img = Image.new("RGB", (max(2, window.rect.width), max(2, window.rect.height)), (40, 40, 40))
-        return Capture(img, window, "printwindow", not self.unreliable)
+        return Capture(fake_frame(window.rect.width, window.rect.height), window, "printwindow", not self.unreliable,
+                       hwnd=window.hwnd)
+
+
+def fake_frame(width: int, height: int, color=(40, 40, 40)) -> Image.Image:
+    """A non-uniform frame (uniform bitmaps are rejected as blank): dark
+    background with a lighter block in the centre; pixel (0,0) stays ``color``."""
+    from PIL import ImageDraw
+    w, h = max(8, width), max(8, height)
+    img = Image.new("RGB", (w, h), color)
+    d = ImageDraw.Draw(img)
+    d.rectangle((w * 0.3, h * 0.3, w * 0.45, h * 0.45), fill=(200, 200, 200))
+    return img
 
 
 class FakeOcr:

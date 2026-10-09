@@ -29,6 +29,7 @@ class TargetIdentity:
     exe_name: str = ""
     class_name: str = ""
     title: str = ""
+    process_start: float = 0.0   # process creation time (epoch); with pid + exe it defeats pid reuse
 
     @property
     def is_set(self) -> bool:
@@ -96,7 +97,22 @@ class ActivityConfig:
     start_at_signin: bool = False
 
 
-CONFIG_VERSION = 3
+@dataclass
+class CaptureConfig:
+    backend: str = "auto"                     # auto | wgc | printwindow
+    interval_seconds: float = 0.5
+    max_frame_age_seconds: float = 30.0       # older frames are never used as current evidence
+    refresh_interval_seconds: float = 15.0    # WGC session heartbeat restart when no new frame arrived
+    allow_desktop_fallback: bool = True       # explicit, visibility-verified desktop crop as last resort
+
+
+@dataclass
+class HealthConfig:
+    degrade_after_seconds: float = 15.0
+    recover_after_seconds: float = 10.0
+
+
+CONFIG_VERSION = 4
 
 
 @dataclass
@@ -110,6 +126,9 @@ class AppConfig:
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     activity: ActivityConfig = field(default_factory=ActivityConfig)
     bots: list = field(default_factory=list)   # list[BotConfig]; tokens live in the credential store
+    capture: CaptureConfig = field(default_factory=CaptureConfig)
+    health: HealthConfig = field(default_factory=HealthConfig)
+    account_label: str = ""                    # optional operator label shown in broadcast alerts
     config_version: int = CONFIG_VERSION
 
     # -- serialisation ----------------------------------------------------
@@ -135,6 +154,9 @@ class AppConfig:
         cfg.privacy = PrivacyConfig(**_known(PrivacyConfig, data.get("privacy", {})))
         cfg.detection = DetectionConfig(**_known(DetectionConfig, data.get("detection", {})))
         cfg.activity = ActivityConfig(**_known(ActivityConfig, data.get("activity", {})))
+        cfg.capture = CaptureConfig(**_known(CaptureConfig, data.get("capture", {})))
+        cfg.health = HealthConfig(**_known(HealthConfig, data.get("health", {})))
+        cfg.account_label = str(data.get("account_label", "") or "")
         from .bots import BotConfig
         cfg.bots = [BotConfig.from_dict(b) for b in data.get("bots", []) if isinstance(b, dict)]
         cfg.config_version = int(data.get("config_version", 1))

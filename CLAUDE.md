@@ -21,11 +21,15 @@ ctypes Win32 (no pywin32), SQLite outbox, Windows built-in OCR via `winocr`, PyI
 - Tests must not hit the network. Use `FakeWindowSystem`, `FakeCapturer`, `FakeOcr`, `FakeClock`
   (tests/conftest.py) and the `FakeTransport` pattern for Telegram.
 - Monotonic time for in-process durations, UTC ISO strings for stored records.
+- Capture is bound to the validated HWND via `CaptureService`; never fall back to desktop cropping silently and
+  never treat an unrelated foreground window as a capture problem. WGC emits frames only on change: keep the
+  heartbeat (session refresh) separate from pixel-change detection.
 
 ## Layout
 ```
 src/studio_monitor/
-  win32/{api,windows,capture}.py  ctypes bindings, enumeration, PrintWindow capture
+  win32/{api,windows,capture}.py  ctypes bindings, enumeration, CaptureService (WGC > PrintWindow > verified desktop crop)
+  health.py / broadcast_events.py debounced health alerts; broadcast episode dedup
   target.py / tracker.py          identity validation, rediscovery, RUNNING/DEGRADED/LOST
   detection/{rules,detector}.py   popup keyword rules (rules/studio_rules.json)
   incidents.py                    popup confirmation + de-duplication
@@ -53,4 +57,6 @@ src/studio_monitor/
   Studio screenshots. `rules/live_state_rules.json` has `"verified": false`; flip it only after
   `calibrate-live` classifies real LIVE and NOT_LIVE screenshots correctly.
 - Everything in tests is synthetic/replay validation, not real-Studio validation.
-- Real Telegram delivery is unverified until a user-configured bot sends an explicit test notification.
+- Real Telegram delivery was confirmed by the user (restriction screenshot delivered).
+- Broadcast-start detection is verified by synthetic replay only, not with a real broadcast.
+- WGC behaviour verified on this machine with self-owned windows (covered, moved/resized, minimized -> no frames).

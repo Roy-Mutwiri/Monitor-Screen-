@@ -252,8 +252,9 @@ def test_health_alerts_only_to_subscribed_bots(cfg, rules, clock, tmp_path):
     cfg.activity.notify_already_running = False
     mon, sys_, cap, ocr, queue, events = build(cfg, rules, clock, reg)
     mon.tick()
-    sys_.remove(0x1001); sys_.alive.clear()
-    mon.tick()
+    sys_.remove(0x1001)                                   # window gone, process alive -> degraded for > 15 s
+    for _ in range(10):
+        clock.advance(2); mon.tick()
     ds = [d for d in all_deliveries(queue) if d["kind"] == "status"]
     assert ds and {d["bot_name"] for d in ds} == {"Health"}
 

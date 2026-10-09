@@ -42,17 +42,17 @@ def test_rediscover_requires_class_match(studio_identity):
     assert rediscover(sys_, studio_identity) is None
 
 
-def test_related_windows_includes_dialogs_from_process_tree_and_owned():
+def test_related_windows_limited_to_owned_and_sibling_dialogs():
     sys_ = FakeWindowSystem()
     main = sys_.add(make_window())
-    sys_.add(make_window(hwnd=0x5001, title="Notice", pid=4242, rect=Rect(300, 300, 800, 600)))        # same pid
-    sys_.add(make_window(hwnd=0x5002, title="Helper", pid=4300, rect=Rect(300, 300, 800, 600)))        # child proc
+    sys_.add(make_window(hwnd=0x5001, title="Notice", pid=4242, rect=Rect(300, 300, 800, 600)))        # same pid/class
+    sys_.add(make_window(hwnd=0x5002, title="Helper", pid=4300, rect=Rect(300, 300, 800, 600)))        # child proc: excluded
     sys_.add(make_window(hwnd=0x5003, title="Owned", pid=999, owner=0x1001, rect=Rect(0, 0, 500, 400)))  # owned
     sys_.add(make_window(hwnd=0x5004, title="Other", pid=1, exe="C:/x.exe"))
     sys_.add(make_window(hwnd=0x5005, title="Hidden", pid=4242, visible=False))
     sys_.children[4242] = {4300}
     found = {w.hwnd for w in related_windows(sys_, main)}
-    assert found == {0x5001, 0x5002, 0x5003}
+    assert found == {0x5001, 0x5003}
 
 
 def test_tracker_lifecycle(studio_identity, clock):

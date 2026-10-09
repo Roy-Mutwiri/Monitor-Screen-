@@ -152,6 +152,63 @@ def format_not_live_reminder(machine_label: str, ts: float, threshold_minutes: f
     return _finish(lines, ts)
 
 
+def format_broadcast_started(machine_label: str, ts: float, account_label: str = "", after_gap: bool = False,
+                             gap_seconds: float = 0.0, screenshot_attached: bool = True, rules_verified: bool = True) -> dict:
+    lines = [
+        "<b>TIKTOK LIVE STUDIO HAS GONE LIVE</b>",
+        f"PC: {html.escape(machine_label)}",
+        f"Detected at: {local_ts(ts)}",
+        "Status: LIVE",
+    ]
+    if account_label:
+        lines.append(f"Account: {html.escape(account_label)}")
+    if after_gap:
+        lines.append(f"<i>LIVE was first observed after a monitoring gap of {format_duration(gap_seconds)}; "
+                     "the exact start time was not observed.</i>")
+    if not screenshot_attached:
+        lines.append("<i>Screenshot unavailable (screenshots disabled or no valid frame).</i>")
+    if not rules_verified:
+        lines.append("<i>Live-state rules are unverified (not yet calibrated on real Studio screenshots).</i>")
+    return _finish(lines, ts)
+
+
+def format_already_live(machine_label: str, ts: float, account_label: str = "", screenshot_attached: bool = True,
+                        rules_verified: bool = True) -> dict:
+    lines = [
+        "<b>TIKTOK LIVE STUDIO IS ALREADY LIVE</b>",
+        f"PC: {html.escape(machine_label)}",
+        f"Observed at: {local_ts(ts)}",
+        "Status: LIVE \u2014 monitoring started while the broadcast was already running "
+        "(this is not a newly observed broadcast start).",
+    ]
+    if account_label:
+        lines.append(f"Account: {html.escape(account_label)}")
+    if not screenshot_attached:
+        lines.append("<i>Screenshot unavailable.</i>")
+    if not rules_verified:
+        lines.append("<i>Live-state rules are unverified (not yet calibrated on real Studio screenshots).</i>")
+    return _finish(lines, ts)
+
+
+def format_health_alert(kind: str, reason: str, machine_label: str, ts: float, since: float, duration: float) -> dict:
+    if kind == "degraded":
+        lines = [
+            "\u26A0\uFE0F <b>MONITOR HEALTH: DEGRADED</b>",
+            f"PC: {html.escape(machine_label)}",
+            f"Reason: {html.escape(reason) or '-'}",
+            f"Since: {local_ts(since)} (persisting for {format_duration(duration)})",
+            "Popup detection may be incomplete until capture recovers. Restriction alerts are not affected by this notice.",
+        ]
+    else:
+        lines = [
+            "\u2705 <b>MONITOR HEALTH: RECOVERED</b>",
+            f"PC: {html.escape(machine_label)}",
+            f"Previous problem: {html.escape(reason) or '-'}",
+            f"Degraded from {local_ts(since)} for {format_duration(duration)}; healthy again at {local_ts(ts)}.",
+        ]
+    return _finish(lines, ts)
+
+
 def format_status_alert(status: str, reason: str, machine_label: str, ts: float) -> str:
     return "\n".join([
         f"ℹ️ <b>{html.escape(SOURCE_LABEL)}</b> monitor status: <b>{html.escape(status)}</b>",

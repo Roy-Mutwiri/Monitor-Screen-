@@ -112,7 +112,7 @@ class WindowTracker:
 
     def _adopt(self, window: WindowInfo, why: str) -> None:
         old = self.identity
-        new = identity_from_window(window)
+        new = identity_from_window(window, self.system)
         self.identity = new
         self.state.rediscovered_count += 1
         self.state.events.append(

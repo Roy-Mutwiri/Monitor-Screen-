@@ -1,10 +1,10 @@
-"""Monitoring loop: track the Studio window, capture it and its dialogs, OCR,
-match rules, de-duplicate, and queue Telegram alerts.
+"""Monitoring loop: consume frames of the bound Studio window, OCR, match
+rules, de-duplicate, and queue Telegram alerts.
 
-Also drives the Studio activity features: application session (opened /
-closed), latest-frame cache, broadcast-state engine and not-live reminders.
-Every notification becomes one event with immutable redacted evidence and one
-delivery per enabled, subscribed bot (see :mod:`queue`).
+Also drives Studio activity (session opened/closed, latest-frame cache,
+broadcast-state engine, broadcast-start events, not-live reminders) and the
+health model. Every notification becomes one event with immutable redacted
+evidence and one delivery per enabled, subscribed bot (see :mod:`queue`).
 """
 from __future__ import annotations
 
@@ -17,17 +17,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-from .alerts import (format_alert, format_not_live_reminder, format_status_alert, format_studio_already_running,
-                     format_studio_closed, format_studio_opened)
-from .bots import (CAT_HEALTH, CAT_REMINDERS, CAT_RESTRICTIONS, CAT_STUDIO_CLOSED, CAT_STUDIO_OPENED,
+from .alerts import (format_alert, format_already_live, format_broadcast_started, format_health_alert,
+                     format_not_live_reminder, format_studio_already_running, format_studio_closed,
+                     format_studio_opened)
+from .bots import (CAT_BROADCAST, CAT_HEALTH, CAT_REMINDERS, CAT_RESTRICTIONS, CAT_STUDIO_CLOSED, CAT_STUDIO_OPENED,
                    CAT_VERIFICATION, BotRegistry)
 from .broadcast import BroadcastStateEngine, Classification, LiveRules, LiveState
+from .broadcast_events import BroadcastEpisodeTracker
 from .config import AppConfig, TargetIdentity
 from .detection.detector import Detection, Detector
 from .detection.rules import RuleSet
 from .framecache import FrameCache
+from .health import HealthAlertPolicy, HealthSnapshot
 from .incidents import Incident, IncidentTracker
-from .ocr.base import OcrBackend
+from .ocr.base import OcrBackend, OcrError
 from .privacy import purge_old_screenshots, redact
 from .queue import KIND_ACTIVITY, KIND_INCIDENT, KIND_STATUS, Delivery, DeliveryError, DeliveryQueue, DeliveryWorker
 from .reminders import EVT_REMINDER_CANCELLED, OfflineReminderEngine, ReminderDue
@@ -35,10 +38,14 @@ from .sessions import EVT_ALREADY_RUNNING, EVT_CLOSED, EVT_OPENED, SessionEvent,
 from .target import related_windows
 from .telegram import ClientFactory, deliver
 from .tracker import Status, WindowTracker
-from .win32.capture import Capture, Capturer
+from .win32.capture import Capture, Capturer, CaptureStatus, FrameService, SyncFrameService, is_blank
 from .win32.windows import WindowSystem
 
 log = logging.getLogger(__name__)
+
+EVT_BROADCAST_STARTED = "BROADCAST_STARTED"
+EVT_ALREADY_LIVE = "BROADCAST_ALREADY_LIVE"
+EVT_BROADCAST_ENDED = "BROADCAST_ENDED"
 
 
 @dataclass
@@ -51,7 +58,7 @@ class StatusUpdate:
 
 @dataclass
 class ActivitySnapshot:
-    """What the GUI shows in the "Studio activity" panel."""
+    """What the GUI shows: Studio activity, capture health, broadcast state."""
     app_state: str = "NOT_RUNNING"
     session_id: str = ""
     live_state: str = LiveState.UNKNOWN.value
@@ -59,6 +66,8 @@ class ActivitySnapshot:
     live_rules_verified: bool = False
     last_confirmed_utc: str = ""
     last_observation: str = ""
+    last_transition: str = ""
+    broadcast_episode: str = ""
     offline_seconds: float = 0.0
     remaining_seconds: Optional[float] = None
     accumulating: bool = False
@@ -66,6 +75,10 @@ class ActivitySnapshot:
     reminders_sent: int = 0
     last_event: str = ""
     delivery: dict = field(default_factory=dict)
+    health: HealthSnapshot = field(default_factory=HealthSnapshot)
+    capture: CaptureStatus = field(default_factory=CaptureStatus)
+    target_title: str = ""
+    target_hwnd: int = 0
 
 
 def _event_id(prefix: str, ts: float) -> str:
@@ -88,10 +101,15 @@ class Monitor:
                  live_rules: Optional[LiveRules] = None,
                  frame_cache: Optional[FrameCache] = None,
                  mono: Callable[[], float] = time.monotonic,
-                 on_activity: Optional[Callable[[ActivitySnapshot], None]] = None) -> None:
+                 on_activity: Optional[Callable[[ActivitySnapshot], None]] = None,
+                 frame_service: Optional[FrameService] = None,
+                 owns_frame_service: bool = False) -> None:
         self.cfg = cfg
         self.system = system
-        self.capturer = capturer
+        self.capturer = capturer                 # dialogs only (PrintWindow, no desktop fallback)
+        self.frames: FrameService = frame_service or SyncFrameService(system, capturer, cfg.capture.max_frame_age_seconds,
+                                                                      clock, mono)
+        self._owns_frames = owns_frame_service or frame_service is None
         self.queue = queue
         self.registry = registry
         self.client_factory = client_factory
@@ -120,12 +138,17 @@ class Monitor:
         self.live_rules = live_rules or LiveRules({})
         self.broadcast = BroadcastStateEngine(self.live_rules, act.confirm_observations,
                                               act.max_observation_gap_seconds, clock, mono)
+        self.episodes = BroadcastEpisodeTracker(queue, act.max_observation_gap_seconds, clock, mono)
         self.reminders = OfflineReminderEngine(
             queue, threshold_seconds=act.offline_threshold_minutes * 60.0,
             max_gap_seconds=act.max_observation_gap_seconds, repeat_enabled=act.repeat_enabled,
             repeat_interval_seconds=act.repeat_interval_minutes * 60.0, repeat_max=act.repeat_max_count,
             enabled=act.reminders_enabled, clock=clock, mono=mono,
         )
+        self.health_policy = HealthAlertPolicy(queue, degrade_after=cfg.health.degrade_after_seconds,
+                                               recover_after=cfg.health.recover_after_seconds, clock=clock, mono=mono)
+        self.health = HealthSnapshot()
+        self._ocr_failures = 0
         self.worker: Optional[DeliveryWorker] = None
         if client_factory is not None:
             self.worker = DeliveryWorker(queue, self.send_delivery, cfg.telegram.delivery_concurrency,
@@ -134,12 +157,17 @@ class Monitor:
         self._stop = threading.Event()
         self._last_status: tuple[Status, str] = (Status.STOPPED, "")
         self._last_purge = 0.0
+        self._last_seq = -1
         self.last_detections: list[Detection] = []
+        self.last_transition = ""
         self.activity = ActivitySnapshot(live_rules_verified=self.live_rules.verified)
+        if cfg.target.hwnd:
+            self.frames.bind(cfg.target.hwnd)
 
     # ------------------------------------------------------------------
     def _identity_changed(self, identity: TargetIdentity) -> None:
         self.cfg.target = identity
+        self.frames.bind(identity.hwnd)
         if self._on_identity_change:
             self._on_identity_change(identity)
 
@@ -168,13 +196,7 @@ class Monitor:
     def _emit_status(self, status: Status, reason: str) -> None:
         title = self.tracker.state.window.title if self.tracker.state.window else ""
         self.on_status(StatusUpdate(status, reason, title, self.queue.counts()))
-        if (status, reason) != self._last_status:
-            self._last_status = (status, reason)
-            if status in (Status.LOST, Status.DEGRADED, Status.RUNNING) and self.registry.targets(CAT_HEALTH):
-                text = format_status_alert(status.value, reason, self.cfg.machine_label, self.clock())
-                self.dispatch(_event_id("HLT", self.clock()), KIND_STATUS, CAT_HEALTH,
-                              {"text": text, "caption": text, "created_at": self.clock()}, "",
-                              label=f"Monitor {status.value}")
+        self._last_status = (status, reason)
 
     def _kick(self) -> None:
         if self.worker:
@@ -188,23 +210,30 @@ class Monitor:
             self.on_event(ev)
         self.last_detections = []
         window_present = state.window is not None and state.status in (Status.RUNNING, Status.DEGRADED)
+        if state.window is not None and self.frames.status().hwnd != state.window.hwnd:
+            self.frames.bind(state.window.hwnd)   # follow the validated window (recreation / restart)
 
         captures: list[Capture] = []
         detections: list[Detection] = []
         main_cap: Optional[Capture] = None
         main_full_text: Optional[str] = None
-        if state.status == Status.RUNNING and state.window is not None:
+        fresh_frame = False
+        if state.status in (Status.RUNNING, Status.DEGRADED) and state.window is not None:
             main = state.window
-            foreground = self.system.foreground_window()
-            cap = self.capturer.capture(main, foreground)
-            self.tracker.report_capture(cap is not None, bool(cap and cap.reliable), cap.note if cap else "")
-            if cap is not None:
+            cap = self.frames.frame()
+            if cap is not None and cap.hwnd == main.hwnd:
+                fresh_frame = cap.seq != self._last_seq
+                self._last_seq = cap.seq
+                # work on a copy: the service's frame stays immutable
+                cap = Capture(cap.image.copy(), main, cap.method, cap.reliable, cap.note, False,
+                              cap.captured_at, cap.captured_mono, cap.hwnd, cap.seq)
                 captures.append(cap)
                 main_cap = cap
-            if self.cfg.detection.include_dialogs:
+            if self.cfg.detection.include_dialogs and state.status == Status.RUNNING:
+                foreground = self.system.foreground_window()
                 for win in related_windows(self.system, main):
                     dcap = self.capturer.capture(win, foreground)
-                    if dcap is not None:
+                    if dcap is not None and not is_blank(dcap.image):
                         dcap.is_dialog = True
                         captures.append(dcap)
             for ev in self.tracker.drain_events():
@@ -212,15 +241,26 @@ class Monitor:
             if captures:
                 self.on_capture(captures[0])
 
-            for c in captures:
-                # Redaction happens before OCR so redacted areas are never read, stored or sent.
-                c.image = redact(c.image, self.cfg.regions)
-                regions = [] if c.is_dialog else [r for r in self.cfg.regions if r.kind == "detect"]
-                det = self.detector.detect(c, regions)
-                if c is main_cap:
-                    main_full_text = self.detector.last_full_text
-                if det is not None:
-                    detections.append(det)
+            if fresh_frame or any(c.is_dialog for c in captures):
+                for c in captures:
+                    if c is main_cap and not fresh_frame:
+                        continue
+                    # Redaction happens before OCR so redacted areas are never read, stored or sent.
+                    c.image = redact(c.image, self.cfg.regions)
+                    regions = [] if c.is_dialog else [r for r in self.cfg.regions if r.kind == "detect"]
+                    try:
+                        det = self.detector.detect(c, regions)
+                        self._ocr_failures = 0
+                    except OcrError as exc:
+                        self._ocr_failures += 1
+                        self.health.ocr, self.health.ocr_reason = "FAILING", str(exc)[:120]
+                        det = None
+                    if c is main_cap:
+                        main_full_text = self.detector.last_full_text
+                    if det is not None:
+                        detections.append(det)
+            elif main_cap is not None:
+                main_cap.image = redact(main_cap.image, self.cfg.regions)
 
             for det in detections:
                 decision = self.incidents.observe(
@@ -234,18 +274,21 @@ class Monitor:
                     log.debug("detection %s suppressed: %s", det.category, decision.reason)
         self.incidents.tick()
         self.last_detections = detections
+        if self._ocr_failures == 0:
+            self.health.ocr, self.health.ocr_reason = "OK", ""
 
         # ---- Studio activity: session, frame cache, broadcast state, reminders
-        screenshot_ok = main_cap is not None and main_cap.reliable
-        if screenshot_ok:
+        screenshot_ok = main_cap is not None
+        if screenshot_ok and fresh_frame:
             self.frame_cache.update(main_cap.image)
         self._update_sessions(window_present, screenshot_ok)
         popup_on_main = any(not d.is_dialog for d in detections)
         classification: Optional[Classification] = None
-        if screenshot_ok and not popup_on_main and self.sessions.running:
+        if screenshot_ok and fresh_frame and not popup_on_main and self.sessions.running:
             classification = self._classify_live(main_cap, main_full_text)
-        self._update_broadcast_and_reminders(classification)
+        self._update_broadcast_and_reminders(classification, main_cap if fresh_frame else None)
 
+        self._update_health(state)
         self._emit_status(self.tracker.state.status, self.tracker.state.reason)
         self._emit_activity()
         self._maybe_purge()
@@ -295,6 +338,17 @@ class Monitor:
         dest = self.cfg.activity_screenshots_dir / f"{event_id}.png"
         return self.frame_cache.export(dest) or ""
 
+    def _save_evidence(self, event_id: str, image) -> str:
+        """Persist an already-redacted frame as evidence for an activity event."""
+        if image is None or not self.cfg.privacy.send_screenshots:
+            return ""
+        dest = self.cfg.activity_screenshots_dir / f"{event_id}.png"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".tmp.png")
+        image.save(tmp, format="PNG")
+        tmp.replace(dest)
+        return str(dest)
+
     def _handle_session_event(self, ev: SessionEvent) -> None:
         act = self.cfg.activity
         eid = _event_id("EVT", ev.ts)
@@ -340,10 +394,15 @@ class Monitor:
             text = self.detector.ocr_text(cap.image)
         return self.live_rules.classify(text)
 
-    def _update_broadcast_and_reminders(self, classification: Optional[Classification]) -> None:
+    def _update_broadcast_and_reminders(self, classification: Optional[Classification],
+                                        evidence_cap: Optional[Capture]) -> None:
         cs = self.broadcast.observe(classification)
         for old, new, why in self.broadcast.drain_transitions():
+            self.last_transition = f"{old.value} -> {new.value} at {datetime.fromtimestamp(self.clock()):%H:%M:%S}"
             self.on_event(f"broadcast state {old.value} -> {new.value} ({why})")
+        if classification is None:
+            self.episodes.note_gap()
+        bev = self.episodes.observe(cs.state, cs.fresh)
         session = self.sessions.state.session
         out = self.reminders.update(session is not None, session.pid if session else 0, cs.state, cs.fresh)
         if out.episode_started:
@@ -355,8 +414,35 @@ class Monitor:
             self.on_event(f"pending not-live reminder {event_id} cancelled: {reason}")
         if out.episode_ended and not out.episode_started:
             self.on_event(f"offline episode ended: {out.episode_ended}")
+        if bev is not None:
+            self._handle_broadcast_event(bev, evidence_cap)
         if out.due is not None:
             self._send_reminder(out.due)
+
+    def _handle_broadcast_event(self, bev, evidence_cap: Optional[Capture]) -> None:
+        now = self.clock()
+        if bev.kind == "ended":
+            self.queue.record_event(_event_id("EVT", now), EVT_BROADCAST_ENDED, _utc(now),
+                                    {"summary": "broadcast ended (confirmed NOT_LIVE)"}, episode_id=bev.episode_id)
+            self.on_event(f"broadcast episode {bev.episode_id} ended (confirmed NOT_LIVE)")
+            return
+        eid = _event_id("BCS", now)
+        # the exact frame that supported the LIVE confirmation (already redacted)
+        shot = self._save_evidence(eid, evidence_cap.image if evidence_cap is not None else None)
+        if bev.kind == "already_live":
+            payload = format_already_live(self.cfg.machine_label, now, self.cfg.account_label, bool(shot),
+                                          self.live_rules.verified)
+            summary, etype = "Studio is already LIVE (monitoring started)", EVT_ALREADY_LIVE
+        else:
+            payload = format_broadcast_started(self.cfg.machine_label, now, self.cfg.account_label,
+                                               bev.kind == "started_after_gap", bev.gap_seconds, bool(shot),
+                                               self.live_rules.verified)
+            summary, etype = ("Studio has gone LIVE" + (" (observed after a gap)" if bev.kind == "started_after_gap" else ""),
+                              EVT_BROADCAST_STARTED)
+        n = self.dispatch(eid, KIND_ACTIVITY, CAT_BROADCAST, payload, shot, label=summary)
+        self.queue.record_event(eid, etype, _utc(now), {"summary": summary, "screenshot": bool(shot), "bots": n,
+                                                        "kind": bev.kind}, episode_id=bev.episode_id, screenshot_path=shot)
+        self.on_event(f"{summary} -> {eid} queued for {n} bot(s){'' if shot else ' (text only)'}")
 
     def _send_reminder(self, due: ReminderDue) -> None:
         act = self.cfg.activity
@@ -375,6 +461,43 @@ class Monitor:
         self.on_event(f"TIME TO GO LIVE reminder {due.sequence} -> {eid} queued for {n} bot(s)")
         self._kick()
 
+    # ---- health --------------------------------------------------------
+    def _update_health(self, state) -> None:
+        cs = self.frames.status()
+        h = self.health
+        h.session = self.sessions.state.app_state
+        h.broadcast = self.broadcast.state.state.value
+        h.capture_backend = cs.backend
+        h.last_valid_frame_at = cs.last_valid_at
+        studio_running = self.sessions.state.session is not None
+        if not studio_running:
+            h.capture, h.capture_reason = "NONE", "Studio is not running"
+        elif state.status == Status.LOST:
+            h.capture, h.capture_reason = "DEGRADED", "Target window closed or not found"
+        elif cs.health == "OK":
+            # a stale frame (no fresh one within max age) is degraded even if the worker is alive
+            age = self.mono() - cs.last_valid_mono if cs.last_valid_mono else None
+            if age is not None and age > self.cfg.capture.max_frame_age_seconds:
+                h.capture, h.capture_reason = "DEGRADED", "No fresh frame from the window"
+            else:
+                h.capture, h.capture_reason = "OK", (cs.reason if cs.code == "fallback" else "")
+        elif cs.health == "DEGRADED":
+            h.capture, h.capture_reason = "DEGRADED", cs.reason
+        else:
+            h.capture, h.capture_reason = ("DEGRADED", "Capture not started") if studio_running else ("NONE", "")
+        d = self.queue.delivery_status()
+        last = d.get("last")
+        h.delivery = "FAILING" if last and last.get("status") in ("failed", "dead") else "OK"
+        h.delivery_reason = (last.get("error") or "") if h.delivery == "FAILING" else ""
+        degraded = studio_running and (h.capture == "DEGRADED" or h.ocr == "FAILING")
+        alert = self.health_policy.update(degraded, h.degraded_reason)
+        if alert is not None and self.registry.targets(CAT_HEALTH):
+            payload = format_health_alert(alert.kind, alert.reason, self.cfg.machine_label, self.clock(),
+                                          alert.since, alert.duration)
+            self.dispatch(_event_id("HLT", self.clock()), KIND_STATUS, CAT_HEALTH, payload, "",
+                          label=f"Monitor health {alert.kind}")
+            self.on_event(f"health alert queued: {alert.kind} ({alert.reason})")
+
     def _emit_activity(self) -> None:
         st = self.sessions.state
         bs = self.broadcast.state
@@ -384,9 +507,11 @@ class Monitor:
             app_state=st.app_state, session_id=self.sessions.session_id,
             live_state=bs.state.value, live_evidence=bs.evidence, live_rules_verified=self.live_rules.verified,
             last_confirmed_utc=bs.last_confirmed_utc, last_observation=lc.summary() if lc else "",
+            last_transition=self.last_transition, broadcast_episode=self.episodes.state.episode_id,
             offline_seconds=rs.accumulated_seconds, remaining_seconds=self.reminders.remaining_seconds(),
             accumulating=self.reminders.accumulating, episode_id=rs.episode_id, reminders_sent=rs.reminders_sent,
-            last_event=st.last_event, delivery=self.queue.delivery_status(),
+            last_event=st.last_event, delivery=self.queue.delivery_status(), health=HealthSnapshot(**self.health.__dict__),
+            capture=self.frames.status(), target_title=self.tracker.identity.title, target_hwnd=self.tracker.identity.hwnd,
         )
         self.on_activity(self.activity)
 
@@ -429,6 +554,8 @@ class Monitor:
                 self.frame_cache.flush()
             except OSError:  # pragma: no cover
                 log.warning("could not persist latest frame")
+            if self._owns_frames:
+                self.frames.stop()
             self._emit_status(Status.STOPPED, "")
             self.on_event("monitoring stopped")
 

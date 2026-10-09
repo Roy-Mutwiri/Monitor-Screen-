@@ -128,10 +128,15 @@ def test_degraded_when_minimized_skips_ocr(cfg, rules, clock):
     assert statuses[-1].status == Status.DEGRADED and ocr.calls == 0
 
 
-def test_health_status_notifications_go_to_subscribed_bots(cfg, rules, clock):
+def test_health_degradation_alert_is_debounced(cfg, rules, clock):
     mon, sys_, *_, queue, events, statuses = build(cfg, rules, clock)
     mon.tick()
-    sys_.remove(0x1001); sys_.alive.clear()
-    mon.tick()
+    assert [d for d in all_deliveries(queue) if d["kind"] == "status"] == []   # RUNNING is not announced
+    sys_.remove(0x1001)                                   # window gone, process alive -> capture degraded
+    for _ in range(5):
+        clock.advance(2); mon.tick()
+    assert [d for d in all_deliveries(queue) if d["kind"] == "status"] == []   # < 15 s: nothing yet
+    for _ in range(5):
+        clock.advance(2); mon.tick()
     texts = [d["payload"]["text"] for d in all_deliveries(queue) if d["kind"] == "status"]
-    assert any("RUNNING" in t for t in texts) and any("LOST" in t for t in texts)
+    assert len(texts) == 1 and "DEGRADED" in texts[0] and "closed or not found" in texts[0]

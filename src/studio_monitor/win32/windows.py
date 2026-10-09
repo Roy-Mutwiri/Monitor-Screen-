@@ -67,9 +67,12 @@ class WindowSystem(Protocol):
     def is_window(self, hwnd: int) -> bool: ...
     def process_alive(self, pid: int) -> bool: ...
     def process_exe_path(self, pid: int) -> str: ...
+    def process_start_time(self, pid: int) -> float: ...
     def process_tree(self, root_pid: int) -> set[int]: ...
     def foreground_window(self) -> int: ...
     def virtual_screen(self) -> Rect: ...
+    def window_at_point(self, x: int, y: int) -> int: ...
+    def desktop_locked(self) -> bool: ...
 
 
 class Win32WindowSystem:
@@ -99,8 +102,47 @@ class Win32WindowSystem:
             self._exe_cache[pid] = path
         return path
 
+    def process_start_time(self, pid: int) -> float:
+        """Process creation time (epoch seconds); 0.0 if unreadable. Combined
+        with the pid and executable it defeats pid reuse."""
+        handle = api.kernel32.OpenProcess(api.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return 0.0
+        try:
+            c, e, k, u = api.FILETIME(), api.FILETIME(), api.FILETIME(), api.FILETIME()
+            if api.kernel32.GetProcessTimes(handle, ctypes.byref(c), ctypes.byref(e), ctypes.byref(k), ctypes.byref(u)):
+                return c.to_epoch()
+            return 0.0
+        finally:
+            api.kernel32.CloseHandle(handle)
+
     def process_alive(self, pid: int) -> bool:
         return pid in self._snapshot_processes()
+
+    def window_at_point(self, x: int, y: int) -> int:
+        """Top-level window visible at a screen point (0 if none)."""
+        hwnd = api.user32.WindowFromPoint(api.POINT(x, y))
+        if not hwnd:
+            return 0
+        root = api.user32.GetAncestor(hwnd, api.GA_ROOT)
+        return int(root or hwnd)
+
+    def desktop_locked(self) -> bool:
+        """True when the interactive desktop is not the input desktop (lock
+        screen / secure desktop), in which case nothing can be captured."""
+        handle = api.user32.OpenInputDesktop(0, False, api.DESKTOP_READOBJECTS)
+        if not handle:
+            return True
+        try:
+            buf = ctypes.create_unicode_buffer(256)
+            needed = wintypes.DWORD(0)
+            api.user32.GetUserObjectInformationW.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                             wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+            if api.user32.GetUserObjectInformationW(handle, 2, buf, 512, ctypes.byref(needed)):   # UOI_NAME
+                return buf.value.lower() != "default"
+            return False
+        finally:
+            api.user32.CloseDesktop(handle)
 
     def _snapshot_processes(self) -> dict[int, tuple[int, str]]:
         """pid -> (parent pid, exe name)."""

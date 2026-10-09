@@ -7,7 +7,7 @@ import logging.handlers
 from pathlib import Path
 from typing import Optional
 
-from .bots import CAT_HEALTH, BotRegistry, BotTarget
+from .bots import CAT_BROADCAST, CAT_HEALTH, BotRegistry, BotTarget
 from .broadcast import LiveRules
 from .config import AppConfig, default_config_path, live_rules_path, rules_path
 from .credentials import CredentialStore, default_store
@@ -92,6 +92,16 @@ def run_migrations(cfg: AppConfig, cfg_path: Path, registry: BotRegistry, queue:
             tg.chat_id = ""
             tg.legacy_migrated = True
             cfg.save(cfg_path)
+    if cfg.config_version < 4:
+        added = 0
+        for b in registry.bots:
+            if b.enabled and CAT_BROADCAST not in b.subscriptions:
+                b.subscriptions.append(CAT_BROADCAST)
+                added += 1
+        cfg.config_version = 4
+        cfg.save(cfg_path)
+        if added:
+            notes.append(f"subscribed {added} enabled bot(s) to the new 'Broadcast started / already live' category")
     if queue.legacy_pending_count() or not queue.get_state("legacy_alerts_migrated"):
         target = None
         default = registry.by_name("Default Bot") or (registry.bots[0] if registry.bots else None)
@@ -105,6 +115,15 @@ def run_migrations(cfg: AppConfig, cfg_path: Path, registry: BotRegistry, queue:
     return notes
 
 
+def make_capture_service(cfg: AppConfig, system=None):
+    from .win32.capture import CaptureService
+    from .win32.windows import Win32WindowSystem
+    c = cfg.capture
+    return CaptureService(system or Win32WindowSystem(), interval=c.interval_seconds, max_age=c.max_frame_age_seconds,
+                          refresh_interval=c.refresh_interval_seconds, allow_desktop_fallback=c.allow_desktop_fallback,
+                          prefer=c.backend)
+
+
 def build_monitor(cfg: AppConfig, cfg_path: Path, registry: Optional[BotRegistry] = None,
                   queue: Optional[DeliveryQueue] = None, **callbacks) -> Monitor:
     from .win32.capture import Win32Capturer
@@ -112,7 +131,10 @@ def build_monitor(cfg: AppConfig, cfg_path: Path, registry: Optional[BotRegistry
 
     ensure_dirs(cfg)
     system = Win32WindowSystem()
-    capturer = Win32Capturer()
+    capturer = Win32Capturer(allow_screen_fallback=False, system=system)   # dialogs: PrintWindow only
+    if callbacks.get("frame_service") is None:
+        callbacks["frame_service"] = make_capture_service(cfg, system)
+        callbacks["owns_frame_service"] = True
     ocr = create_backend(cfg.detection.ocr_backend, cfg.detection.ocr_language, cfg.detection.ocr_upscale)
     rules = load_ruleset(cfg)
     queue = queue or open_queue(cfg)

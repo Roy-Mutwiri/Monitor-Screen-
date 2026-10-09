@@ -28,10 +28,32 @@ The monitor is strictly passive: it never focuses, restores, clicks or dismisses
 2. **Regions.** Drag on the preview to add *detection* regions (only these parts are OCR'd) or
    *redaction* regions (blacked out before OCR and before any screenshot leaves the machine).
    Regions are stored as fractions of the window, so they follow moves and resizes.
-3. **Capture.** Each poll captures the Studio main window with `PrintWindow(PW_RENDERFULLCONTENT)`
-   (works for Electron/Chromium windows even when covered). It also captures every visible window
-   that belongs to the Studio process tree or is owned by the main window, so a notice shown as a
-   **separate dialog** is captured as its own image, not missed by capturing only the main window.
+3. **Capture.** A capture service is bound to the validated Studio HWND as soon as you click
+   "Use selected window" (preview starts immediately, independent of Start/Stop). Backends, in
+   order of preference:
+   - **Windows Graphics Capture** (`wgc`, via the maintained `windows-capture` binding, Windows 10
+     1903+): captures the window's own composited surface even when Telegram, Chrome or anything
+     else covers it. WGC only emits a frame when the content changes, so the service restarts the
+     session as a heartbeat (every `capture.refresh_interval_seconds`, default 15 s) and on size
+     change or device loss; a fresh session always yields a frame.
+   - **PrintWindow** (`printwindow`): kept only where it produces a non-blank frame. GPU-composited
+     Electron windows such as Studio return an empty bitmap while occluded, which was the original
+     cause of the RUNNING/DEGRADED flapping.
+   - **Desktop crop** (`desktop-crop`): an explicit, clearly labelled last resort used only when the
+     window is the foreground window, fully on-screen and the top-level window at five sample
+     points of its own rectangle. It is never used silently and never sends another application's
+     pixels as Studio evidence.
+   Uniform (black/empty) frames are rejected even if the native call succeeded; unchanged static
+   content is valid. Frames carry their capture timestamp and backend; the monitor never uses a
+   frame older than `capture.max_frame_age_seconds` (30 s) as current evidence. Process identity is
+   pid + executable + **process creation time**, so a recycled pid never passes validation.
+   Dialogs are captured separately with PrintWindow, limited to windows owned by the main window or
+   sibling top-level windows of the same process/executable/class.
+
+   Verified on this machine with self-owned test windows: covered windows are captured correctly,
+   moves/resizes are followed. **Minimized windows deliver no frames** (WGC limitation) and are
+   reported as "Studio is minimized"; a locked desktop is reported as "Desktop locked". Capture
+   resumes automatically on restore/unlock.
 4. **OCR + rules.** Windows' built-in OCR (`winocr`, no external binary) reads the text; keyword
    rules classify it. Tesseract and RapidOCR are optional alternatives (`detection.ocr_backend`).
 5. **Incidents.** A popup must be seen in `confirm_polls` consecutive polls. The same popup staying
@@ -47,6 +69,33 @@ The monitor is strictly passive: it never focuses, restores, clicks or dismisses
    - `DEGRADED` Studio is minimized/hidden/off-screen, capture failed, or only a screen-grab
      fallback was possible while another window is in front
    - `LOST`     window/process gone; waiting for it to reappear
+
+## Broadcast-start alert
+
+On a confirmed NOT_LIVE -> LIVE transition the monitor sends one **"TIKTOK LIVE STUDIO HAS GONE
+LIVE"** event (category "Broadcast started / already live", with the exact redacted frame that
+supported the LIVE confirmation, "Detected at" time, optional `account_label`). Rules:
+
+- the first confirmed LIVE after monitoring starts is sent as **"IS ALREADY LIVE — monitoring
+  started"** and never as a new start;
+- UNKNOWN -> LIVE while the same broadcast is already announced sends nothing (observation resumed);
+- a confirmed NOT_LIVE re-arms the next start alert; if LIVE is then first seen after an UNKNOWN gap
+  longer than the max observation gap, the alert says so and does not assert the start time;
+- the last confirmed state and broadcast episode are persisted, so a restart while live reports
+  "already live" and never duplicates the start alert;
+- a confirmed LIVE ends the offline reminder episode and cancels a still-pending go-live reminder.
+
+Existing enabled bots were migrated to receive this category; new bots get it by default.
+
+## Health alerts (debounced)
+
+Application/session state, capture health, OCR health, broadcast state and Telegram delivery health
+are tracked separately and shown immediately in the GUI (friendly text; technical details under
+"Diagnostics"). Telegram receives a health message only when a degradation persists for
+`health.degrade_after_seconds` (15 s), once per episode even if the cause changes, and a recovery
+only after `health.recover_after_seconds` (10 s) of stable health and only if the degradation was
+alerted. The episode is persisted to avoid restart spam. Restriction and verification alerts are
+independent of this debounce. An unrelated foreground window never degrades window capture.
 
 ## Studio activity notifications
 
@@ -199,7 +248,7 @@ and the triggering screenshot as the photo. Verification puzzles are prefixed wi
 ## Install (development)
 
 ```powershell
-py -3.11 -m venv .venv
+py -3.11 -m venv .venv   # requirements include windows-capture + numpy for WGC
 .venv\Scripts\python -m pip install -r requirements.txt
 .venv\Scripts\python -m pip install -e .
 .venv\Scripts\python -m pytest
@@ -262,7 +311,9 @@ Produces `dist\StudioMonitor\StudioMonitor.exe` (GUI), `dist\StudioMonitor\studi
 
 ```
 src/studio_monitor/
-  win32/        ctypes bindings, window/process enumeration, PrintWindow capture
+  win32/        ctypes bindings, window/process enumeration, capture service (WGC / PrintWindow / desktop crop)
+  health.py     health model + debounced health alerts
+  broadcast_events.py  broadcast episodes (gone live / already live)
   target.py     identity validation, rediscovery, related dialog discovery
   tracker.py    RUNNING / DEGRADED / LOST lifecycle
   ocr/          windows | tesseract | rapidocr backends

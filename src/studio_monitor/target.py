@@ -21,7 +21,13 @@ class ValidationResult:
     window: Optional[WindowInfo] = None
 
 
-def identity_from_window(window: WindowInfo) -> TargetIdentity:
+def identity_from_window(window: WindowInfo, system: Optional[WindowSystem] = None) -> TargetIdentity:
+    start = 0.0
+    if system is not None:
+        try:
+            start = float(system.process_start_time(window.pid) or 0.0)
+        except Exception:
+            start = 0.0
     return TargetIdentity(
         hwnd=window.hwnd,
         pid=window.pid,
@@ -29,7 +35,22 @@ def identity_from_window(window: WindowInfo) -> TargetIdentity:
         exe_name=window.exe_name,
         class_name=window.class_name,
         title=window.title,
+        process_start=start,
     )
+
+
+def same_process(system: WindowSystem, identity: TargetIdentity, pid: int) -> bool:
+    """pid + executable + creation time: a recycled pid with a new process fails."""
+    if pid != identity.pid:
+        return False
+    if identity.process_start:
+        try:
+            start = float(system.process_start_time(pid) or 0.0)
+        except Exception:
+            start = 0.0
+        if start and abs(start - identity.process_start) > 2.0:
+            return False
+    return True
 
 
 def _same_exe(identity: TargetIdentity, window: WindowInfo) -> bool:
@@ -54,6 +75,8 @@ def validate_handle(system: WindowSystem, identity: TargetIdentity) -> Validatio
         )
     if window.class_name != identity.class_name:
         return ValidationResult(False, "window class changed; handle was reused")
+    if not same_process(system, identity, window.pid):
+        return ValidationResult(False, "process id was reused by a different process (creation time differs)")
     return ValidationResult(True, "", window)
 
 
@@ -98,21 +121,23 @@ def rediscover(system: WindowSystem, identity: TargetIdentity) -> Optional[Windo
 
 
 def related_windows(system: WindowSystem, main: WindowInfo) -> list[WindowInfo]:
-    """Visible dialogs/windows belonging to Studio besides its main window.
+    """Visible dialogs belonging to the validated Studio main window.
 
-    Includes windows from the Studio process tree (Electron helper processes)
-    and windows owned, directly or transitively, by the main window.
+    Only windows *owned* (directly or transitively) by the main window, or
+    top-level windows of the same process with the same executable and window
+    class (Electron dialogs). Arbitrary windows of helper processes are never
+    captured.
     """
-    tree = system.process_tree(main.pid)
     out = []
     for w in system.list_windows():
-        if w.hwnd == main.hwnd or not w.visible or w.cloaked or w.minimized:
+        if w.hwnd == main.hwnd or not w.visible or w.cloaked or w.minimized or w.tool_window:
             continue
         if w.rect.width < 40 or w.rect.height < 40:
             continue
-        in_tree = w.pid in tree
         owned = _owned_by(system, w, main.hwnd)
-        if in_tree or owned:
+        sibling = (w.pid == main.pid and w.exe_name.lower() == main.exe_name.lower()
+                   and w.class_name == main.class_name)
+        if owned or sibling:
             out.append(w)
     return out
 

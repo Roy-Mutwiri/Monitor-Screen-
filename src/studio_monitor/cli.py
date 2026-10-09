@@ -58,9 +58,9 @@ def _select(cfg: AppConfig, cfg_path: Path, hwnd_text: str) -> int:
     if not system.process_alive(win.pid):
         print("the window's process is not running", file=sys.stderr)
         return 2
-    cfg.target = identity_from_window(win)
+    cfg.target = identity_from_window(win, system)
     cfg.save(cfg_path)
-    print(f"target stored: {win.describe()}")
+    print(f"target stored: {win.describe()} (process started {cfg.target.process_start:.0f})")
     print(f"executable discovered: {win.exe_path}")
     return 0
 
@@ -169,12 +169,20 @@ def _run(cfg: AppConfig, cfg_path: Path, once: bool) -> int:
     log.info("%s monitor %s; target %s (%s); bots enabled: %s", SOURCE_LABEL, __version__, cfg.target.title,
              cfg.target.exe_name, ", ".join(enabled) or "none (alerts will queue with no deliveries)")
     if once:
+        import time as _time
+        deadline = _time.monotonic() + 3.0          # let the capture thread deliver its first frame
+        while _time.monotonic() < deadline and monitor.frames.frame() is None:
+            _time.sleep(0.1)
         dets = monitor.tick()
         st = monitor.tracker.state
+        cs = monitor.frames.status()
         print(f"status: {st.status.value} {st.reason}")
+        print(f"capture: {cs.health} backend={cs.backend or '-'} frames={cs.frames}"
+              f"{(' reason=' + cs.reason) if cs.reason else ''}")
         a = monitor.activity
         print(f"studio: {a.app_state}  broadcast: {a.live_state} ({a.last_observation or '-'})"
               f"{'' if a.live_rules_verified else '  [live rules unverified]'}")
+        monitor.frames.stop()
         for d in dets:
             print(f"detection: {d.category} in {'dialog' if d.is_dialog else 'main'}: {d.ocr_text[:120]!r}")
         return 0
@@ -346,7 +354,18 @@ def _test_alert(cfg: AppConfig, cfg_path: Path | None = None) -> int:
     return rc
 
 
+def _utf8_console() -> None:
+    """Window titles can contain characters the legacy console code page cannot
+    encode (e.g. U+200E in a Chrome tab title); never crash on printing them."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _utf8_console()
     parser = argparse.ArgumentParser(prog="studio-monitor", description=f"{SOURCE_LABEL} popup monitor")
     parser.add_argument("--config", type=Path, help="config file path")
     parser.add_argument("--version", action="version", version=__version__)

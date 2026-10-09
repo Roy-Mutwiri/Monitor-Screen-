@@ -15,8 +15,8 @@ from PIL import Image, ImageTk
 
 from .. import SOURCE_LABEL, __version__
 from ..alerts import format_duration
-from ..app import (build_monitor, load_live_rules, load_ruleset, make_registry, open_queue, run_migrations,
-                   setup_logging)
+from ..app import (build_monitor, load_live_rules, load_ruleset, make_capture_service, make_registry, open_queue,
+                   run_migrations, setup_logging)
 from ..bot_tests import deliver_test_now, enqueue_test, validate_bot, validate_token
 from ..bots import EVENT_CATEGORIES, MAX_BOTS, BotError, BotRegistry
 from ..config import AppConfig
@@ -26,7 +26,7 @@ from ..regions import Region
 from ..target import identity_from_window, validate_handle
 from ..telegram import ClientFactory, sanitize
 from ..tracker import Status
-from ..win32.capture import Win32Capturer
+from ..win32.capture import CaptureStatus, Win32Capturer
 from ..win32.windows import WindowInfo, Win32WindowSystem, looks_like_studio, selectable_windows
 
 STATUS_COLORS = {
@@ -122,6 +122,10 @@ class SettingsDialog(simpledialog.Dialog):
             ("Popup rules file (blank = bundled)", "rules", c.detection.rules_file),
             ("Delivery dead-letter age (hours)", "dead_age", str(c.telegram.delivery_max_age_hours)),
             ("Bots delivered in parallel", "concurrency", str(c.telegram.delivery_concurrency)),
+            ("Account label in broadcast alerts (optional)", "account", c.account_label),
+            ("Capture backend (auto | wgc | printwindow)", "backend", c.capture.backend),
+            ("Health alert after degraded for (s)", "degrade_after", str(c.health.degrade_after_seconds)),
+            ("Health recovery after stable for (s)", "recover_after", str(c.health.recover_after_seconds)),
         ):
             self._entry(gen, r, label, key, value); r += 1
         self._check(gen, r, "Attach screenshots to Telegram alerts", "send_shots", c.privacy.send_screenshots); r += 1
@@ -165,6 +169,7 @@ class SettingsDialog(simpledialog.Dialog):
             float(self.vars["open_timeout"].get()); float(self.vars["close_debounce"].get())
             float(self.vars["max_gap"].get()); int(self.vars["confirm_obs"].get())
             float(self.vars["dead_age"].get()); int(self.vars["concurrency"].get())
+            float(self.vars["degrade_after"].get()); float(self.vars["recover_after"].get())
         except ValueError:
             messagebox.showerror("Settings", "Numeric fields must be numbers.")
             return False
@@ -181,6 +186,10 @@ class SettingsDialog(simpledialog.Dialog):
         c.detection.rules_file = v["rules"].get().strip()
         c.telegram.delivery_max_age_hours = max(1.0, float(v["dead_age"].get()))
         c.telegram.delivery_concurrency = max(1, min(10, int(v["concurrency"].get())))
+        c.account_label = v["account"].get().strip()
+        c.capture.backend = v["backend"].get().strip() or "auto"
+        c.health.degrade_after_seconds = max(1.0, float(v["degrade_after"].get()))
+        c.health.recover_after_seconds = max(1.0, float(v["recover_after"].get()))
         c.privacy.send_screenshots = b["send_shots"].get()
         c.privacy.store_detected_text = b["store_text"].get()
         c.detection.include_dialogs = b["dialogs"].get()
@@ -326,7 +335,9 @@ class App:
         self.cfg = cfg
         self.cfg_path = cfg_path
         self.system = Win32WindowSystem()
-        self.capturer = Win32Capturer()
+        self.capturer = Win32Capturer(allow_screen_fallback=False, system=self.system)
+        self.capture_service = make_capture_service(cfg, self.system)
+        self._diag_visible = False
         self.monitor: Optional[Monitor] = None
         self.monitor_thread: Optional[threading.Thread] = None
         self.events: _queue.Queue = _queue.Queue()
@@ -370,6 +381,7 @@ class App:
         self.refresh_bots()
         self.root.after(200, self._pump_events)
         self.root.after(500, self._refresh_preview)
+        self.root.after(1000, self._refresh_capture_panel)
         if not any(b.enabled for b in self.registry.bots):
             self.notebook.select(self.bots_tab)
             self.log_line("Setup: add at least one Telegram bot in the Telegram Bots tab, then select the Studio "
@@ -407,6 +419,23 @@ class App:
         ttk.Button(btns, text="Use selected window", command=self.use_selected).pack(side="left", padx=4)
         self.target_var = tk.StringVar(value="No target selected.")
         ttk.Label(left, textvariable=self.target_var, wraplength=360, justify="left").pack(fill="x")
+
+        capf = ttk.Labelframe(left, text="Capture", padding=6)
+        capf.pack(fill="x", pady=(6, 0))
+        self.cap_vars: dict[str, tk.StringVar] = {}
+        for i, (label, key) in enumerate([("Selected window", "window"), ("Capture backend", "backend"),
+                                          ("Last valid frame", "frame"), ("Capture health", "health"),
+                                          ("Broadcast state", "live2"), ("Last confirmed transition", "transition")]):
+            ttk.Label(capf, text=label + ":").grid(row=i, column=0, sticky="nw", padx=(0, 6))
+            var = tk.StringVar(value="-")
+            self.cap_vars[key] = var
+            lbl = ttk.Label(capf, textvariable=var, wraplength=250, justify="left")
+            lbl.grid(row=i, column=1, sticky="w")
+            if key == "health":
+                self.cap_health_label = lbl
+        self.diag_btn = ttk.Button(capf, text="Diagnostics \u25b8", command=self._toggle_diag)
+        self.diag_btn.grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.diag = tk.Text(capf, height=7, width=48, state="disabled", font=("Consolas", 8), wrap="word")
 
         actf = ttk.Labelframe(left, text="Studio activity", padding=6)
         actf.pack(fill="x", pady=(6, 0))
@@ -550,7 +579,61 @@ class App:
         self.status_label.configure(text=status.value, bg=STATUS_COLORS[status])
         self.reason_var.set(reason)
 
+    def _toggle_diag(self) -> None:
+        self._diag_visible = not self._diag_visible
+        if self._diag_visible:
+            self.diag.grid(row=7, column=0, columnspan=2, sticky="we")
+            self.diag_btn.configure(text="Diagnostics \u25be")
+        else:
+            self.diag.grid_forget()
+            self.diag_btn.configure(text="Diagnostics \u25b8")
+
+    def _show_capture(self, cs: CaptureStatus, health: str = "", reason: str = "", live: str = "",
+                      transition: str = "") -> None:
+        v = self.cap_vars
+        t = self.cfg.target
+        v["window"].set(f'"{t.title}" ({t.exe_name}, pid {t.pid})' if t.is_set else "none selected")
+        names = {"wgc": "Windows Graphics Capture (window)", "printwindow": "PrintWindow (window)",
+                 "desktop-crop": "Desktop crop (explicit fallback)"}
+        v["backend"].set(names.get(cs.backend, cs.backend or "-"))
+        if cs.last_valid_at:
+            age = max(0.0, time.time() - cs.last_valid_at)
+            v["frame"].set(f"{datetime.fromtimestamp(cs.last_valid_at):%H:%M:%S} ({age:.0f}s ago, #{cs.frames})")
+        else:
+            v["frame"].set("none yet")
+        h = health or cs.health
+        r = reason or cs.reason
+        text = {"OK": "OK", "DEGRADED": "Degraded", "NONE": "Not capturing"}.get(h, h)
+        v["health"].set(text + (f" \u2014 {r}" if r else ""))
+        self.cap_health_label.configure(foreground={"OK": "#2e7d32", "DEGRADED": "#ef6c00"}.get(h, "#555"))
+        if live:
+            v["live2"].set(live.replace("_", " "))
+        if transition:
+            v["transition"].set(transition)
+        if self._diag_visible:
+            d = cs.diagnostics or {}
+            lines = [f"backend={cs.backend} code={cs.code or '-'} hwnd=0x{cs.hwnd:X}",
+                     f"frames={cs.frames} session_restarts={cs.session_restarts}",
+                     f"heartbeat={'alive' if cs.heartbeat_mono and time.monotonic() - cs.heartbeat_mono < 5 else 'stalled'}",
+                     f"last_valid_mono_age={(time.monotonic() - cs.last_valid_mono):.1f}s" if cs.last_valid_mono else "last_valid=none"]
+            lines += [f"{k}={v_}" for k, v_ in d.items()]
+            if t.is_set:
+                lines.append(f"target pid={t.pid} start={t.process_start:.0f} class={t.class_name}")
+            self.diag.configure(state="normal")
+            self.diag.delete("1.0", "end")
+            self.diag.insert("end", "\n".join(lines))
+            self.diag.configure(state="disabled")
+
+    def _refresh_capture_panel(self) -> None:
+        try:
+            if self.monitor is None:
+                self._show_capture(self.capture_service.status())
+        except Exception as exc:  # pragma: no cover
+            self.log_line(f"capture panel error: {exc}")
+        self.root.after(1000, self._refresh_capture_panel)
+
     def _show_activity(self, s: ActivitySnapshot) -> None:
+        self._show_capture(s.capture, s.health.capture, s.health.capture_reason, s.live_state, s.last_transition)
         v = self.act_vars
         v["app"].set(f"{s.app_state}" + (f"  (session {s.session_id})" if s.session_id else ""))
         verified = "" if s.live_rules_verified else "  [rules unverified]"
@@ -781,10 +864,12 @@ class App:
             messagebox.showerror("Select window", "That window is no longer available. Refresh the list.")
             self.refresh_windows()
             return
-        self.cfg.target = identity_from_window(win)
+        self.cfg.target = identity_from_window(win, self.system)
         self.save()
         self._show_target()
-        self.log_line(f"target set: {win.describe()}; executable discovered at {win.exe_path}")
+        self.capture_service.bind(win.hwnd)
+        self.log_line(f"target set: {win.describe()}; executable discovered at {win.exe_path}; capture initialized "
+                      f"({'window capture' if self.capture_service.wgc_available else 'PrintWindow'})")
 
     def _restore_target(self) -> None:
         if not self.cfg.target.is_set:
@@ -794,11 +879,13 @@ class App:
             from ..target import rediscover
             found = rediscover(self.system, self.cfg.target)
             if found is not None:
-                self.cfg.target = identity_from_window(found)
+                self.cfg.target = identity_from_window(found, self.system)
                 self.save()
                 self.log_line(f"stored handle was stale ({result.reason}); rediscovered {found.describe()}")
             else:
                 self.log_line(f"stored target not found ({result.reason}); it will be rediscovered when Studio reappears")
+        if validate_handle(self.system, self.cfg.target).ok:
+            self.capture_service.bind(self.cfg.target.hwnd)
         self._show_target()
 
     def _show_target(self) -> None:
@@ -818,20 +905,9 @@ class App:
     def _refresh_preview(self) -> None:
         try:
             img = None
-            with self._lock:
-                cap = self._monitor_capture
-                self._monitor_capture = None
-            if cap is not None:
+            cap = self.capture_service.frame(max_age=float("inf"))
+            if cap is not None and cap.hwnd == self.cfg.target.hwnd:
                 img = cap.image
-            elif self.monitor is None:
-                win = self._current_window()
-                if win is not None:
-                    fg = self.system.foreground_window()
-                    cap = self.capturer.capture(win, fg)
-                    if cap is not None:
-                        img = cap.image
-                    else:
-                        self.reason_var.set("Preview unavailable (window minimized or hidden)")
             if img is not None:
                 self.preview_image = img
                 self._draw_preview()
@@ -929,6 +1005,7 @@ class App:
                 on_capture=self._on_capture,
                 on_identity_change=lambda ident: self.events.put(("identity", ident)),
                 on_activity=lambda a: self.events.put(("activity", a)),
+                frame_service=self.capture_service,
             )
             self.monitor.client_factory = self.factory
         except Exception as exc:
@@ -951,6 +1028,8 @@ class App:
         self.stop_btn.configure(state="disabled")
         self._set_status(Status.STOPPED, "")
         self.act_vars["app"].set("monitor stopped (not observing)")
+        if self.cfg.target.is_set and self.cfg.target.hwnd:
+            self.capture_service.bind(self.cfg.target.hwnd)   # keep the preview of the selected window alive
 
     def _pump_events(self) -> None:
         refresh_hist = False
@@ -969,6 +1048,7 @@ class App:
                     self.cfg.target = payload
                     self.save()
                     self._show_target()
+                    self.capture_service.bind(payload.hwnd)
                 elif kind == "activity":
                     self._show_activity(payload)
         except _queue.Empty:
@@ -1040,6 +1120,10 @@ class App:
 
     def on_close(self) -> None:
         self.stop()
+        try:
+            self.capture_service.stop()
+        except Exception:
+            pass
         self.save()
         try:
             self.queue.close()
