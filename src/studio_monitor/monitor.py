@@ -1062,7 +1062,11 @@ class Monitor:
             w.rebind()
             w.tick()
         confirmed, recovered = w.drain()
-        live = self.broadcast.state.state == LiveState.LIVE and self.sessions.running
+        bs, ep = self.broadcast.state.state, self.episodes.state
+        # episode-aware like _run_detectors: a single UNKNOWN frame (OCR missed the upload bitrate) inside an open LIVE
+        # episode must not close and re-open the audio incident every few seconds (seen on the real 2026-10-09 broadcast)
+        live = self.sessions.running and (bs == LiveState.LIVE or
+                                          (bs == LiveState.UNKNOWN and ep.last_confirmed == LiveState.LIVE.value and bool(ep.episode_id)))
         # a problem that was already confirmed before the broadcast started is raised once we are LIVE
         if live and w.analyzer.silence.confirmed and "AUDIO_SILENCE" not in self._audio_incidents and not any(n == "AUDIO_SILENCE" for n, _ in confirmed):
             confirmed.append(("AUDIO_SILENCE", f"No audio from {w.binding.label} since before the broadcast started "

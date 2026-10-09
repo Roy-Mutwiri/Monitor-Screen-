@@ -6,7 +6,8 @@
     "any: at least one phrase must appear.  all: every phrase must appear.",
     "none: none of these phrases may appear (suppresses false positives).",
     "Matching is case-insensitive and tolerant of OCR spacing/punctuation.",
-    "priority: higher wins when several categories match the same text."
+    "priority: higher wins when several categories match the same text.",
+    "2026-10-09: monetization_restriction added from a real capture (gifting suspended in this LIVE, Appeal button)."
   ],
   "min_text_chars": 12,
   "categories": {
@@ -127,6 +128,23 @@
         "moderation notice",
         "content has been reported"
       ]
+    },
+    "monetization_restriction": {
+      "label": "Gifting / monetization restriction",
+      "severity": "high",
+      "priority": 70,
+      "any": [
+        "gifting suspended",
+        "gifting is suspended",
+        "gifting has been suspended",
+        "gifts are suspended",
+        "gifts suspended",
+        "monetization suspended",
+        "monetization is suspended",
+        "live gifts are turned off",
+        "gifting is disabled"
+      ],
+      "_comment": "Real Studio dialog captured 2026-10-09 while LIVE: 'Gifting suspended / This behavior is not in line with our policies. Gifting is suspended in this LIVE. Reason: ... / Appeal'"
     }
   }
 }
