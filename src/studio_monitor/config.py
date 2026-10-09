@@ -208,16 +208,6 @@ class DeviceConfig:
 
 
 @dataclass
-class DeviceConfig:
-    """Stable installation identity and fleet settings (used standalone and when managed by a hub)."""
-    device_id: str = ""                 # uuid4, generated on first save; a copied install enrolls as a new device
-    device_name: str = ""               # display name shown in the hub
-    expected_account: str = ""          # configured expectation; observed account is tracked separately
-    mode: str = "standalone"            # standalone | managed (hub owns Telegram delivery)
-    schedule: dict = field(default_factory=dict)   # schedules.Schedule.to_dict()
-
-
-@dataclass
 class UiConfig:
     theme: str = "bootstrap-dark"   # ttkbootstrap theme name (bootstrap-dark | bootstrap-light)
 
