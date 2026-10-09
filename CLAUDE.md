@@ -117,9 +117,14 @@ src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy
 - Root cause of 'Has gone LIVE' on the end dialog: phrase-anywhere live scoring (dialog 'End LIVE?', title chip 'Lets Go
   LIVE!', chat 'go LIVE'). Never reintroduce frame-wide control phrases; use LiveRules.classify_frame with exclusions.
 - Unknown-popup review (real session 2026-10-09): main UI (sign-in page, empty home panels, docked sources panel) is not
-  a dialog. Review needs: button row + >=2-word title + body/second button, centred floating panel, layout located;
-  one alert per review cooldown, one-shot (never an incident). Sign-in page = sign_in_screen, not alerted.
+  a dialog. Review needs: button row + >=2-word title + body/second button, centred compact floating panel in the
+  app's surface colour (PopupClassifier._on_ui_surface: ad cards in the video preview are not UI), layout located;
+  one alert per review cooldown, one-shot (never an incident). Sign-in page = sign_in_screen, LIVE settings sheet /
+  go-LIVE setup page (or 3+ blocks spread over >50% of the window) = studio_screen; neither is alerted.
 - tests/test_gui.py must run in its own pytest process: in the same process as the rest of the suite a later hub
   dashboard test dies with Windows fatal exception 0x80000003 (Tk + Jinja/starlette interaction; gui+hub alone pass).
+- Real Studio while LIVE (2026-10-09): the red 'Go LIVE' button is replaced by the elapsed timer; no 'End LIVE' label.
+  LIVE evidence = timer in the control slot (frame_analysis rescans the slot at 2x when no red control is located, score 1)
+  + status-bar 'Upload: N kbps' with N>0 (score 1). Never exclude the status bar from broadcast evidence.
 - Detectors never evaluate when the broadcast is not LIVE; a 'reconnecting' overlay keeps the LIVE episode open (UNKNOWN,
   not NOT_LIVE) so RECONNECTING can be reported.

@@ -13,28 +13,114 @@
     "  - anything else (no evidence, or contradictory evidence)              -> UNKNOWN",
     "Evidence items: `any` phrases (normalized, case-insensitive), optional `regex`,",
     "`requires_timer` (an HH:MM:SS / MM:SS elapsed timer must also be present), `score`.",
-    "A bare 'LIVE' word scores nothing on its own: it must come with a timer."
+    "A bare 'LIVE' word scores nothing on its own: it must come with a timer.",
+    "2026-10-09: on the real Studio UI the red 'Go LIVE' control is replaced by the elapsed timer while LIVE; there is no 'End LIVE' label. LIVE = timer in the control slot (score 1) + 'Upload: N kbps' with N>0 (score 1)."
   ],
   "verified": false,
   "timer_regex": "\\b\\d{1,2}:\\d{2}(?::\\d{2})?\\b",
   "live": {
     "min_score": 2,
     "evidence": [
-      {"name": "end_live_control", "any": ["end live", "end broadcast", "end stream", "stop live", "stop streaming"], "score": 2},
-      {"name": "live_badge_with_timer", "any": ["live"], "requires_timer": true, "score": 1},
-      {"name": "viewer_count", "regex": "\\b\\d[\\d,.]*[km]?\\s*(viewers|watching|viewer)\\b", "score": 1},
-      {"name": "streaming_status", "any": ["you're live", "you are live", "now live", "streaming live", "live now"], "score": 1}
+      {
+        "name": "end_live_control",
+        "any": [
+          "end live",
+          "end broadcast",
+          "end stream",
+          "stop live",
+          "stop streaming"
+        ],
+        "score": 2
+      },
+      {
+        "name": "live_badge_with_timer",
+        "any": [
+          "live"
+        ],
+        "requires_timer": true,
+        "score": 1
+      },
+      {
+        "name": "viewer_count",
+        "regex": "\\b\\d[\\d,.]*[km]?\\s*(viewers|watching|viewer)\\b",
+        "score": 1
+      },
+      {
+        "name": "streaming_status",
+        "any": [
+          "you're live",
+          "you are live",
+          "now live",
+          "streaming live",
+          "live now"
+        ],
+        "score": 1
+      },
+      {
+        "name": "encoder_uploading",
+        "regex": "upload\\W{0,3}\\s*[1-9]\\d{0,2}[\\d.,]*\\s*kbps",
+        "score": 1,
+        "_comment": "status bar 'Upload: 4813 kbps' while streaming (real frame 2026-10-09); 'Upload: 0 kbps' when idle"
+      }
     ]
   },
   "not_live": {
     "min_score": 2,
     "evidence": [
-      {"name": "go_live_control", "any": ["go live", "start live", "start broadcast", "start stream", "start streaming"], "score": 2},
-      {"name": "preview_label", "any": ["preview", "not live yet", "offline", "stream preview"], "score": 1},
-      {"name": "setup_hint", "any": ["add a title", "live title", "select a topic", "choose a topic", "live goal", "set up your live"], "score": 1}
+      {
+        "name": "go_live_control",
+        "any": [
+          "go live",
+          "start live",
+          "start broadcast",
+          "start stream",
+          "start streaming"
+        ],
+        "score": 2
+      },
+      {
+        "name": "preview_label",
+        "any": [
+          "preview",
+          "not live yet",
+          "offline",
+          "stream preview"
+        ],
+        "score": 1
+      },
+      {
+        "name": "setup_hint",
+        "any": [
+          "add a title",
+          "live title",
+          "select a topic",
+          "choose a topic",
+          "live goal",
+          "set up your live"
+        ],
+        "score": 1
+      },
+      {
+        "name": "encoder_idle",
+        "regex": "upload\\W{0,3}\\s*[0oO]\\s*kbps",
+        "score": 1,
+        "_comment": "status bar 'Upload: 0 kbps' (OCR often reads the zero as the letter O)"
+      }
     ]
   },
   "unknown": {
-    "any": ["loading", "connecting", "reconnecting", "sign in", "log in", "login", "update available", "updating", "please wait", "checking network"]
-  }
+    "any": [
+      "loading",
+      "connecting",
+      "reconnecting",
+      "sign in",
+      "log in",
+      "login",
+      "update available",
+      "updating",
+      "please wait",
+      "checking network"
+    ]
+  },
+  "verified_scope": "real NOT_LIVE frames and one real LIVE frame (operator session 2026-10-09): control slot + upload bitrate"
 }

@@ -76,7 +76,7 @@ def analyze_frame(frame: Image.Image, frame_id: int, captured_at: float, capture
     exclude: list[Box] = list(fa.obscured)
     control_label = ""
     if layout is not None:
-        for key in ("chat_panel", "top_bar", "right_panel", "left_panel", "status_bar"):
+        for key in ("chat_panel", "top_bar", "right_panel", "left_panel"):   # the status bar stays: 'Upload: N kbps' is evidence
             el = layout.get(key)
             if el is not None:
                 exclude.append(el.box)
@@ -86,6 +86,26 @@ def analyze_frame(frame: Image.Image, frame_id: int, captured_at: float, capture
             x, y, x2, y2 = lc.box
             inside = [b.text for b in boxes if x - 4 <= b.cx <= x2 + 4 and y - 4 <= b.cy <= y2 + 4]
             control_label = " ".join(inside).strip()
+        elif lc is None and boxes and classifier is not None and getattr(classifier, "reocr", None) is not None:
+            # no red button located (while LIVE the slot shows the elapsed timer, which full-frame OCR tends to miss):
+            # rescan the control slot at 2x. The slot = bottom-right of the preview band, left of the right panel.
+            w, h = frame.size
+            rp, sb = layout.get("right_panel"), layout.get("status_bar")
+            x0, x1 = int(w * 0.62), (rp.box[0] if rp is not None else int(w * 0.8))
+            y1 = sb.box[1] if sb is not None else int(h * 0.96)
+            y0 = max(0, y1 - int(h * 0.09))
+            if x1 - x0 > 40 and y1 - y0 > 16 and not fa.obscures((x0, y0, x1, y1), 0.5):
+                t1 = mono()
+                try:
+                    crop = frame.crop((x0, y0, x1, y1))
+                    found = classifier.reocr(crop.resize((crop.width * 2, crop.height * 2), Image.BICUBIC)) or []
+                    texts = [b.text for b in found if b.text.strip()]
+                    label = " ".join(texts).strip()
+                    if live_rules.timer_regex.search(label) or any(k in label.lower() for k in ("go live", "end live", "start live")):
+                        control_label = label
+                except Exception:
+                    pass
+                fa.timings_ms["control_slot_rescan"] = (mono() - t1) * 1000
     end_dialog = fa.popup_of_type(END_CONFIRMATION)
     summary = fa.popup_of_type(POST_LIVE_SUMMARY)
     if end_dialog is not None and not boxes:

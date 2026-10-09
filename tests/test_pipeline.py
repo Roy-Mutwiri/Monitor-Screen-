@@ -12,7 +12,7 @@ import pytest
 from conftest import TOKEN_A, TOKEN_B, FakeClock, FakeTransport, all_deliveries, make_window
 from studio_monitor.broadcast import LiveRules
 from studio_monitor.config import TelegramConfig
-from studio_monitor.popups import (ACCOUNT_SUSPENSION, END_CONFIRMATION, SIGN_IN, LIVE_ACCESS_SUSPENSION, LIVE_RESTRICTION, MISSING_SOURCE,
+from studio_monitor.popups import (ACCOUNT_SUSPENSION, END_CONFIRMATION, SIGN_IN, STUDIO_SCREEN, LIVE_ACCESS_SUSPENSION, LIVE_RESTRICTION, MISSING_SOURCE,
                                    POST_LIVE_SUMMARY, RECONNECTING, UNKNOWN, VERIFICATION, PopupClassifier)
 from studio_monitor.frame_analysis import analyze_frame
 from studio_monitor.end_request import EndDialogRules
@@ -355,3 +355,31 @@ def test_review_alerts_are_throttled_one_shot_and_never_incidents(auto):
     h.run(6)
     pops = alerts(h, "POP-")
     assert len(pops) == 2 and "logged, not sent" in pops[1]["payload"]["text"]
+
+
+def test_live_settings_sheet_is_a_page_not_a_popup(auto, rules):
+    c = classifier(rules)
+    assert c.classify_text("LIVE info Moderators", "A camera source is required to ensure real-time interactions during your LIVE.",
+                           ["LIVE settings", "Add camera"], "dialog")[0] == STUDIO_SCREEN
+    assert c.classify_text("To optimize LIVE experience, run a network", "speed test to ensure suitable video quality.",
+                           ["Video settings", "Edit"], "dialog")[0] == STUDIO_SCREEN
+    h = auto
+    h.run(4)
+    h.scene_cap.set_scene(dialog=["LIVE settings", "A camera source is required to ensure real-time interactions during your LIVE.", "Add camera | Cancel"])
+    h.run(8)
+    assert alerts(h, "POP-") == [] and alerts(h, "INC-") == [] and events_of(h, "BROADCAST_STARTED") == []
+    assert h.mon.last_analysis.popups and h.mon.last_analysis.popups[0].popup_type == STUDIO_SCREEN
+
+
+def test_light_ad_panel_inside_dark_preview_is_not_a_dialog(rules):
+    from PIL import Image, ImageDraw
+    from studio_monitor.popups import PopupClassifier as PC
+    frame = Image.new("RGB", (800, 500), (20, 20, 23))                      # dark Studio chrome
+    d = ImageDraw.Draw(frame)
+    d.rectangle((300, 200, 500, 300), fill=(234, 235, 237))                  # a white ad card in the video
+    d.rectangle((250, 350, 550, 450), fill=(40, 40, 43))                     # a Studio-surface dialog
+    assert PC._on_ui_surface(frame, (300, 200, 500, 300)) is False
+    assert PC._on_ui_surface(frame, (250, 350, 550, 450)) is True
+    light = Image.new("RGB", (800, 500), (245, 245, 247))                    # light theme: light dialogs are fine
+    ImageDraw.Draw(light).rectangle((250, 350, 550, 450), fill=(255, 255, 255))
+    assert PC._on_ui_surface(light, (250, 350, 550, 450)) is True

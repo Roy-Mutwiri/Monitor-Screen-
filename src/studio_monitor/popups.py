@@ -40,6 +40,7 @@ MISSING_SOURCE = "missing_source"
 POST_LIVE_SUMMARY = "post_live_summary"
 INFORMATIONAL = "informational"
 SIGN_IN = "sign_in_screen"
+STUDIO_SCREEN = "studio_screen"       # a full Studio page/sheet (LIVE settings, go-LIVE setup): main UI, never a popup
 UNKNOWN = "unknown"
 
 ALERTING_TYPES = (END_CONFIRMATION, LIVE_RESTRICTION, LIVE_ACCESS_SUSPENSION, ACCOUNT_SUSPENSION, VERIFICATION, RECONNECTING,
@@ -53,6 +54,10 @@ POST_LIVE_PHRASES = ["that's a wrap", "thats a wrap", "how was your live experie
 LIVE_ACCESS_PHRASES = ["live access", "access to live", "go live has been", "live feature", "live privileges", "cannot go live", "can no longer go live",
                       "not able to go live", "live is temporarily unavailable"]
 INFO_BUTTONS = {"ok", "got it", "close", "check", "later", "learn more", "done", "dismiss", "continue"}
+# Studio's pre-LIVE settings sheet (header 'LIVE settings', tabs LIVE info / Moderators, About me, Video settings,
+# 'A camera source is required ...', 'run a network speed test ...'): a page the operator opens, not a popup
+STUDIO_SCREEN_PHRASES = ["live settings", "live info moderators", "about me", "video settings", "add camera source",
+                         "camera source is required", "run a network speed test", "lets go live", "live match", "studio view"]
 # Studio's sign-in screen is a full page of cards (QR code, Google, email/password, confirm on mobile): one screen,
 # never a set of dialogs to review one by one
 SIGN_IN_PHRASES = ["scan to log in", "log in with", "continue with google", "continue with facebook", "continue with apple",
@@ -201,6 +206,8 @@ class PopupClassifier:
                 return MISSING_SOURCE, 0.75, "missing source / audio-device wording", ""
         if any(phrase_in(p, full) for p in SIGN_IN_PHRASES):
             return SIGN_IN, 0.8, "sign-in screen wording (QR / Google / email-password / confirm on mobile)", ""
+        if any(phrase_in(p, full) for p in STUDIO_SCREEN_PHRASES):
+            return STUDIO_SCREEN, 0.8, "Studio page/sheet wording (LIVE settings / go-LIVE setup)", ""
         if btns and all(b in INFO_BUTTONS for b in btns) and len(full) < 400:
             return INFORMATIONAL, 0.6, "generic dialog with only acknowledgement buttons", ""
         return UNKNOWN, 0.5, "dialog wording matches no known category", ""
@@ -211,9 +218,29 @@ class PopupClassifier:
         is a docked panel (source list, tools, engage) and is never reported as an unknown dialog."""
         w, h = size
         x, y, x2, y2 = panel
-        if x <= 2 or x2 >= w - 2 or y2 >= h - 2:
+        if x <= 2 or x2 >= w - 2 or y2 >= h - 2 or y <= 2:
             return False
+        if (x2 - x) > 0.6 * w or (y2 - y) > 0.6 * h:
+            return False                                        # a modal is compact; this is the canvas or a page
         return abs((x + x2) / 2 - w / 2) <= 0.2 * w
+
+    @staticmethod
+    def _on_ui_surface(frame: Image.Image, panel: Box, layout=None) -> bool:
+        """Studio draws its dialogs in the app's own surface colour (dark theme ~rgb 20-50, light theme near white).
+        A panel whose colour is far from the window chrome (title bar) or is saturated is video / ad content inside
+        the preview (e.g. 'DENTIST RECOMMENDED ... LEARN MORE' seen on 2026-10-09), never a dialog to review."""
+        import numpy as np
+        w, h = frame.size
+        tb = layout.get("top_bar") if layout is not None else None
+        cx0, cy0, cx1, cy1 = (tb.box if tb is not None else (0, 0, w, max(8, int(h * 0.05))))
+        chrome = np.asarray(frame.convert("L").crop((cx0, cy0, cx1, cy1)), dtype=np.int16)
+        x, y, x2, y2 = panel
+        rgb = np.asarray(frame.crop((max(0, x), max(0, y), min(w, x2), min(h, y2))), dtype=np.int16).reshape(-1, 3)
+        if rgb.size == 0 or chrome.size == 0:
+            return True
+        lum = np.median(rgb.mean(axis=1))
+        sat = (rgb.max(axis=1) - rgb.min(axis=1)).mean()
+        return bool(abs(float(lum) - float(np.median(chrome))) <= 60 and sat < 25)
 
     def _rescan_panel(self, frame: Image.Image, panel: Box, blk: TextBlock) -> Optional[TextBlock]:
         """Re-OCR the dialog panel at 2x; returns a replacement block when the rescan reads at least as many lines."""
@@ -260,21 +287,31 @@ class PopupClassifier:
                 continue                                                  # tile / counter / badge, not a message
             if ptype in (UNKNOWN, INFORMATIONAL) and not self._floats_centred(panel, frame.size):
                 continue                                                  # docked side/bottom panel (sources, tools), not a modal
+            if ptype in (UNKNOWN, INFORMATIONAL) and not self._on_ui_surface(frame, panel, layout):
+                continue                                                  # text on video/ad content, not a Studio surface
             out.append(PopupObservation(ptype, title, body, buttons, panel, observed_at, frame_id, conf, reason,
                                         evidence=blk.line_texts[:8], rule_category=rule_cat, kind=kind))
         if any(p.popup_type == POST_LIVE_SUMMARY for p in out):
             # the post-LIVE summary is a full-screen overlay made of several cards (rewards, top gifters, rating):
             # its other cards are parts of the summary, not new dialogs to review
             out = [p for p in out if p.popup_type not in (UNKNOWN, INFORMATIONAL)]
-        if any(p.popup_type == SIGN_IN for p in out):
-            # the sign-in page: every card on it belongs to one screen
-            cards = [p for p in out if p.popup_type in (SIGN_IN, UNKNOWN, INFORMATIONAL)]
+        w, h = frame.size
+        loose = [p for p in out if p.popup_type in (UNKNOWN, INFORMATIONAL)]
+        screen_type = next((t for t in (SIGN_IN, STUDIO_SCREEN) if any(p.popup_type == t for p in out)), None)
+        if screen_type is None and len(loose) >= 3:
+            ys = [p.bounding_box[1] for p in loose] + [p.bounding_box[3] for p in loose]
+            if max(ys) - min(ys) > 0.5 * h:
+                screen_type = STUDIO_SCREEN                      # three+ unrelated blocks spread over the window: a page, not dialogs
+        if screen_type is not None:
+            # a page (sign-in, LIVE settings sheet, go-LIVE setup): every card on it belongs to one screen
+            cards = [p for p in out if p.popup_type in (screen_type, UNKNOWN, INFORMATIONAL)]
             keep = [p for p in out if p not in cards]
             x, y = min(c.bounding_box[0] for c in cards), min(c.bounding_box[1] for c in cards)
             x2, y2 = max(c.bounding_box[2] for c in cards), max(c.bounding_box[3] for c in cards)
-            one = PopupObservation(SIGN_IN, "Sign-in screen", " / ".join(c.title for c in cards if c.title)[:300],
+            name = "Sign-in screen" if screen_type == SIGN_IN else "Studio page / sheet"
+            one = PopupObservation(screen_type, name, " / ".join(c.title for c in cards if c.title)[:300],
                                    sorted({b for c in cards for b in c.button_labels})[:8], (x, y, x2, y2), observed_at, frame_id, 0.8,
-                                   "sign-in screen wording across its cards", evidence=[c.title for c in cards][:8], kind="screen")
+                                   f"{name.lower()} wording across its cards", evidence=[c.title for c in cards][:8], kind="screen")
             out = keep + [one]
         return out
 

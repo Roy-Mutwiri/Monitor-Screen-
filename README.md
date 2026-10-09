@@ -174,7 +174,9 @@ manufactured from text that is not the control. Popups were also recognised *aft
 (frame id, capture time, OCR text + boxes). Popups are classified first from spatially grouped blocks on a uniform panel
 (title / body / button row); the chat panel, title bar, side panels and the control bar are negative regions. Only then is the
 broadcast state scored on the *unobscured* text, and the Go/End LIVE evidence comes from the label read inside the located
-red control on **this** frame — never from phrases elsewhere, never from the cached layout. The end dialog is evidence of
+red control on **this** frame — never from phrases elsewhere, never from the cached layout. While LIVE, Studio replaces
+that button with the elapsed timer (no "End LIVE" label): the control slot is rescanned at 2x and the timer counts as LIVE
+evidence together with the status bar's `Upload: N kbps` (N > 0); `Upload: 0 kbps` counts as NOT_LIVE evidence. The end dialog is evidence of
 an end *request*; it cannot start a broadcast, reset the episode or combine with another frame. Without OCR geometry the
 dialog's own lines are removed from the evidence before classification. A post-LIVE summary never counts as LIVE.
 A dialog panel whose full-frame OCR lost a button (white-on-red "End now" is the usual casualty) is rescanned once at 2x
@@ -183,9 +185,12 @@ cards of the post-LIVE summary are never reported as new popups.
 
 **What an unrecognised dialog must look like** (learned from a real session on 2026-10-09, when the sign-in page, the
 empty home panels and the docked sources panel each produced a review alert): a block with a button row, a title of at
-least two words and a body or a second button, floating centred like a Studio modal (never touching the window edge),
+least two words and a body or a second button, floating centred like a Studio modal (never touching the window edge,
+never most of the window), drawn in the app's own surface colour (a white ad card inside the dark preview is video, not UI),
 seen only after the layout has been located. The sign-in page (QR / Google / email-password / confirm on mobile) is one
-`sign_in_screen` observation and is not alerted. Review alerts carry every unrecognised block of the frame, are sent at
+`sign_in_screen` observation and is not alerted; the LIVE settings sheet / go-LIVE setup page (LIVE info, Moderators,
+About me, Video settings, camera-source and speed-test notes) and any three-plus unrelated blocks spread over the window
+are one `studio_screen` observation, also not alerted. Review alerts carry every unrecognised block of the frame, are sent at
 most once per `detection.review_cooldown_seconds` (default 300 s; later distinct blocks are counted into the next
 alert) and are one-shot notices: no incident, no reminders, nothing to `/ack`.
 
