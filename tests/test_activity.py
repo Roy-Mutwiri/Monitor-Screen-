@@ -409,5 +409,5 @@ def test_settings_persist_and_migrate(tmp_path):
     c.save(p)
     back = AppConfig.load(p)
     assert back.activity.offline_threshold_minutes == 45 and back.activity.repeat_enabled
-    assert back.live_regions == c.regions and back.config_version == 4
+    assert back.live_regions == c.regions and back.config_version == 5
     assert AppConfig.from_dict({"activity": {"bogus": 1, "notify_opened": False}}).activity.notify_opened is False

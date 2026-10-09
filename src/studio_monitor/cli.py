@@ -469,6 +469,50 @@ def _utf8_console() -> None:
             pass
 
 
+def _detectors(cfg: AppConfig, action: str, image: str | None, backend: str) -> int:
+    """Operator calibration helpers for the stream-health detectors. Never changes settings."""
+    from PIL import Image
+    from .config import connection_rules_path
+    from .detectors.presenter import YuNetDetector, model_path, verify_model
+    from .detectors.text_rules import ConnectionRules
+    d = cfg.detectors
+    if action == "status":
+        print(f"detectors enabled: {d.enabled}; presenter: {d.presenter_enabled} (expected on camera: {d.presenter_expected}); "
+              f"audio meter: {d.audio_enabled} ({d.audio_profile})")
+        print(f"face model: {model_path()} -> {'OK (checksum verified)' if verify_model(model_path()) else 'MISSING / checksum mismatch'}")
+        rules = ConnectionRules.load(connection_rules_path(cfg))
+        print(f"connection rules: {connection_rules_path(cfg)} verified={rules.verified} "
+              f"({len(rules.reconnecting)} reconnecting, {len(rules.ended)} ended, {len(rules.source_missing)} source phrases)")
+        print("regions: " + (", ".join(f"[{r.kind}] {r.name}" for r in cfg.regions if r.kind in ("face", "audio")) or "no presenter/audio regions"))
+        print(f"thresholds: face absent {d.face_absent_seconds:g}s, still {d.motion_low_seconds:g}s, frozen {d.frozen_seconds:g}s, "
+              f"black {d.black_preview_seconds:g}s, connection {d.connection_sustain_seconds:g}s, audio {d.audio_silence_seconds:g}s")
+        return 0
+    if not image:
+        print("IMAGE is required for this action"); return 2
+    img = Image.open(image).convert("RGB")
+    if action == "text":
+        ocr = create_backend(backend or cfg.detection.ocr_backend, cfg.detection.ocr_language, cfg.detection.ocr_upscale)
+        text = ocr.recognize(img).text
+        cls = ConnectionRules.load(connection_rules_path(cfg)).classify(text)
+        print(f"OCR text ({len(text)} chars): {' '.join(text.split())[:400]!r}")
+        print("classification: " + ", ".join(f"{k}={v!r}" for k, v in cls.items()))
+        return 0
+    region = next((r for r in cfg.regions if r.kind == ("face" if action == "face" else "audio")), None)
+    crop = region.crop(img) if region else img
+    print(f"region: {region.name if region else 'whole image (no region configured)'} size={crop.size}")
+    if action == "face":
+        det = YuNetDetector()
+        faces = det.detect(crop)
+        print(f"faces detected: {len(faces)}")
+        for f in faces:
+            print(f"  box={f.box} score={f.score:.2f}")
+        return 0
+    from .detectors.audio import read_meter
+    r = read_meter(img, region.to_box(*img.size) if region else (0, 0, img.width, img.height))
+    print(f"audio meter readable={r.valid} level={r.level:.3f} {r.note}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _utf8_console()
     parser = argparse.ArgumentParser(prog="studio-monitor", description=f"{SOURCE_LABEL} popup monitor")
@@ -496,6 +540,9 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("schedule", help="show or set the streaming schedule")
     p.add_argument("--enable", action="store_true"); p.add_argument("--disable", action="store_true")
     p.add_argument("--tz"); p.add_argument("--days"); p.add_argument("--start"); p.add_argument("--end"); p.add_argument("--grace", type=int)
+    p = sub.add_parser("detectors", help="stream-health detectors: status | text IMAGE | face IMAGE | audio IMAGE")
+    p.add_argument("action", choices=["status", "text", "face", "audio"]); p.add_argument("image", nargs="?")
+    p.add_argument("--backend", default="")
     p = sub.add_parser("account", help="TikTok account discovery: status | test | clear")
     p.add_argument("action", choices=["status", "test", "clear"], nargs="?", default="status")
     p = sub.add_parser("owner", help="show or set the PC owner name used in notification labels")
@@ -541,6 +588,8 @@ def main(argv: list[str] | None = None) -> int:
         return _calibrate_live(cfg, args.image, args.backend)
     if cmd == "history":
         return _history(cfg, args.kind, args.limit, args.expand)
+    if args.cmd == "detectors":
+        return _detectors(cfg, args.action, args.image, args.backend)
     if cmd == "autostart":
         return _autostart(cfg, cfg_path, args.enable, args.disable)
     if cmd == "maintenance":

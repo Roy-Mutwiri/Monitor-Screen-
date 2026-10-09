@@ -429,7 +429,7 @@ def test_broadcast_subscription_migration_and_multi_bot_delivery(cfg, rules, clo
     notes = appmod.run_migrations(cfg, path, reg, queue)
     assert any("Broadcast started" in n for n in notes)
     assert CAT_BROADCAST in a.subscriptions and CAT_BROADCAST not in b.subscriptions
-    assert AppConfig.load(path).config_version == 4
+    assert AppConfig.load(path).config_version == 5
     assert appmod.run_migrations(cfg, path, reg, queue) == [] or all("Broadcast" not in n for n in appmod.run_migrations(cfg, path, reg, queue))
     reg.set_enabled(b.bot_id, True)
     h = Harness(cfg, rules, clock, queue=queue)

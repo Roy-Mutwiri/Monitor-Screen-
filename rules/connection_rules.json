@@ -1,0 +1,22 @@
+{
+  "_comment": [
+    "UNVERIFIED SEED. Phrases Studio may show for connection problems, stream end and missing",
+    "sources. Calibrate with `studio-monitor calibrate IMAGE` style OCR dumps of real Studio",
+    "screenshots and set `verified` to true only after real wording has been confirmed.",
+    "Matching is whole-word on normalized OCR text. Temporal confirmation is applied by the detector."
+  ],
+  "verified": false,
+  "reconnecting": {
+    "any": ["reconnecting", "connection lost", "connection unstable", "network unstable", "poor network",
+            "trying to reconnect", "network error", "disconnected", "reconnect", "weak network", "connection interrupted"]
+  },
+  "ended": {
+    "any": ["live has ended", "your live has ended", "live ended", "stream ended", "the live has ended",
+            "live session has ended", "you have ended your live"]
+  },
+  "source_missing": {
+    "any": ["camera unavailable", "camera not found", "no camera", "camera disconnected", "source not found",
+            "source unavailable", "device disconnected", "media file not found", "failed to load", "file not found",
+            "capture device unavailable", "no signal", "device not found", "microphone not found", "microphone unavailable"]
+  }
+}

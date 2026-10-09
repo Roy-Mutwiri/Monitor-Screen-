@@ -102,6 +102,17 @@ def run_migrations(cfg: AppConfig, cfg_path: Path, registry: BotRegistry, queue:
         cfg.save(cfg_path)
         if added:
             notes.append(f"subscribed {added} enabled bot(s) to the new 'Broadcast started / already live' category")
+    if cfg.config_version < 5:
+        from .bots import CAT_STREAM
+        added = 0
+        for b in registry.bots:
+            if b.enabled and CAT_STREAM not in b.subscriptions:
+                b.subscriptions.append(CAT_STREAM)
+                added += 1
+        cfg.config_version = 5
+        cfg.save(cfg_path)
+        if added:
+            notes.append(f"subscribed {added} enabled bot(s) to the new 'Stream health' category")
     if queue.legacy_pending_count() or not queue.get_state("legacy_alerts_migrated"):
         target = None
         default = registry.by_name("Default Bot") or (registry.bots[0] if registry.bots else None)
@@ -113,6 +124,32 @@ def run_migrations(cfg: AppConfig, cfg_path: Path, registry: BotRegistry, queue:
             if done["pending"] or done["history"]:
                 notes.append(f"migrated legacy outbox: {done['pending']} pending, {done['history']} history row(s)")
     return notes
+
+
+def make_detector_suite(cfg: AppConfig, clock=None, mono=None):
+    """Detector suite for the real app: YuNet face backend when the bundled model verifies, else presenter
+    conditions are DISABLED (never silently approximated)."""
+    import time
+    from .config import connection_rules_path
+    from .detectors.presenter import YuNetDetector
+    from .detectors.suite import DetectorSuite, DetectorsConfig
+    from .detectors.text_rules import ConnectionRules
+    d = cfg.detectors
+    if not d.enabled:
+        return None
+    dc = DetectorsConfig(**{k: getattr(d, k) for k in DetectorsConfig.__dataclass_fields__ if hasattr(d, k)})
+    try:
+        rules = ConnectionRules.load(connection_rules_path(cfg))
+    except Exception as exc:
+        log.warning("connection rules unavailable (%s); text detectors disabled", exc)
+        rules = ConnectionRules({})
+    backend = None
+    if d.presenter_enabled:
+        try:
+            backend = YuNetDetector()
+        except Exception as exc:
+            log.warning("face detector unavailable: %s; presenter conditions DISABLED", exc)
+    return DetectorSuite(dc, rules, backend, clock or time.time, mono or time.monotonic)
 
 
 def make_capture_service(cfg: AppConfig, system=None):
@@ -144,5 +181,6 @@ def build_monitor(cfg: AppConfig, cfg_path: Path, registry: Optional[BotRegistry
     for note in run_migrations(cfg, cfg_path, registry, queue):
         log.info(note)
     factory = ClientFactory(cfg.telegram, registry.token_for)
+    callbacks.setdefault("detector_suite", make_detector_suite(cfg))
     return Monitor(cfg, system, capturer, ocr, rules, queue, registry, factory,
                    live_rules=load_live_rules(cfg), **callbacks)

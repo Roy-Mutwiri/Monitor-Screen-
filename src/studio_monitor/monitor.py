@@ -19,9 +19,12 @@ from typing import Callable, Optional
 
 from .account import (DISABLED_STATUS, FAILED, IN_PROGRESS, NOT_ATTEMPTED, SUCCEEDED, AccountIdentity, AccountLookupJob,
                       IdentityStore, Interactor, LookupContext, LookupResult, Win32Interactor)
+from .detectors.suite import CATEGORY_OF as STREAM_CATEGORY_OF, DetectorSuite
+from .alerts import (format_stream_alert, format_stream_recovered)
 from .alerts import (format_alert, format_already_live, format_broadcast_started, format_health_alert,
                      format_not_live_reminder, format_studio_already_running, format_studio_closed,
                      format_studio_opened)
+from .bots import CAT_STREAM
 from .bots import (CAT_BROADCAST, CAT_HEALTH, CAT_REMINDERS, CAT_RESTRICTIONS, CAT_STUDIO_CLOSED, CAT_STUDIO_OPENED,
                    CAT_VERIFICATION, BotRegistry)
 from .broadcast import BroadcastStateEngine, Classification, LiveRules, LiveState
@@ -84,6 +87,8 @@ class ActivitySnapshot:
     capture: CaptureStatus = field(default_factory=CaptureStatus)
     target_title: str = ""
     target_hwnd: int = 0
+    stream: dict = field(default_factory=dict)      # condition -> {"state", "detail", "since"}
+    stream_end_hint: str = ""
 
 
 def _event_id(prefix: str, ts: float) -> str:
@@ -118,7 +123,8 @@ class Monitor:
                  owns_frame_service: bool = False,
                  interactor: Optional[Interactor] = None,
                  inline_lookup: bool = False,
-                 lookup_sleep: Callable[[float], None] = time.sleep) -> None:
+                 lookup_sleep: Callable[[float], None] = time.sleep,
+                 detector_suite: Optional[DetectorSuite] = None) -> None:
         self.cfg = cfg
         self.system = system
         self.capturer = capturer                 # dialogs only (PrintWindow, no desktop fallback)
@@ -191,6 +197,10 @@ class Monitor:
         self._lookup: Optional[AccountLookupJob] = None
         self._pending_broadcast: Optional[dict] = None
         self._blocking_detection = False
+        # stream-health detectors (connection / source / presenter / audio), evaluated only while LIVE
+        self.detectors: Optional[DetectorSuite] = detector_suite
+        self._stream_incidents: dict[str, dict] = {}
+        self._stream_end_hint = ""
         self.activity = ActivitySnapshot(live_rules_verified=self.live_rules.verified)
         if cfg.target.hwnd:
             self.frames.bind(cfg.target.hwnd)
@@ -336,12 +346,94 @@ class Monitor:
             classification = self._classify_live(main_cap, main_full_text)
         self._update_broadcast_and_reminders(classification, main_cap if fresh_frame else None)
         self._poll_lookup()
+        self._run_detectors(main_cap, fresh_frame and screenshot_ok, main_full_text)
 
         self._update_health(state)
         self._emit_status(self.tracker.state.status, self.tracker.state.reason)
         self._emit_activity()
         self._maybe_purge()
         return detections
+
+    # ---- stream-health detectors --------------------------------------
+    STREAM_CODES = {"RECONNECTING": "CON", "SOURCE_MISSING": "SRC", "BLACK_PREVIEW": "BLK", "FACE_ABSENT": "FAC",
+                    "FACE_MOTION_LOW": "MOT", "PREVIEW_FROZEN": "FRZ", "AUDIO_SILENCE": "AUD"}
+    STREAM_SEVERITY = {"RECONNECTING": Severity.WARNING, "SOURCE_MISSING": Severity.WARNING, "BLACK_PREVIEW": Severity.WARNING,
+                       "FACE_ABSENT": Severity.WARNING, "FACE_MOTION_LOW": Severity.INFO, "PREVIEW_FROZEN": Severity.WARNING,
+                       "AUDIO_SILENCE": Severity.WARNING}
+
+    def _run_detectors(self, main_cap: Optional[Capture], fresh: bool, text: Optional[str]) -> None:
+        suite = self.detectors
+        if suite is None:
+            return
+        bs = self.broadcast.state.state
+        ep = self.episodes.state
+        # LIVE, or a transitional/unreadable screen (UNKNOWN) inside an open LIVE episode: reconnecting
+        # overlays are exactly the moments the detectors exist for and never mean NOT_LIVE.
+        live = self.sessions.running and (bs == LiveState.LIVE or
+                                          (bs == LiveState.UNKNOWN and ep.last_confirmed == LiveState.LIVE.value and bool(ep.episode_id)))
+        if not live:
+            if self._stream_incidents:
+                self._close_stream_incidents("Broadcast is no longer confirmed LIVE; stream-health evaluation stopped.")
+            if suite.cond["RECONNECTING"].confirmed or any(c.confirmed for c in suite.cond.values()):
+                suite.reset()
+            self._stream_end_hint = ""
+            self.activity.stream = {}
+            return
+        if self._lookup is not None:                       # profile-menu lookup changes the frame; pause briefly
+            suite.suspend(max(2.0, self.cfg.detectors.scene_change_grace_seconds))
+        suppressed = self.incident_engine.is_suppressed(self.device_id, CAT_STREAM) or self._blocking_detection
+        frame = main_cap.image if (main_cap is not None and fresh) else None
+        out = suite.evaluate(frame, fresh and frame is not None, True, text or "", self.cfg.regions, suppressed=suppressed)
+        if fresh and text:
+            ended = suite.classify_text(text).get("ended")
+            if ended and not self._stream_end_hint:
+                self._stream_end_hint = ended
+                self.on_event(f"stream-end wording seen while LIVE ({ended!r}); broadcast state is decided by the live-state engine")
+        for name, detail in out.confirmed:
+            self._open_stream_incident(name, detail, main_cap)
+        for name, detail in out.recovered:
+            self._resolve_stream_incident(name, detail)
+        self.activity.stream = {k: {"state": c.state, "detail": c.detail, "since": c.since} for k, c in out.conditions.items()}
+
+    def _open_stream_incident(self, name: str, detail: str, main_cap: Optional[Capture]) -> None:
+        now = self.clock()
+        cond = self.detectors.cond[name]
+        since = now - cond.duration(self.mono())
+        eid = _event_id("STR" + self.STREAM_CODES.get(name, "GEN"), now)
+        shot = self._save_evidence(eid, main_cap.image if main_cap is not None else None)
+        attach = bool(shot)
+        payload = format_stream_alert(name, detail, self.cfg.machine_label, now, since, label=self.cfg.notification_label,
+                                      account=self.current_account_handle(), screenshot_attached=attach,
+                                      rules_verified=self.detectors.rules.verified, episodes=cond.episodes)
+        change = self.incident_engine.open_or_update(
+            self.device_id, CAT_STREAM, name, self.STREAM_SEVERITY.get(name, Severity.WARNING), detail,
+            session_id=self.sessions.session_id, evidence_path=shot, account=self.current_account_handle(),
+            owner_label=self.cfg.notification_label, incident_id=eid)
+        self._stream_incidents[name] = {"incident_id": change.incident.incident_id, "since": since, "event_id": eid}
+        if not change.is_new:
+            payload["thread_of"] = change.incident.incident_id
+        n = self.dispatch(eid, KIND_INCIDENT, CAT_STREAM, payload, shot, label=f"Stream {name}", incident_id=change.incident.incident_id)
+        self.on_event(f"stream health: {name} confirmed -> {eid} queued for {n} bot(s): {detail}")
+
+    def _resolve_stream_incident(self, name: str, detail: str, final: bool = False) -> None:
+        info = self._stream_incidents.pop(name, None)
+        if info is None:
+            return
+        now = self.clock()
+        self.incident_engine.resolve(info["incident_id"], detail, observed_utc=_utc(now))
+        if final:
+            self.on_event(f"stream health: {name} closed ({detail})")
+            return
+        payload = format_stream_recovered(name, detail, self.cfg.machine_label, now, now - info["since"],
+                                          label=self.cfg.notification_label)
+        payload["thread_of"] = info["incident_id"]
+        self.dispatch(f"{info['event_id']}-RES", KIND_INCIDENT, CAT_STREAM, payload, "", label=f"Stream {name} cleared",
+                      incident_id=info["incident_id"])
+        self.on_event(f"stream health: {name} cleared -> {info['event_id']}-RES queued")
+
+    def _close_stream_incidents(self, reason: str) -> None:
+        for name in list(self._stream_incidents):
+            self._resolve_stream_incident(name, reason, final=True)
 
     # ---- restriction alerts ------------------------------------------
     def _raise_alert(self, det: Detection, inc: Incident, reason: str) -> None:
@@ -758,6 +850,7 @@ class Monitor:
             last_event=st.last_event, delivery=self.queue.delivery_status(), health=HealthSnapshot(**self.health.__dict__),
             account=self.account_snapshot(),
             capture=self.frames.status(), target_title=self.tracker.identity.title, target_hwnd=self.tracker.identity.hwnd,
+            stream=dict(self.activity.stream), stream_end_hint=self._stream_end_hint,
         )
         self.on_activity(self.activity)
 

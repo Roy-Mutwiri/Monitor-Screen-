@@ -162,6 +162,40 @@ and a mode: `standalone` (local Telegram delivery) or `managed` (a hub owns deli
 recorded locally and delivered by the hub, so there are no duplicate notifications). Local bot
 settings are kept in both modes.
 
+## Stream-health detectors (while LIVE)
+
+`detectors/` evaluates the fresh Studio frame only while the broadcast is confirmed LIVE (or shows a
+transitional/unreadable screen inside an open LIVE episode). Every condition needs sustained evidence,
+pauses on invalid frames (UNKNOWN), restarts after an evidence gap longer than 10 s, and recovers only
+after the problem has been absent for a while. One incident per condition episode; recovery replies to
+the original message; incidents are closed quietly when the broadcast ends. Nothing here changes the
+LIVE / NOT_LIVE state and nothing clicks Studio.
+
+| Condition | Evidence | Default |
+|---|---|---|
+| `RECONNECTING` | connection wording from `rules/connection_rules.json` (unverified seed) in the OCR text | 10 s sustain, 20 s recover |
+| `SOURCE_MISSING` | explicit "camera unavailable / source not found / file not found" wording | 10 s |
+| `BLACK_PREVIEW` | presenter region mean luminance below 12 | 20 s |
+| `FACE_ABSENT` | no face in the **Presenter** region (profile "presenter expected" only) | 30 s |
+| `FACE_MOTION_LOW` | face visible, in-face motion below threshold (background motion ignored) | 60 s |
+| `PREVIEW_FROZEN` | presenter region pixel-identical while the rest of the frame keeps changing | 20 s |
+| `AUDIO_SILENCE` | Studio's on-screen **Audio meter** region shows no lit segments; unreadable meter = UNKNOWN | 30 s |
+
+Face detection uses OpenCV's YuNet (`models/face_detection_yunet_2023mar.onnx`, Apache-2.0, SHA-256
+pinned) on the CPU and returns boxes and landmarks only; no embeddings, no identity, nothing leaves the
+PC. If the model is missing or fails verification the presenter conditions are reported DISABLED rather
+than approximated. A large whole-frame change (scene switch) pauses presenter evaluation for 10 s and
+restarts its timers; the profile-menu account lookup and maintenance mode suppress it too. Regions:
+draw a **Presenter** box over the camera preview and an **Audio meter** box over Studio's level meter.
+Settings → "Stream health (while LIVE)" holds the thresholds and the presenter/audio profiles; bots
+receive these alerts through the new `stream_health` category (existing enabled bots are subscribed
+by the version-5 settings migration). CLI: `studio-monitor detectors status | text IMAGE | face IMAGE |
+audio IMAGE` for calibration against real screenshots.
+
+**Not verified on a real broadcast**: the connection/source wording, the YuNet accuracy on this
+machine's camera framing, the meter reader against Studio's real meter and all thresholds are
+synthetic-replay validated only.
+
 ## Health alerts (debounced)
 
 Application/session state, capture health, OCR health, broadcast state and Telegram delivery health
@@ -436,6 +470,7 @@ src/studio_monitor/
   sessions.py   Studio application session (opened / closed)
   framecache.py latest valid redacted frame
   broadcast.py  LIVE / NOT_LIVE / UNKNOWN engine
+  detectors/    stream-health conditions: text rules, presenter (YuNet), audio meter, suite
   reminders.py  offline episodes + not-live reminders
   startup.py    start at Windows sign-in (HKCU Run)
   bots.py       bot registry (max 10), subscriptions, fingerprints
@@ -447,7 +482,7 @@ src/studio_monitor/
   monitor.py    the loop
   gui/app.py    Tkinter UI
   cli.py        command line
-rules/studio_rules.json, rules/live_state_rules.json
+rules/studio_rules.json, rules/live_state_rules.json, rules/connection_rules.json; models/ (YuNet face detector)
 tests/          pytest suite (fakes for Win32, capture, OCR, Telegram)
 packaging/      PyInstaller spec + build script
 ```

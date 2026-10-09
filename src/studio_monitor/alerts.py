@@ -252,6 +252,50 @@ def format_health_alert(kind: str, reason: str, machine_label: str, ts: float, s
     return _finish(lines, ts)
 
 
+# ---------------------------------------------------------------- stream health (detectors)
+
+STREAM_TITLES = {
+    "RECONNECTING": ("📶", "CONNECTION PROBLEM"),
+    "SOURCE_MISSING": ("🖥️", "SOURCE MISSING"),
+    "BLACK_PREVIEW": ("⬛", "PREVIEW BLACK"),
+    "FACE_ABSENT": ("👤", "PRESENTER NOT VISIBLE"),
+    "FACE_MOTION_LOW": ("🧍", "PRESENTER VERY STILL"),
+    "PREVIEW_FROZEN": ("🧊", "PREVIEW MAY BE FROZEN"),
+    "AUDIO_SILENCE": ("🔇", "AUDIO METER SILENT"),
+}
+
+
+def format_stream_alert(condition: str, detail: str, machine_label: str, ts: float, since: float,
+                        label: str = "", account: str = "", screenshot_attached: bool = False,
+                        rules_verified: bool = True, episodes: int = 1) -> dict:
+    """Cautious wording: states the evidence, never a verdict about the broadcast itself."""
+    label = label or f"{machine_label}\u2019s Live"
+    icon, title = STREAM_TITLES.get(condition, ("\u26A0\uFE0F", condition.replace("_", " ")))
+    lines = [headline(icon, label, title), html.escape(detail)]
+    if account:
+        lines.append(f"TikTok account: {html.escape(account)}")
+    lines += [f"Since: {local_ts(since)}", f"Detected at: {local_ts(ts)}", f"PC: {html.escape(machine_label)}"]
+    if episodes > 1:
+        lines.append(f"Occurrence {episodes} during this broadcast.")
+    if condition in ("FACE_ABSENT", "FACE_MOTION_LOW", "PREVIEW_FROZEN"):
+        lines.append("Evidence: configured presenter region of the Studio window only. No identity recognition is performed.")
+    if condition == "AUDIO_SILENCE":
+        lines.append("Evidence: Studio\u2019s on-screen audio meter, not system audio.")
+    if condition in ("RECONNECTING", "SOURCE_MISSING") and not rules_verified:
+        lines.append("Note: message wording rules are seeded and not yet verified against real Studio screenshots.")
+    lines.append("Screenshot attached." if screenshot_attached else "No screenshot attached.")
+    return _finish(lines, ts)
+
+
+def format_stream_recovered(condition: str, detail: str, machine_label: str, ts: float, duration: float,
+                            label: str = "") -> dict:
+    label = label or f"{machine_label}\u2019s Live"
+    _, title = STREAM_TITLES.get(condition, ("", condition.replace("_", " ")))
+    lines = [headline("\u2705", label, f"{title} \u2014 CLEARED"), html.escape(detail),
+             f"Lasted: {format_duration(duration)}", f"Time: {local_ts(ts)}", f"PC: {html.escape(machine_label)}"]
+    return _finish(lines, ts)
+
+
 def format_status_alert(status: str, reason: str, machine_label: str, ts: float, label: str = "") -> str:
     label = label or f"{machine_label}’s Live"
     return "\n".join([

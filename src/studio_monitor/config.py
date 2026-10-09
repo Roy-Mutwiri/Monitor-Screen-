@@ -146,6 +146,30 @@ class AccountConfig:
 
 
 @dataclass
+class DetectorsSettings:
+    """Stream-health detectors (presenter/face, preview, source, connection, audio)."""
+    enabled: bool = True
+    presenter_enabled: bool = True
+    presenter_expected: bool = True
+    face_absent_seconds: float = 30.0
+    motion_low_seconds: float = 60.0
+    motion_threshold: float = 0.035
+    frozen_seconds: float = 20.0
+    black_preview_seconds: float = 20.0
+    black_luma: float = 12.0
+    source_sustain_seconds: float = 10.0
+    connection_sustain_seconds: float = 10.0
+    connection_recover_seconds: float = 20.0
+    recover_seconds: float = 15.0
+    scene_change_grace_seconds: float = 10.0
+    audio_enabled: bool = False
+    audio_silence_seconds: float = 30.0
+    audio_level_threshold: float = 0.05
+    audio_profile: str = "mixed"
+    rules_file: str = ""
+
+
+@dataclass
 class DeviceConfig:
     """Stable installation identity and fleet settings (used standalone and when managed by a hub)."""
     device_id: str = ""                 # uuid4, generated on first save; a copied install enrolls as a new device
@@ -170,7 +194,7 @@ class UiConfig:
     theme: str = "bootstrap-dark"   # ttkbootstrap theme name (bootstrap-dark | bootstrap-light)
 
 
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 
 
 @dataclass
@@ -191,6 +215,7 @@ class AppConfig:
     ui: UiConfig = field(default_factory=UiConfig)
     account: AccountConfig = field(default_factory=AccountConfig)
     device: DeviceConfig = field(default_factory=DeviceConfig)
+    detectors: DetectorsSettings = field(default_factory=DetectorsSettings)
     config_version: int = CONFIG_VERSION
 
     # -- serialisation ----------------------------------------------------
@@ -221,6 +246,7 @@ class AppConfig:
         cfg.ui = UiConfig(**_known(UiConfig, data.get("ui", {})))
         cfg.account = AccountConfig(**_known(AccountConfig, data.get("account", {})))
         cfg.device = DeviceConfig(**_known(DeviceConfig, data.get("device", {})))
+        cfg.detectors = DetectorsSettings(**_known(DetectorsSettings, data.get("detectors", {})))
         if cfg.device.mode not in ("standalone", "managed"):
             cfg.device.mode = "standalone"
         cfg.device = DeviceConfig(**_known(DeviceConfig, data.get("device", {})))
@@ -342,6 +368,12 @@ def bundled_rules_path(name: str = "studio_rules.json") -> Path:
     if getattr(sys, "frozen", False):  # PyInstaller bundle
         return Path(getattr(sys, "_MEIPASS", ".")) / "rules" / name
     return Path(__file__).resolve().parents[2] / "rules" / name
+
+
+def connection_rules_path(cfg: Optional[AppConfig] = None) -> Path:
+    if cfg and cfg.detectors.rules_file:
+        return Path(cfg.detectors.rules_file)
+    return bundled_rules_path("connection_rules.json")
 
 
 def live_rules_path(cfg: Optional[AppConfig] = None) -> Path:

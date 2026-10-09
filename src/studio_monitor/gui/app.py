@@ -48,7 +48,8 @@ PAGES = [("monitor", "Monitor", "display"), ("bots", "Telegram Bots", "robot"), 
 STATUS_STYLE = {Status.STOPPED: "secondary", Status.RUNNING: "success", Status.DEGRADED: "warning", Status.LOST: "danger"}
 LIVE_STYLE = {"LIVE": "danger", "NOT_LIVE": "info", "UNKNOWN": "secondary"}
 HEALTH_STYLE = {"OK": "success", "DEGRADED": "warning", "NONE": "secondary"}
-REGION_COLORS = {"detect": "#ffcd39", "redact": "#e35d6a", "live": "#479f76", "profile": "#3dd5f3"}
+REGION_COLORS = {"detect": "#ffcd39", "redact": "#e35d6a", "live": "#479f76", "profile": "#3dd5f3",
+                 "face": "#d63384", "audio": "#6f42c1"}
 BACKEND_NAMES = {"wgc": "Windows Graphics Capture", "printwindow": "PrintWindow", "desktop-crop": "Desktop crop (fallback)"}
 TOKEN_HELP = ("Enter the bot token from @BotFather. This is not your Telegram account password or a Telegram "
               "developer API ID/API hash. The token identifies the sending bot; the chat ID identifies the recipient. "
@@ -442,11 +443,13 @@ class App:
         self.pill_monitor = Pill(pills, "STOPPED", "secondary")
         self.pill_capture = Pill(pills, "Capture: not started", "secondary")
         self.pill_live = Pill(pills, "Broadcast: unknown", "secondary")
-        for p in (self.pill_monitor, self.pill_capture, self.pill_live):
+        self.pill_stream = Pill(pills, "Stream: not evaluated", "secondary")
+        for p in (self.pill_monitor, self.pill_capture, self.pill_live, self.pill_stream):
             p.pack(side="left", padx=4)
         ToolTip(self.pill_monitor, text="Monitoring status (RUNNING / DEGRADED / LOST / STOPPED)")
         ToolTip(self.pill_capture, text="Capture health of the selected Studio window")
         ToolTip(self.pill_live, text="Confirmed broadcast state from Studio UI evidence")
+        ToolTip(self.pill_stream, text="Stream-health detectors (connection, source, preview, presenter, audio meter); evaluated only while LIVE")
         tb.Separator(self.root).pack(fill="x")
 
     def _build_sidebar(self, body) -> None:
@@ -526,7 +529,8 @@ class App:
         self.region_kind = tk.StringVar(value="detect")
         tb.Label(rrow, text="Draw:", font=self.fonts["strong"]).pack(side="left")
         for text, value, style in (("Popup detection", "detect", "warning"), ("Redaction (privacy)", "redact", "danger"),
-                                   ("Live-status", "live", "success"), ("Profile control", "profile", "info")):
+                                   ("Live-status", "live", "success"), ("Profile control", "profile", "info"),
+                                   ("Presenter", "face", "danger"), ("Audio meter", "audio", "secondary")):
             tb.Radiobutton(rrow, text=text, variable=self.region_kind, value=value, bootstyle=f"{style}-outline-toolbutton",
                            padding=(8, 3)).pack(side="left", padx=3)
         self.region_clear_btn = tb.Button(rrow, text="Clear all", command=self.clear_regions, bootstyle="secondary-link")
@@ -540,7 +544,8 @@ class App:
         tb.Label(right, font=self.fonts["caption"], bootstyle="secondary", wraplength=720, justify="left",
                  text="Drag on the preview to add a region. No detection regions = scan the whole window; no live-status "
                       "regions = classify from the whole window (less reliable). Draw a small 'Profile control' box around "
-                      "Studio’s top-right avatar to calibrate account detection. Dialogs are always scanned whole.").pack(anchor="w", pady=(4, 0))
+                      "Studio’s top-right avatar to calibrate account detection. 'Presenter' = camera preview area for face/"
+                      "motion/frozen checks; 'Audio meter' = Studio’s level meter. Dialogs are always scanned whole.").pack(anchor="w", pady=(4, 0))
 
         tiles = tb.Frame(page)
         tiles.pack(fill="x", pady=(12, 0))
@@ -686,6 +691,30 @@ class App:
                  lambda v: setattr(c.health, "degrade_after_seconds", max(1.0, v)), ""),
                 ("recover_after", "Health recovery after stable for (s)", "float", lambda: c.health.recover_after_seconds,
                  lambda v: setattr(c.health, "recover_after_seconds", max(1.0, v)), ""),
+            ]),
+            ("Stream health (while LIVE)", [
+                ("det_enabled", "Enable stream-health detectors", "bool", lambda: c.detectors.enabled,
+                 lambda v: setattr(c.detectors, "enabled", v), "Connection, missing source, black/frozen preview, presenter, audio meter. Restart monitoring to apply."),
+                ("det_presenter", "Presenter (face) monitoring", "bool", lambda: c.detectors.presenter_enabled,
+                 lambda v: setattr(c.detectors, "presenter_enabled", v), "Needs a 'Presenter' region. Local CPU face detection only; no identity recognition."),
+                ("det_expected", "Presenter expected on camera", "bool", lambda: c.detectors.presenter_expected,
+                 lambda v: setattr(c.detectors, "presenter_expected", v), "Off = no 'presenter not visible' alerts (music/gameplay streams)."),
+                ("det_face_absent", "Face absent for (s)", "float", lambda: c.detectors.face_absent_seconds,
+                 lambda v: setattr(c.detectors, "face_absent_seconds", max(5.0, v)), ""),
+                ("det_motion_low", "Very still face for (s)", "float", lambda: c.detectors.motion_low_seconds,
+                 lambda v: setattr(c.detectors, "motion_low_seconds", max(10.0, v)), ""),
+                ("det_frozen", "Frozen preview for (s)", "float", lambda: c.detectors.frozen_seconds,
+                 lambda v: setattr(c.detectors, "frozen_seconds", max(5.0, v)), ""),
+                ("det_black", "Black preview for (s)", "float", lambda: c.detectors.black_preview_seconds,
+                 lambda v: setattr(c.detectors, "black_preview_seconds", max(5.0, v)), ""),
+                ("det_conn", "Connection message for (s)", "float", lambda: c.detectors.connection_sustain_seconds,
+                 lambda v: setattr(c.detectors, "connection_sustain_seconds", max(2.0, v)), ""),
+                ("det_audio", "Audio meter silence detection", "bool", lambda: c.detectors.audio_enabled,
+                 lambda v: setattr(c.detectors, "audio_enabled", v), "Needs an 'Audio meter' region. Reads Studio’s on-screen meter only."),
+                ("det_audio_s", "Audio silent for (s)", "float", lambda: c.detectors.audio_silence_seconds,
+                 lambda v: setattr(c.detectors, "audio_silence_seconds", max(5.0, v)), ""),
+                ("det_profile", "Audio profile", ("choice", ["mixed", "mic-only", "music-only"]), lambda: c.detectors.audio_profile,
+                 lambda v: setattr(c.detectors, "audio_profile", v), "Informational label for the operator; thresholds are not changed automatically."),
             ]),
             ("Popup detection", [
                 ("poll", "Poll interval (s)", "float", lambda: c.detection.poll_interval_seconds,
@@ -953,6 +982,7 @@ class App:
                            verified + (f"confirmed {_local(s.last_confirmed_utc)}" if s.last_confirmed_utc else "not confirmed"),
                            (s.last_transition or s.live_evidence or s.last_observation or "")[:120], LIVE_STYLE.get(s.live_state, "secondary"))
         self.pill_live.set(f"Broadcast: {s.live_state.replace('_', ' ').lower()}", LIVE_STYLE.get(s.live_state, "secondary"))
+        self._show_stream(s.stream)
         if s.episode_id:
             off = format_duration(s.offline_seconds) + ("  (counting)" if s.accumulating else "  (paused)")
             if s.remaining_seconds is None:
@@ -1260,6 +1290,7 @@ class App:
             lines += ["", "[health]",
                       f"session={h.session} capture={h.capture} ({h.capture_reason or '-'}) ocr={h.ocr} "
                       f"broadcast={h.broadcast} delivery={h.delivery} ({h.delivery_reason or '-'})",
+                      "", "[stream health]"] + ([f"{k}={v.get('state')} {v.get('detail') or ''}".rstrip() for k, v in a.stream.items()] or ["not evaluated (not LIVE)"]) + [
                       "", "[broadcast]", f"state={a.live_state} evidence={a.live_evidence or '-'}",
                       f"last_observation={a.last_observation or '-'}",
                       f"episode={a.broadcast_episode or '-'} transition={a.last_transition or '-'}",
@@ -1354,6 +1385,19 @@ class App:
         except Exception as exc:  # never kill the UI loop
             self.log_line(f"preview error: {exc}")
         self.root.after(700, self._refresh_preview)
+
+    def _show_stream(self, stream: dict) -> None:
+        if not stream:
+            self.pill_stream.set("Stream: not evaluated", "secondary")
+            return
+        problems = [k.replace("_", " ").lower() for k, v in stream.items() if v.get("state") == "PROBLEM"]
+        evaluated = sum(1 for v in stream.values() if v.get("state") in ("OK", "PROBLEM"))
+        if problems:
+            self.pill_stream.set("Stream: " + ", ".join(problems), "warning")
+        elif evaluated:
+            self.pill_stream.set(f"Stream: OK ({evaluated} checks)", "success")
+        else:
+            self.pill_stream.set("Stream: unknown (no fresh frame)", "secondary")
 
     def _draw_preview(self) -> None:
         img = self.preview_image

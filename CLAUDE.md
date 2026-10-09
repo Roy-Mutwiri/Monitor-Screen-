@@ -43,6 +43,8 @@ src/studio_monitor/
   sessions.py                     Studio application session (opened / closed), pid-based
   framecache.py                   latest valid redacted frame (atomic persist, retention)
   broadcast.py                    LIVE / NOT_LIVE / UNKNOWN engine (rules/live_state_rules.json)
+  detectors/{text_rules,presenter,audio,suite}.py  stream-health conditions while LIVE (SustainedCondition debounce,
+                                  YuNet face boxes only, meter lit-fraction); Monitor._run_detectors opens/resolves incidents
   reminders.py                    offline episodes + not-live reminder policy (persisted)
   bots.py / credentials.py        bot registry + secure token store
   queue.py                        events + per-bot deliveries outbox, history, kv state, transactions
@@ -72,3 +74,8 @@ src/studio_monitor/
 - Real Telegram delivery was confirmed by the user (restriction screenshot delivered).
 - Broadcast-start detection is verified by synthetic replay only, not with a real broadcast.
 - WGC behaviour verified on this machine with self-owned windows (covered, moved/resized, minimized -> no frames).
+- Stream-health detectors (Milestone 2): `rules/connection_rules.json` is an unverified seed; YuNet is smoke-tested only
+  (loads, no false positive on synthetic frames) — accuracy on real camera framing, the meter reader against Studio's
+  real meter and all thresholds are unverified. Presenter conditions are DISABLED without the verified model, never guessed.
+- Detectors never evaluate when the broadcast is not LIVE; a 'reconnecting' overlay keeps the LIVE episode open (UNKNOWN,
+  not NOT_LIVE) so RECONNECTING can be reported.
