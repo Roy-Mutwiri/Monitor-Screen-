@@ -383,3 +383,15 @@ def test_light_ad_panel_inside_dark_preview_is_not_a_dialog(rules):
     light = Image.new("RGB", (800, 500), (245, 245, 247))                    # light theme: light dialogs are fine
     ImageDraw.Draw(light).rectangle((250, 350, 550, 450), fill=(255, 255, 255))
     assert PC._on_ui_surface(light, (250, 350, 550, 450)) is True
+
+
+def test_narrow_repeated_column_in_video_is_not_a_dialog():
+    from studio_monitor.popups import PopupClassifier as PC
+    from studio_monitor.perception.clusters import TextBlock
+    from studio_monitor.perception.ocr_boxes import OcrBox
+    col = TextBlock([OcrBox("BTCUSD, buy 2.50", 630, 380, 80, 12), OcrBox("82 488.25", 630, 400, 60, 12), OcrBox("BTCUSD, buy 2.50", 630, 420, 80, 12),
+                     OcrBox("82 488.25", 630, 440, 60, 12)])
+    assert PC._dialog_shaped((621, 373, 721, 694), (1512, 726), col) is False               # 7% wide, taller than wide, repeated rows
+    dlg = TextBlock([OcrBox("End streaming?", 601, 301, 110, 16), OcrBox("End LIVE? Share your LIVE for more viewers.", 601, 332, 262, 13),
+                     OcrBox("End now", 640, 380, 52, 10), OcrBox("Cancel", 785, 380, 41, 11)])
+    assert PC._dialog_shaped((560, 280, 880, 480), (1512, 726), dlg) is True

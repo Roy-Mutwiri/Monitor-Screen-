@@ -186,7 +186,9 @@ cards of the post-LIVE summary are never reported as new popups.
 **What an unrecognised dialog must look like** (learned from a real session on 2026-10-09, when the sign-in page, the
 empty home panels and the docked sources panel each produced a review alert): a block with a button row, a title of at
 least two words and a body or a second button, floating centred like a Studio modal (never touching the window edge,
-never most of the window), drawn in the app's own surface colour (a white ad card inside the dark preview is video, not UI),
+never most of the window), dialog-shaped (at least 15% of the window wide, wider than tall, no repeated rows: a trading
+terminal's position list in the preview is a table, not a dialog), drawn in the app's own surface colour (a white ad card
+inside the dark preview is video, not UI),
 seen only after the layout has been located. The sign-in page (QR / Google / email-password / confirm on mobile) is one
 `sign_in_screen` observation and is not alerted; the LIVE settings sheet / go-LIVE setup page (LIVE info, Moderators,
 About me, Video settings, camera-source and speed-test notes) and any three-plus unrelated blocks spread over the window

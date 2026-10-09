@@ -225,6 +225,21 @@ class PopupClassifier:
         return abs((x + x2) / 2 - w / 2) <= 0.2 * w
 
     @staticmethod
+    def _dialog_shaped(panel: Box, size: tuple[int, int], blk: TextBlock) -> bool:
+        """Studio modals are wider than tall and at least ~15% of the window wide, and their lines differ. A narrow
+        column of repeated rows ('BTCUSD, buy 2.50 ...' from a trading terminal shown in the preview, 2026-10-09) is a
+        table inside the video, never a dialog."""
+        w, h = size
+        x, y, x2, y2 = panel
+        pw, ph = x2 - x, y2 - y
+        if pw < 0.15 * w or pw < 0.8 * ph:
+            return False
+        norms = [normalize_text(b.text) for b in blk.lines]
+        if len(norms) - len(set(norms)) >= 1:
+            return False
+        return True
+
+    @staticmethod
     def _on_ui_surface(frame: Image.Image, panel: Box, layout=None) -> bool:
         """Studio draws its dialogs in the app's own surface colour (dark theme ~rgb 20-50, light theme near white).
         A panel whose colour is far from the window chrome (title bar) or is saturated is video / ad content inside
@@ -289,6 +304,8 @@ class PopupClassifier:
                 continue                                                  # docked side/bottom panel (sources, tools), not a modal
             if ptype in (UNKNOWN, INFORMATIONAL) and not self._on_ui_surface(frame, panel, layout):
                 continue                                                  # text on video/ad content, not a Studio surface
+            if ptype in (UNKNOWN, INFORMATIONAL) and not self._dialog_shaped(panel, frame.size, blk):
+                continue                                                  # a narrow column / repeated rows: a list in the video, not a dialog
             out.append(PopupObservation(ptype, title, body, buttons, panel, observed_at, frame_id, conf, reason,
                                         evidence=blk.line_texts[:8], rule_category=rule_cat, kind=kind))
         if any(p.popup_type == POST_LIVE_SUMMARY for p in out):
