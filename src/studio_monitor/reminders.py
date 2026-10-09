@@ -195,13 +195,13 @@ class OfflineReminderEngine:
         return None
 
     def enqueue_reminder(self, due: ReminderDue, payload: dict, screenshot_path: str, event_id: str,
-                         details: dict, targets: list, category: str) -> int:
+                         details: dict, targets: list, category: str, owner_label: str = "") -> int:
         """Atomically create the reminder event + per-bot deliveries, record the
         history row and mark the reminder as queued. Returns deliveries created."""
         st = self.state
         with self.queue.transaction() as conn:
             n = self.queue.create_event(event_id, KIND_REMINDER, category, payload, screenshot_path, targets,
-                                        label=f"Not-live reminder {due.sequence}", conn=conn)
+                                        label=f"Not-live reminder {due.sequence}", conn=conn, owner_label=owner_label)
             st.reminders_sent = due.sequence
             st.pending_event_id = event_id
             st.last_reminder_utc = _utc(self.clock())

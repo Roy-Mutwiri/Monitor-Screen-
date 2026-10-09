@@ -331,7 +331,8 @@ def test_not_live_to_live_generates_one_screenshot_event(cfg, rules, clock):
     ev = broadcast_events(h)
     assert len(ev) == 1
     cap = ev[0]["payload"]["caption"]
-    assert cap.startswith("<b>TIKTOK LIVE STUDIO HAS GONE LIVE</b>") and "PC: test-pc" in cap
+    assert cap.startswith("\U0001F534 <b>test-pc\u2019s Live \u2014 HAS GONE LIVE</b>") and "PC: test-pc" in cap
+    assert "TikTok LIVE Studio is broadcasting." in cap
     assert "Detected at:" in cap and "Status: LIVE" in cap and "Account: @creator" in cap
     assert "gap" not in cap and Path(ev[0]["screenshot_path"]).exists()
     assert h.event_types()[-1] == EVT_BROADCAST_STARTED

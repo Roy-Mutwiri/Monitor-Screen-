@@ -382,6 +382,9 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--enable", action="store_true"); g.add_argument("--disable", action="store_true")
     g.add_argument("--status", action="store_true")
     sub.add_parser("test-alert")
+    p = sub.add_parser("owner", help="show or set the PC owner name used in notification labels")
+    p.add_argument("name", nargs="?", help="owner name (omit to show)")
+    p.add_argument("--clear", action="store_true", help="clear the owner name (fall back to the machine label)")
     p = sub.add_parser("set-telegram"); p.add_argument("--chat-id", required=True)
     p.add_argument("--token", help="discouraged: visible in shell history"); p.add_argument("--token-stdin", action="store_true")
     p = sub.add_parser("queue"); p.add_argument("--requeue-failed", action="store_true")
@@ -424,6 +427,20 @@ def main(argv: list[str] | None = None) -> int:
         return _history(cfg, args.kind, args.limit, args.expand)
     if cmd == "autostart":
         return _autostart(cfg, cfg_path, args.enable, args.disable)
+    if cmd == "owner":
+        from .labels import OwnerNameError, validate_owner_name
+        if args.clear:
+            cfg.owner_name = ""
+            cfg.save(cfg_path)
+        elif args.name is not None:
+            try:
+                cfg.owner_name = validate_owner_name(args.name)
+            except OwnerNameError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            cfg.save(cfg_path)
+        print(f"owner: {cfg.owner_name or '(blank -> machine label)'}  notification label: {cfg.notification_label}")
+        return 0
     if cmd == "test-alert":
         return _test_alert(cfg, cfg_path)
     if cmd == "set-telegram":

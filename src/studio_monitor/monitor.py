@@ -189,7 +189,8 @@ class Monitor:
                  label: str = "") -> int:
         """Create one event + one delivery per enabled subscribed bot."""
         targets = self.registry.targets(category)
-        n = self.queue.create_event(event_id, kind, category, payload, evidence_path, targets, label)
+        n = self.queue.create_event(event_id, kind, category, payload, evidence_path, targets, label,
+                                    owner_label=self.cfg.notification_label)
         self._kick()
         return n
 
@@ -309,7 +310,7 @@ class Monitor:
         payload = format_alert(
             inc, self.cfg.machine_label, self.cfg.privacy.max_text_in_alert,
             screenshot_attached=attach, reason=reason if reason != "new incident" else "",
-            capture_method=det.capture.method,
+            capture_method=det.capture.method, label=self.cfg.notification_label,
         )
         payload["created_at"] = self.clock()
         stored_text = inc.text if self.cfg.privacy.store_detected_text else ""
@@ -360,12 +361,14 @@ class Monitor:
                 return
             frame = self.frame_cache.fresh(act.fresh_screenshot_max_age_seconds) if ev.screenshot_available else None
             shot = self._activity_shot(eid, frame)
-            payload = format_studio_opened(self.cfg.machine_label, ev.ts, bool(shot), act.open_screenshot_timeout_seconds)
+            payload = format_studio_opened(self.cfg.machine_label, ev.ts, bool(shot), act.open_screenshot_timeout_seconds,
+                                           label=self.cfg.notification_label)
         elif ev.type == EVT_ALREADY_RUNNING:
             summary, category = "Studio already running at monitor start", CAT_STUDIO_OPENED
             frame = self.frame_cache.fresh(act.fresh_screenshot_max_age_seconds) if ev.screenshot_available else None
             shot = self._activity_shot(eid, frame)
-            payload = format_studio_already_running(self.cfg.machine_label, ev.ts, bool(shot))
+            payload = format_studio_already_running(self.cfg.machine_label, ev.ts, bool(shot),
+                                                    label=self.cfg.notification_label)
         elif ev.type == EVT_CLOSED:
             summary, category = f"Studio closed ({ev.note})", CAT_STUDIO_CLOSED
             if not act.notify_closed:
@@ -374,7 +377,8 @@ class Monitor:
                 return
             frame = self.frame_cache.latest()   # last frame *before* closure, whatever its age
             shot = self._activity_shot(eid, frame)
-            payload = format_studio_closed(self.cfg.machine_label, ev.ts, frame.captured_at if shot else None)
+            payload = format_studio_closed(self.cfg.machine_label, ev.ts, frame.captured_at if shot else None,
+                                           label=self.cfg.notification_label)
         else:  # pragma: no cover
             return
         n = self.dispatch(eid, KIND_ACTIVITY, category, payload, shot, label=summary)
@@ -431,12 +435,12 @@ class Monitor:
         shot = self._save_evidence(eid, evidence_cap.image if evidence_cap is not None else None)
         if bev.kind == "already_live":
             payload = format_already_live(self.cfg.machine_label, now, self.cfg.account_label, bool(shot),
-                                          self.live_rules.verified)
+                                          self.live_rules.verified, label=self.cfg.notification_label)
             summary, etype = "Studio is already LIVE (monitoring started)", EVT_ALREADY_LIVE
         else:
             payload = format_broadcast_started(self.cfg.machine_label, now, self.cfg.account_label,
                                                bev.kind == "started_after_gap", bev.gap_seconds, bool(shot),
-                                               self.live_rules.verified)
+                                               self.live_rules.verified, label=self.cfg.notification_label)
             summary, etype = ("Studio has gone LIVE" + (" (observed after a gap)" if bev.kind == "started_after_gap" else ""),
                               EVT_BROADCAST_STARTED)
         n = self.dispatch(eid, KIND_ACTIVITY, CAT_BROADCAST, payload, shot, label=summary)
@@ -453,11 +457,12 @@ class Monitor:
         payload = format_not_live_reminder(
             self.cfg.machine_label, now, act.offline_threshold_minutes, due.accumulated_seconds, due.episode_id,
             due.sequence, act.repeat_max_count, bool(shot), self.live_rules.verified,
+            label=self.cfg.notification_label,
         )
         details = {"summary": f"not-live reminder {due.sequence} after {int(due.accumulated_seconds)} s confirmed offline",
                    "sequence": due.sequence, "offline_seconds": due.accumulated_seconds, "screenshot": bool(shot)}
         n = self.reminders.enqueue_reminder(due, payload, shot, eid, details, self.registry.targets(CAT_REMINDERS),
-                                            CAT_REMINDERS)
+                                            CAT_REMINDERS, owner_label=self.cfg.notification_label)
         self.on_event(f"TIME TO GO LIVE reminder {due.sequence} -> {eid} queued for {n} bot(s)")
         self._kick()
 
@@ -493,7 +498,7 @@ class Monitor:
         alert = self.health_policy.update(degraded, h.degraded_reason)
         if alert is not None and self.registry.targets(CAT_HEALTH):
             payload = format_health_alert(alert.kind, alert.reason, self.cfg.machine_label, self.clock(),
-                                          alert.since, alert.duration)
+                                          alert.since, alert.duration, label=self.cfg.notification_label)
             self.dispatch(_event_id("HLT", self.clock()), KIND_STATUS, CAT_HEALTH, payload, "",
                           label=f"Monitor health {alert.kind}")
             self.on_event(f"health alert queued: {alert.kind} ({alert.reason})")

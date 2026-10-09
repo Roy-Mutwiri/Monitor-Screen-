@@ -177,6 +177,24 @@ Settings → Studio activity → "Start Monitor Screen when I sign in to Windows
 GUI with `--autostart`, which begins monitoring the saved target. It runs in your interactive
 desktop session (required for capture); nothing runs or is observed before you sign in.
 
+## Whose PC? (owner label)
+
+The "Whose PC?" field at the top of the Monitor tab (or `studio-monitor owner NAME`) sets an operator
+label used in **every** notification headline, e.g. with owner "Roy":
+
+```
+🔴 Roy’s Live — HAS GONE LIVE          ⚠️ Roy’s Live — RESTRICTION DETECTED
+🧩 Roy’s Live — VERIFICATION REQUIRED   ⏰ Roy’s Live — GO-LIVE REMINDER
+🟢 Roy’s Live — STUDIO OPENED           ⚫ Roy’s Live — STUDIO CLOSED
+⚠️ Roy’s Live — MONITOR DEGRADED        🧪 Roy’s Live — TEST NOTIFICATION
+```
+
+Rules: trimmed, single line, no control characters, at most 60 characters, Unicode and punctuation
+allowed. Blank falls back to the machine label (`<machine label>’s Live`). The hostname and machine
+label stay visible under Diagnostics. The label is operator-entered text, not a verified TikTok
+identity, and is HTML-escaped. Each event stores the label in force when it was created; changing the
+name affects future notifications only, and already queued ones keep their original text.
+
 ## Telegram bots (up to 10)
 
 Alerts go to any number of Telegram bots (maximum 10 saved, disabled ones count). Manage them in the

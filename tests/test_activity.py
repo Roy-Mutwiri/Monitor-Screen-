@@ -227,7 +227,7 @@ def test_threshold_reached_exactly_one_reminder(h):
     rem = h.alerts("reminder")
     assert len(rem) == 1
     cap = rem[0]["payload"]["caption"]
-    assert cap.startswith("<b>TIME TO GO LIVE</b>") and "PC: test-pc" in cap
+    assert cap.startswith("\u23F0 <b>test-pc\u2019s Live \u2014 GO-LIVE REMINDER</b>") and "PC: test-pc" in cap
     assert "confirmed not live for at least 1 hour" in cap and "go live when ready" in cap
     assert "unverified" in cap                      # seeded rules not calibrated
     assert Path(rem[0]["screenshot_path"]).exists()  # fresh frame attached

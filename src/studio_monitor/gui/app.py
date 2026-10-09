@@ -20,6 +20,7 @@ from ..app import (build_monitor, load_live_rules, load_ruleset, make_capture_se
 from ..bot_tests import deliver_test_now, enqueue_test, validate_bot, validate_token
 from ..bots import EVENT_CATEGORIES, MAX_BOTS, BotError, BotRegistry
 from ..config import AppConfig
+from ..labels import MAX_OWNER_NAME, OwnerNameError, hostname, validate_owner_name
 from ..monitor import ActivitySnapshot, Monitor, StatusUpdate
 from ..queue import DeliveryQueue, DeliveryWorker
 from ..regions import Region
@@ -401,6 +402,20 @@ class App:
         self._build_bots_tab(self.bots_tab)
 
     def _build_monitor_tab(self, outer) -> None:
+        owner = ttk.Frame(outer)
+        owner.pack(fill="x", pady=(0, 6))
+        ttk.Label(owner, text="Whose PC?", font=("Segoe UI", 10, "bold")).pack(side="left")
+        self.owner_var = tk.StringVar(value=self.cfg.owner_name)
+        entry = ttk.Entry(owner, textvariable=self.owner_var, width=28)
+        entry.pack(side="left", padx=6)
+        entry.bind("<Return>", lambda e: self.save_owner())
+        ttk.Button(owner, text="Save", command=self.save_owner).pack(side="left")
+        self.owner_label_var = tk.StringVar()
+        ttk.Label(owner, textvariable=self.owner_label_var, foreground="#1565c0").pack(side="left", padx=12)
+        ttk.Label(owner, text=f"e.g. Roy  \u2192  notifications say \u201cRoy\u2019s Live\u201d (max {MAX_OWNER_NAME} chars; "
+                              "blank = machine label)", foreground="#666").pack(side="left")
+        self._show_owner_label()
+
         top = ttk.Panedwindow(outer, orient="horizontal")
         top.pack(fill="both", expand=True)
 
@@ -562,6 +577,23 @@ class App:
         self.bots_status = tk.StringVar(value="")
         ttk.Label(outer, textvariable=self.bots_status, foreground="#1565c0", wraplength=900, justify="left").pack(anchor="w", pady=4)
 
+    # -- owner label -------------------------------------------------------
+    def _show_owner_label(self) -> None:
+        self.owner_label_var.set(f"Notifications: \u201c{self.cfg.notification_label}\u201d")
+
+    def save_owner(self) -> None:
+        try:
+            name = validate_owner_name(self.owner_var.get())
+        except OwnerNameError as exc:
+            messagebox.showerror("Whose PC?", str(exc))
+            return
+        self.cfg.owner_name = name
+        self.owner_var.set(name)
+        self.save()
+        self._show_owner_label()
+        self.log_line(f"owner name saved; new notifications are labelled \u201c{self.cfg.notification_label}\u201d "
+                      "(already queued notifications keep their original label)")
+
     # -- helpers ----------------------------------------------------------
     def log_line(self, msg: str) -> None:
         self.log.configure(state="normal")
@@ -619,6 +651,8 @@ class App:
             lines += [f"{k}={v_}" for k, v_ in d.items()]
             if t.is_set:
                 lines.append(f"target pid={t.pid} start={t.process_start:.0f} class={t.class_name}")
+            lines.append(f"hostname={hostname()} machine_label={self.cfg.machine_label} "
+                         f"owner={self.cfg.owner_name or '(blank)'} label={self.cfg.notification_label}")
             self.diag.configure(state="normal")
             self.diag.delete("1.0", "end")
             self.diag.insert("end", "\n".join(lines))

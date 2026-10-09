@@ -129,6 +129,7 @@ class AppConfig:
     capture: CaptureConfig = field(default_factory=CaptureConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
     account_label: str = ""                    # optional operator label shown in broadcast alerts
+    owner_name: str = ""                       # "Whose PC?" -> notification label "<owner>'s Live"
     config_version: int = CONFIG_VERSION
 
     # -- serialisation ----------------------------------------------------
@@ -157,10 +158,21 @@ class AppConfig:
         cfg.capture = CaptureConfig(**_known(CaptureConfig, data.get("capture", {})))
         cfg.health = HealthConfig(**_known(HealthConfig, data.get("health", {})))
         cfg.account_label = str(data.get("account_label", "") or "")
+        from .labels import validate_owner_name, OwnerNameError
+        try:
+            cfg.owner_name = validate_owner_name(str(data.get("owner_name", "") or ""))
+        except OwnerNameError:
+            cfg.owner_name = ""
         from .bots import BotConfig
         cfg.bots = [BotConfig.from_dict(b) for b in data.get("bots", []) if isinstance(b, dict)]
         cfg.config_version = int(data.get("config_version", 1))
         return cfg
+
+    @property
+    def notification_label(self) -> str:
+        """Shared label for every notification: "<owner>'s Live" (machine label fallback)."""
+        from .labels import notification_label
+        return notification_label(self.owner_name, self.machine_label)
 
     @property
     def live_regions(self) -> list[Region]:

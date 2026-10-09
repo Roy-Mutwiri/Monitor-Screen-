@@ -1,4 +1,10 @@
-"""Compose Telegram alert text for an incident."""
+"""Compose Telegram notification text.
+
+Every notification starts with a shared headline built by :func:`headline`:
+``<icon> <label> — <TITLE>`` where the label is the operator-entered owner
+label (e.g. "Roy’s Live"), HTML-escaped. Messages use Telegram HTML parse
+mode; all operator/OCR text is escaped.
+"""
 from __future__ import annotations
 
 import html
@@ -11,13 +17,18 @@ from .privacy import bounded_text
 
 MANUAL_ATTENTION = "Manual attention required"
 
-_ICONS = {
-    "verification_puzzle": "\U0001F9E9",  # puzzle piece
-    "account_suspension": "\U0001F6D1",   # stop sign
-    "live_interruption": "\U0001F4F4",    # phone off
-    "restriction_notice": "⛔",       # no entry
-    "content_warning": "⚠️",    # warning
+_INCIDENT_TITLES = {
+    "verification_puzzle": ("\U0001F9E9", "VERIFICATION REQUIRED"),
+    "account_suspension": ("\U0001F6D1", "ACCOUNT SUSPENSION"),
+    "live_interruption": ("\U0001F4F4", "LIVE INTERRUPTED"),
+    "restriction_notice": ("⚠️", "RESTRICTION DETECTED"),
+    "content_warning": ("⚠️", "CONTENT WARNING"),
 }
+
+
+def headline(icon: str, label: str, title: str) -> str:
+    """Shared notification headline: ``icon <b>label — TITLE</b>``."""
+    return f"{icon} <b>{html.escape(label)} — {html.escape(title)}</b>"
 
 
 def _ts(ts: float) -> str:
@@ -26,43 +37,6 @@ def _ts(ts: float) -> str:
     except (OSError, OverflowError, ValueError):  # Windows rejects timestamps near the epoch
         dt = datetime.fromtimestamp(ts, tz=timezone.utc)
     return dt.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
-
-
-def format_alert(incident: Incident, machine_label: str, max_text: int = 400,
-                 screenshot_attached: bool = True, reason: str = "",
-                 capture_method: Optional[str] = None) -> dict:
-    """Return ``{"caption": html, "text": html}``.
-
-    ``caption`` is used with the screenshot (Telegram caps captions at 1024
-    chars); ``text`` is the standalone fallback.
-    """
-    icon = _ICONS.get(incident.category, "\U0001F6A8")
-    headline = f"{icon} <b>{html.escape(SOURCE_LABEL)}</b> — {html.escape(incident.label)}"
-    if incident.manual_attention:
-        headline = f"❗ <b>{MANUAL_ATTENTION}</b>\n{headline}"
-    where = "separate dialog" if incident.is_dialog else "main window"
-    if incident.window_title:
-        where += f' "{html.escape(incident.window_title)}"'
-    detected = html.escape(bounded_text(incident.text, max_text)) or "(no text)"
-    lines = [
-        headline,
-        f"<b>Source:</b> {html.escape(SOURCE_LABEL)}",
-        f"<b>Category:</b> {html.escape(incident.category)}",
-        f"<b>Detected text:</b> <i>{detected}</i>",
-        f"<b>Where:</b> {where}",
-        f"<b>Time:</b> {html.escape(_ts(incident.last_alerted or incident.last_seen))}",
-        f"<b>Machine:</b> {html.escape(machine_label)}",
-        f"<b>Incident ID:</b> <code>{html.escape(incident.incident_id)}</code>",
-    ]
-    if incident.manual_attention:
-        lines.append("Studio is waiting for a human to complete this step. The monitor does not interact with Studio.")
-    if reason:
-        lines.append(f"<b>Note:</b> {html.escape(reason)}")
-    if not screenshot_attached:
-        lines.append("<i>Screenshot not attached (privacy setting).</i>")
-    text = "\n".join(lines)
-    caption = text if len(text) <= 1024 else text[:1020] + "…"
-    return {"caption": caption, "text": text}
 
 
 def local_ts(ts: float) -> str:
@@ -88,13 +62,51 @@ def _finish(lines: list[str], ts: float) -> dict:
     return {"caption": caption, "text": text, "created_at": ts}
 
 
+# ---------------------------------------------------------------- restrictions / verification
+
+def format_alert(incident: Incident, machine_label: str, max_text: int = 400,
+                 screenshot_attached: bool = True, reason: str = "",
+                 capture_method: Optional[str] = None, label: str = "") -> dict:
+    """Return ``{"caption": html, "text": html}`` for a popup incident."""
+    label = label or f"{machine_label}’s Live"
+    icon, title = _INCIDENT_TITLES.get(incident.category, ("\U0001F6A8", "ALERT"))
+    where = "separate dialog" if incident.is_dialog else "main window"
+    if incident.window_title:
+        where += f' "{html.escape(incident.window_title)}"'
+    detected = html.escape(bounded_text(incident.text, max_text)) or "(no text)"
+    ts = incident.last_alerted or incident.last_seen
+    lines = [headline(icon, label, title)]
+    if incident.manual_attention:
+        lines.append(f"{MANUAL_ATTENTION}. Studio is waiting for a human to complete this step; "
+                     "the monitor does not interact with Studio.")
+    lines += [
+        f"<b>Reason:</b> <i>{detected}</i>",
+        f"<b>Time:</b> {local_ts(ts)}",
+        f"<b>Source:</b> {html.escape(SOURCE_LABEL)} ({html.escape(incident.label)})",
+        f"<b>Category:</b> {html.escape(incident.category)}",
+        f"<b>Where:</b> {where}",
+        f"<b>Machine:</b> {html.escape(machine_label)}",
+        f"<b>Incident ID:</b> <code>{html.escape(incident.incident_id)}</code>",
+    ]
+    if reason:
+        lines.append(f"<b>Note:</b> {html.escape(reason)}")
+    if not screenshot_attached:
+        lines.append("<i>Screenshot not attached (privacy setting).</i>")
+    out = _finish(lines, ts)
+    out.pop("created_at", None)
+    return out
+
+
+# ---------------------------------------------------------------- Studio session
+
 def format_studio_opened(machine_label: str, ts: float, screenshot_attached: bool,
-                         timeout_seconds: float = 0.0) -> dict:
+                         timeout_seconds: float = 0.0, label: str = "") -> dict:
+    label = label or f"{machine_label}’s Live"
     lines = [
-        "<b>TIKTOK LIVE STUDIO OPENED</b>",
+        headline("\U0001F7E2", label, "STUDIO OPENED"),
+        f"{html.escape(SOURCE_LABEL)} is now running.",
         f"PC: {html.escape(machine_label)}",
         f"Time: {local_ts(ts)}",
-        f"{html.escape(SOURCE_LABEL)} is now running.",
     ]
     if not screenshot_attached:
         lines.append(f"<i>Screenshot unavailable: no usable capture of the Studio window within "
@@ -102,24 +114,27 @@ def format_studio_opened(machine_label: str, ts: float, screenshot_attached: boo
     return _finish(lines, ts)
 
 
-def format_studio_already_running(machine_label: str, ts: float, screenshot_attached: bool) -> dict:
+def format_studio_already_running(machine_label: str, ts: float, screenshot_attached: bool, label: str = "") -> dict:
+    label = label or f"{machine_label}’s Live"
     lines = [
-        "<b>TIKTOK LIVE STUDIO ALREADY RUNNING</b>",
+        headline("\U0001F7E2", label, "STUDIO ALREADY RUNNING"),
+        "Studio already running — monitoring started.",
         f"PC: {html.escape(machine_label)}",
         f"Time: {local_ts(ts)}",
-        "Studio already running — monitoring started.",
     ]
     if not screenshot_attached:
         lines.append("<i>Screenshot unavailable at monitor start.</i>")
     return _finish(lines, ts)
 
 
-def format_studio_closed(machine_label: str, ts: float, screenshot_captured_at: Optional[float]) -> dict:
+def format_studio_closed(machine_label: str, ts: float, screenshot_captured_at: Optional[float],
+                         label: str = "") -> dict:
+    label = label or f"{machine_label}’s Live"
     lines = [
-        "<b>TIKTOK LIVE STUDIO CLOSED</b>",
+        headline("⚫", label, "STUDIO CLOSED"),
+        f"{html.escape(SOURCE_LABEL)} has closed.",
         f"PC: {html.escape(machine_label)}",
         f"Time: {local_ts(ts)}",
-        f"{html.escape(SOURCE_LABEL)} has closed.",
     ]
     if screenshot_captured_at is not None:
         lines.append("Image: last available screenshot before closure.")
@@ -129,17 +144,20 @@ def format_studio_closed(machine_label: str, ts: float, screenshot_captured_at: 
     return _finish(lines, ts)
 
 
+# ---------------------------------------------------------------- reminders
+
 def format_not_live_reminder(machine_label: str, ts: float, threshold_minutes: float, offline_seconds: float,
                              episode_id: str, sequence: int = 1, max_count: int = 1,
-                             screenshot_attached: bool = True, rules_verified: bool = True) -> dict:
+                             screenshot_attached: bool = True, rules_verified: bool = True, label: str = "") -> dict:
+    label = label or f"{machine_label}’s Live"
     hours = threshold_minutes / 60.0
     period = f"{int(hours)} hour{'s' if int(hours) != 1 else ''}" if hours >= 1 and hours == int(hours) \
         else f"{int(threshold_minutes)} minutes"
     lines = [
-        "<b>TIME TO GO LIVE</b>",
-        f"PC: {html.escape(machine_label)}",
-        f"{html.escape(SOURCE_LABEL)} has been confirmed not live for at least {period}.",
+        headline("⏰", label, "GO-LIVE REMINDER"),
+        f"Studio has been confirmed not live for at least {period}.",
         "Open your broadcast setup and go live when ready.",
+        f"PC: {html.escape(machine_label)}",
         f"Confirmed offline time: {format_duration(offline_seconds)} (episode <code>{html.escape(episode_id)}</code>)",
         f"Generated: {local_ts(ts)}",
     ]
@@ -152,13 +170,18 @@ def format_not_live_reminder(machine_label: str, ts: float, threshold_minutes: f
     return _finish(lines, ts)
 
 
+# ---------------------------------------------------------------- broadcast
+
 def format_broadcast_started(machine_label: str, ts: float, account_label: str = "", after_gap: bool = False,
-                             gap_seconds: float = 0.0, screenshot_attached: bool = True, rules_verified: bool = True) -> dict:
+                             gap_seconds: float = 0.0, screenshot_attached: bool = True, rules_verified: bool = True,
+                             label: str = "") -> dict:
+    label = label or f"{machine_label}’s Live"
     lines = [
-        "<b>TIKTOK LIVE STUDIO HAS GONE LIVE</b>",
-        f"PC: {html.escape(machine_label)}",
+        headline("\U0001F534", label, "HAS GONE LIVE"),
+        f"{html.escape(SOURCE_LABEL)} is broadcasting.",
         f"Detected at: {local_ts(ts)}",
         "Status: LIVE",
+        f"PC: {html.escape(machine_label)}",
     ]
     if account_label:
         lines.append(f"Account: {html.escape(account_label)}")
@@ -173,13 +196,15 @@ def format_broadcast_started(machine_label: str, ts: float, account_label: str =
 
 
 def format_already_live(machine_label: str, ts: float, account_label: str = "", screenshot_attached: bool = True,
-                        rules_verified: bool = True) -> dict:
+                        rules_verified: bool = True, label: str = "") -> dict:
+    label = label or f"{machine_label}’s Live"
     lines = [
-        "<b>TIKTOK LIVE STUDIO IS ALREADY LIVE</b>",
-        f"PC: {html.escape(machine_label)}",
-        f"Observed at: {local_ts(ts)}",
-        "Status: LIVE \u2014 monitoring started while the broadcast was already running "
+        headline("\U0001F534", label, "ALREADY LIVE"),
+        f"{html.escape(SOURCE_LABEL)} was already broadcasting when monitoring started "
         "(this is not a newly observed broadcast start).",
+        f"Observed at: {local_ts(ts)}",
+        "Status: LIVE",
+        f"PC: {html.escape(machine_label)}",
     ]
     if account_label:
         lines.append(f"Account: {html.escape(account_label)}")
@@ -190,29 +215,51 @@ def format_already_live(machine_label: str, ts: float, account_label: str = "", 
     return _finish(lines, ts)
 
 
-def format_health_alert(kind: str, reason: str, machine_label: str, ts: float, since: float, duration: float) -> dict:
+# ---------------------------------------------------------------- health
+
+def format_health_alert(kind: str, reason: str, machine_label: str, ts: float, since: float, duration: float,
+                        label: str = "") -> dict:
+    label = label or f"{machine_label}’s Live"
     if kind == "degraded":
         lines = [
-            "\u26A0\uFE0F <b>MONITOR HEALTH: DEGRADED</b>",
-            f"PC: {html.escape(machine_label)}",
+            headline("⚠️", label, "MONITOR DEGRADED"),
             f"Reason: {html.escape(reason) or '-'}",
             f"Since: {local_ts(since)} (persisting for {format_duration(duration)})",
+            f"PC: {html.escape(machine_label)}",
             "Popup detection may be incomplete until capture recovers. Restriction alerts are not affected by this notice.",
         ]
     else:
         lines = [
-            "\u2705 <b>MONITOR HEALTH: RECOVERED</b>",
-            f"PC: {html.escape(machine_label)}",
+            headline("✅", label, "MONITOR RECOVERED"),
             f"Previous problem: {html.escape(reason) or '-'}",
             f"Degraded from {local_ts(since)} for {format_duration(duration)}; healthy again at {local_ts(ts)}.",
+            f"PC: {html.escape(machine_label)}",
         ]
     return _finish(lines, ts)
 
 
-def format_status_alert(status: str, reason: str, machine_label: str, ts: float) -> str:
+def format_status_alert(status: str, reason: str, machine_label: str, ts: float, label: str = "") -> str:
+    label = label or f"{machine_label}’s Live"
     return "\n".join([
-        f"ℹ️ <b>{html.escape(SOURCE_LABEL)}</b> monitor status: <b>{html.escape(status)}</b>",
+        headline("ℹ️", label, f"MONITOR {status}"),
         f"<b>Reason:</b> {html.escape(reason) or '-'}",
-        f"<b>Time:</b> {html.escape(_ts(ts))}",
+        f"<b>Time:</b> {local_ts(ts)}",
         f"<b>Machine:</b> {html.escape(machine_label)}",
     ])
+
+
+# ---------------------------------------------------------------- tests
+
+def format_test_notification(label: str, bot_name: str, destination: str, machine_label: str, ts: float,
+                             screenshot_attached: bool) -> dict:
+    lines = [
+        headline("\U0001F9EA", label, "TEST NOTIFICATION"),
+        "Test from Monitor Screen — no Studio event occurred.",
+        f"Bot: {html.escape(bot_name)}",
+        f"Destination: <code>{html.escape(destination)}</code>",
+        f"PC: {html.escape(machine_label)}",
+        f"Time: {local_ts(ts)}",
+        "The attached image is synthetic. Nothing from the desktop was captured." if screenshot_attached
+        else "Text-only test (screenshots disabled in privacy settings).",
+    ]
+    return _finish(lines, ts)

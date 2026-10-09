@@ -16,7 +16,7 @@ from typing import Callable, Optional
 
 from PIL import Image, ImageDraw, ImageFont
 
-from .alerts import local_ts
+from .alerts import format_test_notification, local_ts
 from .bots import CAT_TEST, BotRegistry
 from .config import AppConfig
 from .queue import KIND_TEST, DeliveryError, DeliveryQueue, DeliveryWorker
@@ -80,17 +80,10 @@ def enqueue_test(queue: DeliveryQueue, registry: BotRegistry, cfg: AppConfig, bo
     if cfg.privacy.send_screenshots:
         shot = str(synthetic_test_image(cfg.activity_screenshots_dir / f"{event_id}.png", bot.name,
                                         cfg.machine_label, now))
-    text = "\n".join([
-        "\U0001F9EA <b>TEST NOTIFICATION</b> from Monitor Screen",
-        f"Bot: {html.escape(bot.name)}",
-        f"Destination: <code>{html.escape(bot.destination)}</code>",
-        f"PC: {html.escape(cfg.machine_label)}",
-        f"Time: {local_ts(now)}",
-        "The attached image is synthetic. Nothing from the desktop was captured." if shot
-        else "Text-only test (screenshots disabled in privacy settings).",
-    ])
-    queue.create_event(event_id, KIND_TEST, CAT_TEST, {"caption": text, "text": text, "created_at": now}, shot,
-                       [registry.target_for(bot_id)], label=f"Test -> {bot.name}")
+    payload = format_test_notification(cfg.notification_label, bot.name, bot.destination, cfg.machine_label, now,
+                                       bool(shot))
+    queue.create_event(event_id, KIND_TEST, CAT_TEST, payload, shot, [registry.target_for(bot_id)],
+                       label=f"Test -> {bot.name}", owner_label=cfg.notification_label)
     return event_id
 
 

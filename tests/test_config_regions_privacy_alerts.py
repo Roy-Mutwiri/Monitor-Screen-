@@ -84,8 +84,8 @@ def _incident(**kw):
 def test_alert_contains_required_fields_and_escapes():
     a = format_alert(_incident(), "studio-pc", screenshot_attached=True)
     cap = a["caption"]
-    assert cap.startswith("⛔ <b>TikTok LIVE Studio</b>")
-    assert f"<b>Source:</b> {SOURCE_LABEL}" in cap
+    assert cap.startswith("⚠️ <b>studio-pc’s Live — RESTRICTION DETECTED</b>")
+    assert f"<b>Source:</b> {SOURCE_LABEL}" in cap and "<b>Reason:</b>" in cap
     assert "<b>Category:</b> restriction_notice" in cap
     assert "&lt;restricted&gt;" in cap
     assert "<b>Machine:</b> studio-pc" in cap
@@ -97,7 +97,8 @@ def test_alert_contains_required_fields_and_escapes():
 def test_alert_manual_attention_for_puzzle():
     a = format_alert(_incident(category="verification_puzzle", label="Verification puzzle", manual_attention=True,
                                is_dialog=True, window_title="Verify"), "pc")
-    assert a["caption"].startswith(f"❗ <b>{MANUAL_ATTENTION}</b>")
+    assert a["caption"].startswith("\U0001F9E9 <b>pc’s Live — VERIFICATION REQUIRED</b>")
+    assert MANUAL_ATTENTION in a["caption"]
     assert 'separate dialog "Verify"' in a["caption"]
 
 

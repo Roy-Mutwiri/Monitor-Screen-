@@ -30,6 +30,7 @@ ctypes Win32 (no pywin32), SQLite outbox, Windows built-in OCR via `winocr`, PyI
 src/studio_monitor/
   win32/{api,windows,capture}.py  ctypes bindings, enumeration, CaptureService (WGC > PrintWindow > verified desktop crop)
   health.py / broadcast_events.py debounced health alerts; broadcast episode dedup
+  labels.py                       owner name -> notification label; every headline via alerts.headline()
   target.py / tracker.py          identity validation, rediscovery, RUNNING/DEGRADED/LOST
   detection/{rules,detector}.py   popup keyword rules (rules/studio_rules.json)
   incidents.py                    popup confirmation + de-duplication

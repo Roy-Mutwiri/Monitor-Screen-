@@ -43,7 +43,7 @@ def test_restriction_in_main_window_queues_alert_with_screenshot(cfg, rules, clo
     assert len(dets) == 1 and dets[0].category == "restriction_notice"
     item = first_incident(queue)
     assert SOURCE_LABEL in item["payload"]["caption"]
-    for field in ("Category:", "Detected text:", "Time:", "Machine:</b> test-pc", "Incident ID:", "main window"):
+    for field in ("RESTRICTION DETECTED", "Reason:", "Time:", "Machine:</b> test-pc", "Incident ID:", "main window"):
         assert field in item["payload"]["caption"]
     assert Path(item["screenshot_path"]).exists() and item["screenshot_path"].endswith(f"{item['incident_id']}.png")
     assert statuses[-1].status == Status.RUNNING

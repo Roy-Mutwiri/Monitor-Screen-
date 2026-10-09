@@ -163,6 +163,9 @@ class DeliveryQueue:
             self._conn.execute(f"ALTER TABLE alerts ADD COLUMN kind TEXT NOT NULL DEFAULT '{KIND_INCIDENT}'")
         if "migrated" not in cols:
             self._conn.execute("ALTER TABLE alerts ADD COLUMN migrated INTEGER NOT NULL DEFAULT 0")
+        ecols = {r[1] for r in self._conn.execute("PRAGMA table_info(events)")}
+        if "owner_label" not in ecols:
+            self._conn.execute("ALTER TABLE events ADD COLUMN owner_label TEXT NOT NULL DEFAULT ''")
         if (self.get_state("schema_version") or 0) < SCHEMA_VERSION:
             self.set_state("schema_version", SCHEMA_VERSION)
 
@@ -199,15 +202,21 @@ class DeliveryQueue:
 
     # -- events + deliveries ----------------------------------------------
     def create_event(self, event_id: str, kind: str, category: str, payload: dict, evidence_path: str,
-                     targets: list, label: str = "", conn: Optional[sqlite3.Connection] = None) -> int:
+                     targets: list, label: str = "", conn: Optional[sqlite3.Connection] = None,
+                     owner_label: str = "") -> int:
         """Persist one event and one delivery per target (atomic). Returns the
-        number of deliveries created. Duplicate (event, bot) pairs are ignored."""
+        number of deliveries created. Duplicate (event, bot) pairs are ignored.
+        ``owner_label`` is the notification label in force when the event was
+        created; later changes never rewrite it or the queued payload."""
         payload = dict(payload)
         payload.setdefault("created_at", self.clock())
+        payload.setdefault("owner_label", owner_label)
 
         def _do(c: sqlite3.Connection) -> int:
-            c.execute("INSERT OR IGNORE INTO events VALUES (?,?,?,?,?,?,?)",
-                      (event_id, kind, category, label[:200], json.dumps(payload), evidence_path, self.clock()))
+            c.execute("INSERT OR IGNORE INTO events (event_id, kind, category, label, payload, evidence_path, "
+                      "created_at, owner_label) VALUES (?,?,?,?,?,?,?,?)",
+                      (event_id, kind, category, label[:200], json.dumps(payload), evidence_path, self.clock(),
+                       owner_label[:80]))
             n = 0
             for t in targets:
                 cur = c.execute(
@@ -381,7 +390,7 @@ class DeliveryQueue:
         return self.summarize(self.deliveries_for(event_id))
 
     def events_history(self, limit: int = 50, kind: str = "all") -> list[dict]:
-        sql = "SELECT event_id, kind, category, label, evidence_path, created_at FROM events"
+        sql = "SELECT event_id, kind, category, label, evidence_path, created_at, owner_label FROM events"
         params: list = []
         if kind == "incident":
             sql += " WHERE kind=?"; params.append(KIND_INCIDENT)
@@ -394,7 +403,7 @@ class DeliveryQueue:
         out = []
         for r in rows:
             out.append({"event_id": r[0], "kind": r[1], "category": r[2], "label": r[3], "evidence_path": r[4],
-                        "created_at": r[5], "summary": self.event_summary(r[0])})
+                        "created_at": r[5], "owner_label": r[6], "summary": self.event_summary(r[0])})
         return out
 
     def evidence_in_use(self) -> set[str]:
@@ -471,7 +480,8 @@ class DeliveryQueue:
                              "last_error, kind FROM alerts WHERE migrated=0 ORDER BY id").fetchall()
             for (aid, incident_id, payload, shot, status, created, sent_at, err, kind) in rows:
                 event_id = f"{incident_id}-L{aid}" if incident_id in ("STATUS",) else incident_id
-                c.execute("INSERT OR IGNORE INTO events VALUES (?,?,?,?,?,?,?)",
+                c.execute("INSERT OR IGNORE INTO events (event_id, kind, category, label, payload, evidence_path, "
+                          "created_at) VALUES (?,?,?,?,?,?,?)",
                           (event_id, kind or KIND_INCIDENT, "legacy", incident_id, payload, shot, created))
                 if target is None:
                     continue
@@ -543,7 +553,8 @@ class DeliveryQueue:
         items = []
         for e in self.events_history(limit, kind):
             items.append({"ts": e["created_at"], "kind": e["kind"], "id": e["event_id"], "label": e["label"],
-                          "detail": e["summary"]["text"], "summary": e["summary"], "evidence_path": e["evidence_path"]})
+                          "detail": e["summary"]["text"], "summary": e["summary"], "evidence_path": e["evidence_path"],
+                          "owner_label": e.get("owner_label", "")})
         return items
 
 
