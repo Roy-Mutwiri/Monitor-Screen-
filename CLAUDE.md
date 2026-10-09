@@ -40,6 +40,8 @@ src/studio_monitor/
   commands.py / email_backup.py   Telegram commands (/status /screenshot /sessions /ack /snooze /report + buttons),
                                   UpdatePoller = single getUpdates consumer per bot (offset + lease, 409 backoff);
                                   Monitor.execute_remote_command runs ONLY predefined ops (screenshot, status)
+  memory.py / session_report.py   Supermemory provider (key only from credential store / hub env, scoped retrieval,
+                                  retrieved text = labelled reference), broadcast/session reports from DB facts
 src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy), services (framework-free logic),
                                   delivery (Telegram routes by token_env), app (API + Jinja dashboard); deploy/ has compose
   account.py                      @username discovery: Interactor protocol (Win32Interactor real), perform_lookup,
@@ -90,5 +92,7 @@ src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy
   fingerprint changes (copied install) and drops enrollment.
 - Telegram commands/buttons, escalation route and SMTP backup (Milestone 4) are verified with scripted transports only;
   no real getUpdates session, second chat or SMTP server was exercised. Commands are never arbitrary.
+- Supermemory (Milestone 5) is exercised only with a fake client mirroring SDK 5.0.0 shapes; no real key, no real
+  documents. Never put an API key in source/tests/logs; `memory.redact_api_key` scrubs sm_… tokens from errors.
 - Detectors never evaluate when the broadcast is not LIVE; a 'reconnecting' overlay keeps the LIVE episode open (UNKNOWN,
   not NOT_LIVE) so RECONNECTING can be reported.

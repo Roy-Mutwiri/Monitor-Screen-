@@ -823,6 +823,13 @@ class App:
                  lambda v: setattr(c.smtp, "to_addrs", [a.strip() for a in v.split(",") if a.strip()]), ""),
                 ("smtp_tls", "Use STARTTLS", "bool", lambda: c.smtp.starttls, lambda v: setattr(c.smtp, "starttls", v), "Off = implicit TLS (SMTPS)."),
             ]),
+            ("Memory (Supermemory)", [
+                ("mem_enabled", "Store incident and session summaries in Supermemory", "bool", lambda: c.memory.enabled,
+                 lambda v: setattr(c.memory, "enabled", v), "Standalone mode only. Key: `studio-monitor memory set-key` (Credential Manager). Retrieved text is reference only."),
+                ("mem_ns", "Namespace (blank = per device)", "str", lambda: c.memory.namespace, lambda v: setattr(c.memory, "namespace", v.strip()), ""),
+                ("mem_reports", "Broadcast / session reports when a broadcast or Studio session ends", "bool", lambda: c.activity.session_reports,
+                 lambda v: setattr(c.activity, "session_reports", v), "Sent to bots subscribed to broadcast / Studio-closed categories."),
+            ]),
             ("Fleet hub", [
                 ("hub_url", "Hub URL", "str", lambda: c.hub.url, lambda v: setattr(c.hub, "url", v.strip().rstrip("/")),
                  "Central server (https://...). Use 'Enroll with pairing code' after saving; the agent credential is stored in the Credential Manager."),

@@ -469,6 +469,43 @@ def _utf8_console() -> None:
             pass
 
 
+def _memory(cfg: AppConfig, action: str, query: str) -> int:
+    from .app import make_memory_provider
+    from .credentials import default_store
+    from .memory import MEMORY_CRED_KEY, format_hits, load_api_key
+    store = default_store()
+    if action == "set-key":
+        key = getpass.getpass("Supermemory API key (stored in the Windows Credential Manager, never in settings): ") \
+            if sys.stdin.isatty() else sys.stdin.readline().strip()
+        if not key:
+            print("no key entered"); return 2
+        store.set(MEMORY_CRED_KEY, key)
+        print("Supermemory key stored")
+        return 0
+    if action == "clear-key":
+        store.delete(MEMORY_CRED_KEY)
+        print("Supermemory key removed")
+        return 0
+    has_key = bool(load_api_key(store))
+    print(f"memory enabled={cfg.memory.enabled} mode={cfg.device.mode} key={'stored' if has_key else 'missing'} "
+          f"namespace={cfg.memory.namespace or '(default per device)'} sync incidents={cfg.memory.sync_resolved_incidents} "
+          f"reports={cfg.memory.sync_reports}")
+    if cfg.device.mode == "managed":
+        print("managed mode: the hub syncs memory with its own key; this PC never receives it")
+    if action == "search":
+        if not query:
+            print("QUERY is required"); return 2
+        p = make_memory_provider(cfg, store)
+        if p is None:
+            print("memory not available (disabled, managed mode, or key missing -> `memory set-key`)"); return 1
+        cfg.ensure_device_id()
+        hits = p.search(query, {"device_id": cfg.device.device_id}, cfg.memory.retrieval_limit)
+        print(format_hits(hits).replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "") or "no results")
+        if getattr(p, "last_error", ""):
+            print(f"error: {p.last_error}")
+    return 0
+
+
 def _smtp(cfg: AppConfig, action: str) -> int:
     from .app import make_email_backup
     from .credentials import default_store
@@ -619,6 +656,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("hub", help="fleet hub: enroll --url URL --code CODE [--mode managed|standalone] | status | unenroll | sync-once")
     p.add_argument("action", choices=["enroll", "status", "unenroll", "sync-once"])
     p.add_argument("--url", default=""); p.add_argument("--code", default=""); p.add_argument("--mode", default="")
+    p = sub.add_parser("memory", help="Supermemory: set-key | clear-key | status | search QUERY")
+    p.add_argument("action", choices=["set-key", "clear-key", "status", "search"]); p.add_argument("query", nargs="?", default="")
     p = sub.add_parser("smtp", help="e-mail backup route: set-password | status | test")
     p.add_argument("action", choices=["set-password", "status", "test"])
     p = sub.add_parser("detectors", help="stream-health detectors: status | text IMAGE | face IMAGE | audio IMAGE")
@@ -675,6 +714,8 @@ def main(argv: list[str] | None = None) -> int:
         return _hub(cfg, cfg_path, args.action, args.url, args.code, args.mode)
     if args.cmd == "smtp":
         return _smtp(cfg, args.action)
+    if args.cmd == "memory":
+        return _memory(cfg, args.action, args.query)
     if cmd == "autostart":
         return _autostart(cfg, cfg_path, args.enable, args.disable)
     if cmd == "maintenance":

@@ -78,9 +78,11 @@ class DeviceUpdate(BaseModel):
 
 
 # ---------------------------------------------------------------- app factory
-def create_app(settings: Optional[HubSettings] = None, engine=None, clock=None, telegram_transport=None) -> FastAPI:
+def create_app(settings: Optional[HubSettings] = None, engine=None, clock=None, telegram_transport=None,
+               memory_client=None) -> FastAPI:
     settings = settings or HubSettings.from_env()
     engine = engine or make_engine(settings.database_url)
+    from .memory import HubMemory, MemorySyncRow  # noqa: F401  (registers the table before create_all)
     session_factory = make_session_factory(engine)
     signer = URLSafeTimedSerializer(settings.secret_key, salt="hub-session")
     worker = HubDeliveryWorker(session_factory, settings.telegram_api_base, transport=telegram_transport,
@@ -90,6 +92,9 @@ def create_app(settings: Optional[HubSettings] = None, engine=None, clock=None, 
     from .commands import HubCommandPollers
     background.commands = HubCommandPollers(session_factory, worker.env, settings.telegram_api_base, telegram_transport,
                                             clock or __import__("time").time, settings.evidence_dir)
+    background.memory = HubMemory(session_factory, settings.supermemory_api_key, settings.supermemory_namespace_prefix, client=memory_client)
+    background.commands.memory = background.memory
+    app_memory = background.memory
     templates = Jinja2Templates(directory=str(TEMPLATES))
 
     with session_factory() as s:
@@ -255,6 +260,21 @@ def create_app(settings: Optional[HubSettings] = None, engine=None, clock=None, 
     @app.post("/api/v1/admin/sweep")
     def sweep(actor: str = Depends(admin_actor)):
         return background.once()
+
+    @app.get("/api/v1/memory/search")
+    def memory_search(q: str, device_id: str = "", workspace: str = "", limit: int = 5, actor: str = Depends(admin_actor),
+                      service: HubService = Depends(svc)):
+        if not app_memory.configured:
+            return {"configured": False, "note": "SUPERMEMORY_API_KEY is not set on the hub", "hits": []}
+        ws = service.ensure_workspace(workspace or settings.default_workspace)
+        hits = app_memory.search(ws.id, q, device_id, max(1, min(limit, 20)))
+        return {"configured": True, "note": "retrieved text is reference only, not verified now",
+                "hits": [{"id": h.id, "text": h.text, "similarity": h.similarity, "metadata": h.metadata} for h in hits]}
+
+    @app.post("/api/v1/admin/memory-sync")
+    def memory_sync(actor: str = Depends(admin_actor)):
+        from .services import now_iso
+        return app_memory.sync_once(now_iso(clock))
 
     # ------------------------------------------------------------ dashboard
     def render(request: Request, name: str, **ctx):

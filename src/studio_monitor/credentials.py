@@ -94,7 +94,7 @@ class WindowsCredentialStore:
 
     @staticmethod
     def _target(bot_id: str) -> str:
-        if bot_id.startswith("hub-agent/") or bot_id.startswith("smtp/"):
+        if bot_id.startswith("hub-agent/") or bot_id.startswith("smtp/") or bot_id.startswith("supermemory/"):
             return "MonitorScreen/" + bot_id          # agent credential for the fleet hub / SMTP backup password
         return TARGET_PREFIX + bot_id
 

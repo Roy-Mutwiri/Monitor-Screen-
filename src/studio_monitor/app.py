@@ -242,6 +242,21 @@ def make_email_backup(cfg: AppConfig, store: Optional[CredentialStore] = None):
     return EmailBackup(settings, store or default_store())
 
 
+def make_memory_provider(cfg: AppConfig, store: Optional[CredentialStore] = None, client=None):
+    """Supermemory provider for a standalone PC. Managed devices leave memory to the hub (the hub's key never
+    reaches agents). Without a locally entered key the provider is None and the UI says so."""
+    from .memory import load_api_key, make_provider
+    if cfg.device.mode == "managed" or not cfg.memory.enabled:
+        return None
+    key = load_api_key(store or default_store())
+    if not key:
+        log.warning("memory enabled but no Supermemory key in the credential store; run `studio-monitor memory set-key`")
+        return None
+    cfg.ensure_device_id()
+    ns = cfg.memory.namespace or f"studio-monitor-{cfg.device.device_id[:8]}"
+    return make_provider(True, ns, key, client=client)
+
+
 def make_capture_service(cfg: AppConfig, system=None):
     from .win32.capture import CaptureService
     from .win32.windows import Win32WindowSystem
@@ -275,6 +290,7 @@ def build_monitor(cfg: AppConfig, cfg_path: Path, registry: Optional[BotRegistry
     if "hub_sync" not in callbacks:
         callbacks["hub_sync"] = make_hub_sync(cfg, on_event=callbacks.get("on_event"))
     callbacks.setdefault("email_backup", make_email_backup(cfg))
+    callbacks.setdefault("memory", make_memory_provider(cfg))
     monitor = Monitor(cfg, system, capturer, ocr, rules, queue, registry, factory,
                       live_rules=load_live_rules(cfg), **callbacks)
     if monitor.command_poller is None:

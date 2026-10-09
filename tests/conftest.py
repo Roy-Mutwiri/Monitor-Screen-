@@ -215,6 +215,7 @@ def cfg(tmp_path, studio_identity):
     c.target = studio_identity
     c.detection.confirm_polls = 1
     c.telegram.fingerprint_salt = "test-salt"
+    c.activity.session_reports = False      # reports are a separate feature (tests/test_memory.py switches them on)
     return c
 
 

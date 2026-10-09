@@ -35,6 +35,7 @@ services:
       HUB_UNREACHABLE_AFTER: ${HUB_UNREACHABLE_AFTER:-90}
       # Telegram bot tokens for routes, referenced by variable NAME in each route (token_env). Add as many as you need.
       HUB_BOT_OPS: ${HUB_BOT_OPS:-}
+      SUPERMEMORY_API_KEY: ${SUPERMEMORY_API_KEY:-}
     volumes:
       - hub-evidence:/data/evidence
     ports:

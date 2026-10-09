@@ -80,6 +80,7 @@ class DetectionConfig:
 @dataclass
 class ActivityConfig:
     """Studio opened/closed notifications and the not-live reminder."""
+    session_reports: bool = True        # broadcast / session reports when a broadcast or Studio session ends
     notify_opened: bool = True
     notify_closed: bool = True
     notify_already_running: bool = True
@@ -218,6 +219,17 @@ class SmtpConfig:
 
 
 @dataclass
+class MemoryConfig:
+    """Supermemory long-term memory (standalone PCs; in managed mode the hub syncs with its own key).
+    The API key is entered locally (`studio-monitor memory set-key`) and lives only in the credential store."""
+    enabled: bool = False
+    namespace: str = ""                 # empty = "studio-monitor-<device_id prefix>"
+    sync_resolved_incidents: bool = True
+    sync_reports: bool = True
+    retrieval_limit: int = 5
+
+
+@dataclass
 class HubConfig:
     """Fleet hub connection. The agent secret lives in the credential store (hub-agent/<device_id>)."""
     url: str = ""                       # e.g. https://hub.example.org ; empty = no hub
@@ -271,6 +283,7 @@ class AppConfig:
     commands: CommandsConfig = field(default_factory=CommandsConfig)
     escalation: EscalationConfig = field(default_factory=EscalationConfig)
     smtp: SmtpConfig = field(default_factory=SmtpConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
     config_version: int = CONFIG_VERSION
 
     # -- serialisation ----------------------------------------------------
@@ -306,6 +319,7 @@ class AppConfig:
         cfg.commands = CommandsConfig(**_known(CommandsConfig, data.get("commands", {})))
         cfg.escalation = EscalationConfig(**_known(EscalationConfig, data.get("escalation", {})))
         cfg.smtp = SmtpConfig(**_known(SmtpConfig, data.get("smtp", {})))
+        cfg.memory = MemoryConfig(**_known(MemoryConfig, data.get("memory", {})))
         if cfg.device.mode not in ("standalone", "managed"):
             cfg.device.mode = "standalone"
         cfg.device = DeviceConfig(**_known(DeviceConfig, data.get("device", {})))

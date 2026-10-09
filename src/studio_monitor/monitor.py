@@ -41,6 +41,8 @@ from .contracts.events import Event, EvidenceRef, Severity
 from .hub_sync import HubSync
 from .commands import CommandRouter, UpdatePoller, incident_keyboard
 from .email_backup import EmailBackup
+from .memory import MemoryProvider, format_hits, incident_doc, session_doc
+from .session_report import build_report
 from .ocr.base import OcrBackend, OcrError
 from .privacy import purge_old_screenshots, redact
 from .queue import KIND_ACTIVITY, KIND_INCIDENT, KIND_REMINDER, KIND_STATUS, Delivery, DeliveryError, DeliveryQueue, DeliveryWorker
@@ -132,7 +134,8 @@ class Monitor:
                  detector_suite: Optional[DetectorSuite] = None,
                  hub_sync: Optional[HubSync] = None,
                  command_poller: Optional[UpdatePoller] = None,
-                 email_backup: Optional[EmailBackup] = None) -> None:
+                 email_backup: Optional[EmailBackup] = None,
+                 memory: Optional[MemoryProvider] = None) -> None:
         self.cfg = cfg
         self.system = system
         self.capturer = capturer                 # dialogs only (PrintWindow, no desktop fallback)
@@ -213,6 +216,10 @@ class Monitor:
         # Telegram commands (standalone mode) + e-mail backup route
         self.command_poller: Optional[UpdatePoller] = command_poller
         self.email_backup: Optional[EmailBackup] = email_backup
+        self.memory: Optional[MemoryProvider] = memory
+        self._stream_episode_counts: dict[str, int] = {}
+        self._session_started_utc = ""
+        self.last_report: Optional[dict] = None
         self._last_failed_delivery_id = int(queue.get_state("email_backup_last_delivery_id", 0) or 0)
         self._started_mono = mono()
         self._stream_incidents: dict[str, dict] = {}
@@ -249,7 +256,7 @@ class Monitor:
         return message_id
 
     def dispatch(self, event_id: str, kind: str, category: str, payload: dict, evidence_path: str,
-                 label: str = "", incident_id: str = "", event_type: str = "") -> int:
+                 label: str = "", incident_id: str = "", event_type: str = "", extra_detail: Optional[dict] = None) -> int:
         """Create one event + one delivery per enabled subscribed bot. Deliveries
         are withheld (the event is still recorded) while the category is
         suppressed by maintenance or a snooze, or when a hub owns delivery.
@@ -261,7 +268,7 @@ class Monitor:
                                     owner_label=self.cfg.notification_label)
         if suppressed:
             self.on_event(f"{label or event_id}: recorded but not delivered (maintenance/snooze active for {category})")
-        self.mirror_to_hub(event_id, kind, category, payload, evidence_path, label, incident_id, event_type)
+        self.mirror_to_hub(event_id, kind, category, payload, evidence_path, label, incident_id, event_type, extra_detail)
         self._kick()
         return n
 
@@ -490,6 +497,7 @@ class Monitor:
                 self._stream_end_hint = ended
                 self.on_event(f"stream-end wording seen while LIVE ({ended!r}); broadcast state is decided by the live-state engine")
         for name, detail in out.confirmed:
+            self._stream_episode_counts[name] = self._stream_episode_counts.get(name, 0) + 1
             self._open_stream_incident(name, detail, main_cap)
         for name, detail in out.recovered:
             self._resolve_stream_incident(name, detail)
@@ -522,6 +530,7 @@ class Monitor:
             return
         now = self.clock()
         self.incident_engine.resolve(info["incident_id"], detail, observed_utc=_utc(now))
+        self.remember_incident(info["incident_id"])
         if final:
             self.on_event(f"stream health: {name} closed ({detail})")
             return
@@ -583,6 +592,7 @@ class Monitor:
             return
         text = f"{inc.label} no longer visible in Studio (this does not confirm the restriction was lifted)"
         self.incident_engine.resolve(inc.incident_id, text, observed_utc=_utc(self.clock()))
+        self.remember_incident(inc.incident_id)
         payload = {"text": f"\u2705 <b>{self.cfg.notification_label} \u2014 RESOLVED</b>\n{text}\nIncident <code>{inc.incident_id}</code>\n"
                            f"Time: {datetime.fromtimestamp(self.clock()):%Y-%m-%d %H:%M:%S}", "created_at": self.clock(),
                    "thread_of": inc.incident_id}
@@ -652,6 +662,67 @@ class Monitor:
             ok = eb.send(f"[{self.cfg.notification_label}] {f['label'] or f['event_id']} (Telegram failed)", body)
             self.on_event(f"e-mail backup {'sent' if ok else 'failed: ' + eb.last_error} for {f['event_id']}")
         self.queue.set_state("email_backup_last_delivery_id", self._last_failed_delivery_id)
+
+    # ---- reports + memory ------------------------------------------------
+    def _emit_report(self, kind: str, episode_id: str, ended_at: float, session_id: str = "") -> Optional[dict]:
+        if not self.cfg.activity.session_reports:
+            return None
+        session_id = session_id or self.sessions.session_id
+        summary = self.incident_engine.session_summary(self.device_id, session_id) if session_id else {"incidents": 0, "by_category": {}}
+        ep = self.episodes.state
+        rs = self.reminders.state
+        a = self.account
+        started = ep.live_since_utc if kind == "broadcast_report" else self._session_started_utc
+        report = build_report(kind, device_id=self.device_id, device_name=self.cfg.device.device_name or self.cfg.machine_label,
+                              owner_label=self.cfg.notification_label, session_id=session_id, episode_id=episode_id,
+                              started_utc=started or "", ended_at=ended_at, summary=summary, reminders_sent=rs.reminders_sent,
+                              offline_seconds=rs.accumulated_seconds, stream_problems=dict(self._stream_episode_counts),
+                              account=a.handle if a.status == SUCCEEDED else "", account_status=a.status,
+                              live_rules_verified=self.live_rules.verified)
+        self.last_report = report
+        eid = _event_id("RPT", ended_at)
+        payload = {"text": report["text_html"], "caption": report["text_html"], "created_at": ended_at}
+        category = CAT_BROADCAST if kind == "broadcast_report" else CAT_STUDIO_CLOSED
+        self.queue.record_event(eid, "SESSION_REPORT", _utc(ended_at), {"summary": report["text_plain"], "report": report},
+                                session_id, episode_id)
+        if kind == "session_report" and not self.cfg.activity.notify_closed:
+            # Studio-closed notifications are off: keep the report in history/hub/memory, send nothing
+            self.mirror_to_hub(eid, KIND_ACTIVITY, category, payload, "", label="Session Report", event_type="SESSION_REPORT",
+                               extra_detail={"report": report})
+            n = 0
+        else:
+            n = self.dispatch(eid, KIND_ACTIVITY, category, payload, "", label=report["kind"].replace("_", " ").title(),
+                              event_type="BROADCAST_ENDED" if kind == "broadcast_report" else "SESSION_REPORT",
+                              extra_detail={"report": report})
+        self.on_event(f"{report['kind'].replace('_', ' ')} for {episode_id or session_id} -> {eid} queued for {n} bot(s)")
+        if kind == "broadcast_report":
+            self._stream_episode_counts = {}
+        self._remember(session_doc(report))
+        return report
+
+    def _remember(self, doc) -> None:
+        """Store a summary in long-term memory (never OCR-driven decisions; failures are logged, not fatal)."""
+        if self.memory is None:
+            return
+        try:
+            if self.memory.add(doc):
+                self.on_event(f"memory: stored {doc.id}")
+            else:
+                self.on_event(f"memory: could not store {doc.id}: {getattr(self.memory, 'last_error', '') or 'unknown error'}")
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("memory add failed: %s", exc)
+
+    def remember_incident(self, incident_id: str) -> None:
+        inc = self.incident_engine.get(incident_id)
+        if inc is None or self.memory is None:
+            return
+        self._remember(incident_doc(inc, self.cfg.device.device_name or self.cfg.machine_label, self.cfg.notification_label))
+
+    def similar_from_memory(self, query: str) -> str:
+        if self.memory is None or not query:
+            return ""
+        hits = self.memory.search(query, {"device_id": self.device_id}, self.cfg.memory.retrieval_limit)
+        return format_hits(hits, "Similar past incidents / sessions")
 
     # ---- predefined remote operations ---------------------------------
     REMOTE_OPS = ("screenshot", "status")
@@ -760,6 +831,11 @@ class Monitor:
             lines.append(f"  \u2013 {cat}: {b['count']} ({b['open']} open, {b['resolved']} resolved, {format_duration(b['total_seconds'])} total)")
         if self.detectors is not None and a.stream:
             lines.append("Stream health: " + ", ".join(f"{k.lower()}={v.get('state')}" for k, v in a.stream.items()))
+        open_incs = self.incident_engine.list(self.device_id, "OPEN", 3)
+        query = "; ".join(i.summary[:120] for i in open_incs) or (self.last_report or {}).get("text_plain", "")[:200]
+        similar = self.similar_from_memory(query)
+        if similar:
+            lines += ["", similar]
         return "\n".join(lines)
 
     def command_backend(self):
@@ -825,6 +901,8 @@ class Monitor:
         act = self.cfg.activity
         eid = _event_id("EVT", ev.ts)
         if ev.type == EVT_OPENED:
+            self._session_started_utc = ev.ts_utc
+            self._stream_episode_counts = {}
             summary, category = "Studio opened", CAT_STUDIO_OPENED
             if not act.notify_opened:
                 self.queue.record_event(eid, ev.type, ev.ts_utc, {"summary": summary, "notified": False}, ev.session_id)
@@ -835,6 +913,7 @@ class Monitor:
             payload = format_studio_opened(self.cfg.machine_label, ev.ts, bool(shot), act.open_screenshot_timeout_seconds,
                                            label=self.cfg.notification_label)
         elif ev.type == EVT_ALREADY_RUNNING:
+            self._session_started_utc = ev.ts_utc
             summary, category = "Studio already running at monitor start", CAT_STUDIO_OPENED
             frame = self.frame_cache.fresh(act.fresh_screenshot_max_age_seconds) if ev.screenshot_available else None
             shot = self._activity_shot(eid, frame)
@@ -842,6 +921,7 @@ class Monitor:
                                                     label=self.cfg.notification_label)
         elif ev.type == EVT_CLOSED:
             summary, category = f"Studio closed ({ev.note})", CAT_STUDIO_CLOSED
+            self._emit_report("session_report", "", ev.ts, session_id=ev.session_id)
             if not act.notify_closed:
                 self.queue.record_event(eid, ev.type, ev.ts_utc, {"summary": summary, "notified": False}, ev.session_id)
                 self.on_event(f"{summary}; notification disabled")
@@ -914,9 +994,11 @@ class Monitor:
     def _handle_broadcast_event(self, bev, evidence_cap: Optional[Capture]) -> None:
         now = self.clock()
         if bev.kind == "ended":
-            self.queue.record_event(_event_id("EVT", now), EVT_BROADCAST_ENDED, _utc(now),
+            eid = _event_id("EVT", now)
+            self.queue.record_event(eid, EVT_BROADCAST_ENDED, _utc(now),
                                     {"summary": "broadcast ended (confirmed NOT_LIVE)"}, episode_id=bev.episode_id)
             self.on_event(f"broadcast episode {bev.episode_id} ended (confirmed NOT_LIVE)")
+            self._emit_report("broadcast_report", bev.episode_id, now)
             return
         eid = _event_id("BCS", now)
         # preserve the exact frame that supported the LIVE confirmation *before* anything else happens

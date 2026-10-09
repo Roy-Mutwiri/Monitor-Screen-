@@ -58,7 +58,8 @@ class Harness:
         return all_deliveries(self.queue)
 
     def event_types(self):
-        return [e["event_type"] for e in reversed(self.queue.recent_events(100))]
+        # reports are derived artifacts of a session/broadcast; the lifecycle assertions look at the source events
+        return [e["event_type"] for e in reversed(self.queue.recent_events(100)) if e["event_type"] != "SESSION_REPORT"]
 
     def close_studio(self):
         self.sys.remove(0x1001)

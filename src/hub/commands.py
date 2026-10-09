@@ -29,6 +29,7 @@ class HubCommandBackend:
         self.workspace_id = workspace_id
         self.clock = clock
         self.evidence_dir = evidence_dir
+        self.memory = None
 
     def _svc(self, s: Session) -> HubService:
         return HubService(s, self.clock)
@@ -117,8 +118,15 @@ class HubCommandBackend:
             devs = svc.devices(self.workspace_id)
             live = sum(1 for d in devs if svc.device_status(d) == "LIVE")
             unreachable = sum(1 for d in devs if svc.device_status(d) == "UNREACHABLE")
-            return (f"<b>Fleet report</b>\nDevices: {len(devs)} (LIVE {live}, unreachable {unreachable})\n"
+            text = (f"<b>Fleet report</b>\nDevices: {len(devs)} (LIVE {live}, unreachable {unreachable})\n"
                     f"Open incidents: {c['open_incidents']}\nEvents stored: {c['events']}\nPending Telegram deliveries: {c['pending_deliveries']}")
+            incs = svc.open_incidents(self.workspace_id)
+            if self.memory is not None and getattr(self.memory, "configured", False):
+                query = "; ".join(i.summary[:120] for i in incs[:3]) or "studio session report"
+                block = self.memory.similar_block(self.workspace_id, query)
+                if block:
+                    text += "\n\n" + block
+            return text
 
 
 class HubCommandPollers:
@@ -131,6 +139,7 @@ class HubCommandPollers:
         self.on_event = on_event or (lambda m: log.info(m))
         self._pollers: dict[int, UpdatePoller] = {}
         self._state: dict[str, object] = {}
+        self.memory = None
 
     def _state_get(self, key, default=None):
         return self._state.get(key, default)
@@ -152,6 +161,7 @@ class HubCommandPollers:
             client = TelegramClient(TelegramConfig(api_base=self.api_base, timeout_seconds=35.0), token, r.chat_id,
                                     int(r.thread_id) if r.thread_id else None, transport=self.transport)
             backend = HubCommandBackend(self.sf, r.workspace_id, self.clock, self.evidence_dir)
+            backend.memory = self.memory
             router = CommandRouter(backend, {r.chat_id}, on_audit=self.on_event, clock=self.clock, actor_prefix="telegram")
             self._pollers[r.id] = UpdatePoller(client, router, self._state_get, self._state_set, f"route-{r.id}", "hub",
                                                on_event=self.on_event, clock=self.clock, long_poll_seconds=0)

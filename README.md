@@ -162,6 +162,33 @@ and a mode: `standalone` (local Telegram delivery) or `managed` (a hub owns deli
 recorded locally and delivered by the hub, so there are no duplicate notifications). Local bot
 settings are kept in both modes.
 
+## Reports and long-term memory (Supermemory)
+
+**Reports** (`session_report.py`): when a broadcast ends (confirmed NOT_LIVE) a *broadcast report* goes to bots
+subscribed to the broadcast category, and when Studio closes a *session report* goes with the Studio-closed
+category (suppressed when closed notifications are off). Content is computed from the database only: duration,
+incidents by category with open/resolved counts and total time, reminders, stream-health episodes, the verified
+account, and a note when live-state rules are unverified. `/report` returns the live equivalent on demand.
+Toggle: Settings → Memory → *Broadcast / session reports*.
+
+**Memory** (`memory.py`, Supermemory SDK 5.0.0 namespace API): resolved incidents and reports are stored as short
+summaries with stable ids (`incident:<id>`, `report:<id>`, so re-syncs are idempotent) and metadata that scopes them to
+workspace and device. Retrieval always filters on that scope (and re-checks it client-side) and is shown under
+“Similar past incidents / sessions — retrieved from memory, reference only, not verified now” in `/report` and the hub
+API. Retrieved text is escaped and never interpreted: it cannot change thresholds, suppress alerts or run anything.
+
+- **Standalone PC**: `studio-monitor memory set-key` stores the API key in the Windows Credential Manager
+  (`MonitorScreen/supermemory/api-key`); it is never written to settings, logs or documents (keys are redacted from
+  error messages). Enable in Settings → Memory. Without a stored key the feature reports “key missing” instead of
+  guessing.
+- **Hub**: `SUPERMEMORY_API_KEY` in the hub environment only; one namespace per workspace; the background loop syncs
+  resolved incidents and reports every minute (`POST /api/v1/admin/memory-sync` runs it now); `GET
+  /api/v1/memory/search?q=…&device_id=…` and the hub `/report` command retrieve. Agents never receive the hub key, and
+  managed devices do not run their own memory sync.
+
+**Not verified against the real service**: all Supermemory calls are exercised with a fake client that mirrors the
+SDK 5.0.0 request/response shapes; no real key was used and no real document was created.
+
 ## Telegram commands, buttons, escalation and e-mail backup
 
 **Commands** (`commands.py`): `/status`, `/screenshot`, `/sessions`, `/ack INCIDENT`, `/snooze INCIDENT MINUTES`,
@@ -530,6 +557,7 @@ src/studio_monitor/
   hub_client.py / hub_outbox.py / hub_sync.py  agent side of the fleet hub (enroll, durable outbox, heartbeats)
   commands.py   Telegram command router, inline keyboards, single getUpdates consumer (agent + hub)
   email_backup.py  SMTP backup route for failed urgent deliveries
+  memory.py / session_report.py  Supermemory provider (scoped, key-hygienic) and broadcast/session reports
 src/hub/        the central hub: FastAPI app, SQLAlchemy models, services, Telegram routing, dashboard templates
 deploy/         Dockerfile, docker-compose.yml (PostgreSQL + hub), .env.example, deployment README
   reminders.py  offline episodes + not-live reminders

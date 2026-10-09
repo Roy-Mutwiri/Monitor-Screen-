@@ -77,6 +77,8 @@ class HubBackground:
         self._thread: Optional[threading.Thread] = None
         self._last_purge = 0.0
         self.commands = None          # HubCommandPollers, attached by create_app
+        self.memory = None            # HubMemory, attached by create_app
+        self._last_memory_sync = 0.0
 
     def once(self) -> dict:
         with self.sf() as s:
@@ -95,7 +97,15 @@ class HubBackground:
                 commands = self.commands.poll_once()
             except Exception as exc:  # pragma: no cover
                 log.error("command polling failed: %s", sanitize(str(exc)))
-        return {"unreachable": len(flipped), "delivered": delivered, "purged": purged, "commands": commands}
+        memory = {}
+        if self.memory is not None and self.memory.configured and self.clock() - self._last_memory_sync >= 60:
+            self._last_memory_sync = self.clock()
+            try:
+                from .services import now_iso
+                memory = self.memory.sync_once(now_iso(self.clock))
+            except Exception as exc:  # pragma: no cover
+                log.error("memory sync failed: %s", sanitize(str(exc)))
+        return {"unreachable": len(flipped), "delivered": delivered, "purged": purged, "commands": commands, "memory": memory}
 
     def _run(self) -> None:
         while not self._stop.is_set():

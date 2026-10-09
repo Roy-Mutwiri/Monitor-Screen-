@@ -39,6 +39,8 @@ class HubSettings:
     public_url: str = ""
     default_workspace: str = "default"
     retention_days: int = 90
+    supermemory_api_key: str = ""           # SUPERMEMORY_API_KEY on the hub only; never sent to agents
+    supermemory_namespace_prefix: str = "studio-hub"
     extra: dict = field(default_factory=dict)
 
     @classmethod
@@ -62,4 +64,6 @@ class HubSettings:
             public_url=e.get("HUB_PUBLIC_URL", ""),
             default_workspace=e.get("HUB_DEFAULT_WORKSPACE", cls.default_workspace),
             retention_days=int(e.get("HUB_RETENTION_DAYS", cls.retention_days)),
+            supermemory_api_key=e.get("SUPERMEMORY_API_KEY", ""),
+            supermemory_namespace_prefix=e.get("HUB_MEMORY_NAMESPACE_PREFIX", cls.supermemory_namespace_prefix),
         )
