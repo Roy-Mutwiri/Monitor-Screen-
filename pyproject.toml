@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiktok-live-studio-monitor"
+version = "1.0.0"
+description = "Monitors the TikTok LIVE Studio desktop app for restriction/warning/suspension/interruption/verification popups and alerts via Telegram."
+requires-python = ">=3.10"
+dependencies = [
+    "pillow>=10",
+]
+
+[project.optional-dependencies]
+windows-ocr = ["winocr>=0.0.13"]
+tesseract = ["pytesseract>=0.3.10"]
+rapidocr = ["rapidocr-onnxruntime>=1.3", "numpy"]
+dev = ["pytest>=8", "pyinstaller>=6"]
+
+[project.scripts]
+studio-monitor = "studio_monitor.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

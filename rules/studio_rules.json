@@ -1,0 +1,132 @@
+{
+  "_comment": [
+    "Detection rules for TikTok LIVE Studio popups. Edit freely.",
+    "Match the text Studio actually shows: run `studio-monitor calibrate <screenshot.png>`",
+    "on a real Studio screenshot to see the OCR text and which rules fire.",
+    "any: at least one phrase must appear.  all: every phrase must appear.",
+    "none: none of these phrases may appear (suppresses false positives).",
+    "Matching is case-insensitive and tolerant of OCR spacing/punctuation.",
+    "priority: higher wins when several categories match the same text."
+  ],
+  "min_text_chars": 12,
+  "categories": {
+    "verification_puzzle": {
+      "label": "Verification puzzle",
+      "severity": "critical",
+      "manual_attention": true,
+      "priority": 100,
+      "any": [
+        "verify to continue",
+        "drag the slider",
+        "slide to verify",
+        "select the matching",
+        "select all images",
+        "complete the puzzle",
+        "solve the puzzle",
+        "verification puzzle",
+        "fit the puzzle piece",
+        "rotate the image",
+        "captcha",
+        "verify you are human",
+        "security verification",
+        "confirm you're not a robot"
+      ]
+    },
+    "account_suspension": {
+      "label": "Account suspension",
+      "severity": "critical",
+      "priority": 90,
+      "any": [
+        "account has been suspended",
+        "account is suspended",
+        "account suspended",
+        "permanently banned",
+        "account has been banned",
+        "your account is banned",
+        "account was banned",
+        "live access has been suspended",
+        "live access suspended",
+        "you can no longer go live",
+        "no longer able to go live",
+        "permanently suspended"
+      ]
+    },
+    "live_interruption": {
+      "label": "LIVE interruption",
+      "severity": "high",
+      "priority": 80,
+      "any": [
+        "your live has ended",
+        "live has been ended",
+        "live was ended",
+        "live has been interrupted",
+        "live was interrupted",
+        "ended your live",
+        "we ended your live",
+        "your live was terminated",
+        "live has been stopped",
+        "live was stopped",
+        "stream has been ended",
+        "stream was interrupted",
+        "disconnected from live",
+        "you've been removed from live",
+        "live session ended"
+      ],
+      "none": [
+        "end live?",
+        "are you sure you want to end"
+      ]
+    },
+    "restriction_notice": {
+      "label": "Restriction notice",
+      "severity": "high",
+      "priority": 70,
+      "any": [
+        "has been restricted",
+        "is restricted",
+        "temporarily restricted",
+        "live restriction",
+        "restricted from going live",
+        "restricted from live",
+        "cannot go live",
+        "can't go live",
+        "unable to go live",
+        "not eligible to go live",
+        "live feature is unavailable",
+        "feature has been limited",
+        "account restriction",
+        "your access to live",
+        "violated our community guidelines",
+        "violation of community guidelines",
+        "community guidelines violation",
+        "strike has been applied",
+        "you have received a strike",
+        "temporarily unavailable due to"
+      ]
+    },
+    "content_warning": {
+      "label": "Content warning",
+      "severity": "medium",
+      "priority": 60,
+      "any": [
+        "content warning",
+        "warning: your live",
+        "may violate",
+        "might violate",
+        "potential violation",
+        "review our community guidelines",
+        "please review the community guidelines",
+        "this content may not be appropriate",
+        "inappropriate content",
+        "your live may be at risk",
+        "at risk of being ended",
+        "please adjust your content",
+        "this live has been flagged",
+        "flagged for review",
+        "under review",
+        "moderation notice",
+        "content has been reported"
+      ]
+    }
+  }
+}
