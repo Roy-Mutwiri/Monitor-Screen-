@@ -356,7 +356,9 @@ def test_restriction_and_activity_are_independent(h):
     assert len(h.alerts("incident")) == 1 and len(h.alerts("activity")) == 2
     hist = h.queue.history(kind="activity")
     assert all(x["kind"] != "incident" for x in hist) and sum(x["kind"] == "activity" for x in hist) == 2
-    assert len(h.queue.history(kind="incident")) == 1 and len(h.queue.history(kind="all")) == len(hist) + 1
+    inc_hist = h.queue.history(kind="incident")
+    assert len(inc_hist) == 2 and any(x["id"].endswith("-RES") for x in inc_hist)   # alert + resolution follow-up
+    assert len(h.queue.history(kind="all")) == len(hist) + 2
     assert all("Delivered to" in x["detail"] for x in h.queue.history(kind="all"))
 
 
