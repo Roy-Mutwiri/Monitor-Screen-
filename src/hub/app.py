@@ -30,6 +30,7 @@ log = logging.getLogger("hub")
 TEMPLATES = Path(__file__).parent / "templates"
 PNG_MAGIC = bytes([0x89, 0x50, 0x4E, 0x47])
 JPEG_MAGIC = bytes([0xFF, 0xD8])
+GIF_MAGIC = b"GIF8"
 
 
 # ---------------------------------------------------------------- request models
@@ -194,11 +195,11 @@ def create_app(settings: Optional[HubSettings] = None, engine=None, clock=None, 
         expected = sha256 or row.evidence_sha256
         if expected and digest != expected:
             raise HTTPException(400, "sha256 mismatch")
-        if data[:4] != PNG_MAGIC and data[:2] != JPEG_MAGIC:
-            raise HTTPException(415, "only PNG or JPEG evidence is accepted")
+        if data[:4] != PNG_MAGIC and data[:2] != JPEG_MAGIC and data[:4] != GIF_MAGIC:
+            raise HTTPException(415, "only PNG, JPEG or GIF evidence is accepted")
         dest = Path(settings.evidence_dir) / dev.workspace_id / dev.id
         dest.mkdir(parents=True, exist_ok=True)
-        ext = ".png" if data[:4] == PNG_MAGIC else ".jpg"
+        ext = ".png" if data[:4] == PNG_MAGIC else (".gif" if data[:4] == GIF_MAGIC else ".jpg")
         path = dest / f"{event_id}{ext}"
         path.write_bytes(data)
         row.evidence_stored_path, row.evidence_sha256, row.evidence_size = str(path), digest, len(data)

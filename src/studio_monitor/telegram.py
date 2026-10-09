@@ -30,6 +30,8 @@ Transport = Callable[[str, Optional[bytes], dict, float], tuple[int, bytes]]
 
 _TOKEN_IN_URL = re.compile(r"/bot\d+:[A-Za-z0-9_-]+")
 _BARE_TOKEN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b")
+_SM_KEY = re.compile(r"\bsm_[A-Za-z0-9_\-]{8,}\b")
+_AGENT_CRED = re.compile(r"Bearer\s+[0-9a-fA-F-]{36}:[A-Za-z0-9_\-]{16,}")
 
 
 def sanitize(text: str, token: str = "") -> str:
@@ -39,6 +41,8 @@ def sanitize(text: str, token: str = "") -> str:
     if token:
         text = text.replace(token, "[REDACTED]")
     text = _TOKEN_IN_URL.sub("/bot[REDACTED]", text)
+    text = _SM_KEY.sub("[REDACTED]", text)
+    text = _AGENT_CRED.sub("Bearer [REDACTED]", text)
     return _BARE_TOKEN.sub("[REDACTED]", text)
 
 
@@ -178,6 +182,14 @@ class TelegramClient:
             fields["reply_markup"] = json.dumps(reply_markup, separators=(",", ":"))
         return self._call("sendPhoto", fields, files={"photo": (path.name, content)})
 
+    def send_animation(self, path: str, caption: str, reply_to: Optional[int] = None) -> dict:
+        p = Path(path)
+        fields = self._dest({"caption": caption[:1024], "parse_mode": "HTML"})
+        if reply_to:
+            fields["reply_to_message_id"] = str(reply_to)
+            fields["allow_sending_without_reply"] = "true"
+        return self._call("sendAnimation", fields, files={"animation": (p.name, p.read_bytes())})
+
     def get_updates(self, offset: int = 0, timeout: int = 20) -> list:
         """Long-poll for messages and button presses (single consumer per bot)."""
         fields = {"offset": str(offset), "timeout": str(timeout),
@@ -219,7 +231,9 @@ def deliver(client: TelegramClient, payload: dict, screenshot_path: str, clock: 
     markup = payload.get("buttons") if isinstance(payload.get("buttons"), dict) else None
     if screenshot_path and Path(screenshot_path).exists():
         try:
-            return client.send_photo(screenshot_path, caption[:1024], reply_to=reply_to, reply_markup=markup)
+            result = client.send_photo(screenshot_path, caption[:1024], reply_to=reply_to, reply_markup=markup)
+            _send_clip(client, payload, result)
+            return result
         except DeliveryError as exc:
             msg = str(exc)
             if exc.permanent or "network" in msg or "rate limited" in msg or "server" in msg or "timeout" in msg:
@@ -228,7 +242,22 @@ def deliver(client: TelegramClient, payload: dict, screenshot_path: str, clock: 
     text = prefix + (payload.get("text") or payload.get("caption") or "") + note
     if screenshot_path and not Path(screenshot_path).exists():
         text += "\n(screenshot no longer available locally)"
-    return client.send_message(text, reply_to=reply_to, reply_markup=markup)
+    result = client.send_message(text, reply_to=reply_to, reply_markup=markup)
+    _send_clip(client, payload, result)
+    return result
+
+
+def _send_clip(client: TelegramClient, payload: dict, result: dict) -> None:
+    """Best effort: an optional incident clip follows the alert as a reply; failures never fail the alert."""
+    clip = payload.get("clip_path")
+    if not clip or not Path(clip).exists():
+        return
+    try:
+        mid = result.get("message_id") if isinstance(result, dict) else None
+        client.send_animation(clip, payload.get("clip_caption") or "Clip: the seconds before this alert (redacted frames).",
+                              reply_to=int(mid) if mid else None)
+    except Exception as exc:
+        log.warning("clip not sent: %s", sanitize(str(exc)))
 
 
 class ClientFactory:

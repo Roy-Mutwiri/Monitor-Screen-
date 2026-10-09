@@ -42,6 +42,8 @@ src/studio_monitor/
                                   Monitor.execute_remote_command runs ONLY predefined ops (screenshot, status)
   memory.py / session_report.py   Supermemory provider (key only from credential store / hub env, scoped retrieval,
                                   retrieved text = labelled reference), broadcast/session reports from DB facts
+  pc_health.py / watchdog.py      psutil sampling -> PC_HEALTH incidents (SustainedCondition); StallDetector + Supervisor
+  clips.py / engagement.py        optional GIF ring buffer (redacted frames only); viewer/like counts = observations only
 src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy), services (framework-free logic),
                                   delivery (Telegram routes by token_env), app (API + Jinja dashboard); deploy/ has compose
   account.py                      @username discovery: Interactor protocol (Win32Interactor real), perform_lookup,
@@ -94,5 +96,7 @@ src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy
   no real getUpdates session, second chat or SMTP server was exercised. Commands are never arbitrary.
 - Supermemory (Milestone 5) is exercised only with a fake client mirroring SDK 5.0.0 shapes; no real key, no real
   documents. Never put an API key in source/tests/logs; `memory.redact_api_key` scrubs sm_… tokens from errors.
+- Milestone 6 (PC health/watchdog/clips/engagement/doctor) is verified with fake psutil/processes; `doctor` ran on this
+  PC. VERIFICATION.md is the single place that lists real-world vs synthetic status; keep it current.
 - Detectors never evaluate when the broadcast is not LIVE; a 'reconnecting' overlay keeps the LIVE episode open (UNKNOWN,
   not NOT_LIVE) so RECONNECTING can be reported.

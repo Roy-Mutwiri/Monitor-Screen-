@@ -257,6 +257,67 @@ def make_memory_provider(cfg: AppConfig, store: Optional[CredentialStore] = None
     return make_provider(True, ns, key, client=client)
 
 
+def make_pc_health(cfg: AppConfig, ps=None):
+    from .pc_health import PcHealthConfig, PcHealthSampler
+    p = cfg.pc_health
+    if not p.enabled:
+        return None
+    pc = PcHealthConfig(p.enabled, p.interval_seconds, p.cpu_percent, p.memory_percent, p.disk_free_percent, p.battery_percent,
+                        p.upload_kbps_min, p.sustain_seconds, p.recover_seconds)
+    return PcHealthSampler(pc, cfg.data_dir, ps=ps)
+
+
+def make_clips(cfg: AppConfig):
+    from .clips import ClipBuffer, ClipsConfig
+    c = cfg.clips
+    if not c.enabled:
+        return None
+    return ClipBuffer(ClipsConfig(c.enabled, c.seconds_before, c.fps, c.max_width, c.send))
+
+
+def doctor(cfg: AppConfig, cfg_path: Path) -> list[tuple[str, str, str]]:
+    """Environment checks: (name, OK|WARN|FAIL, detail). Read-only."""
+    out = []
+    import shutil
+    from .credentials import default_store
+    try:
+        store = default_store()
+        probe = "doctor/probe"
+        store.set(probe, "x"); ok = store.get(probe) == "x"; store.delete(probe)
+        out.append(("credential store", "OK" if ok else "FAIL", "Windows Credential Manager read/write"))
+    except Exception as exc:
+        out.append(("credential store", "FAIL", str(exc)[:120]))
+    try:
+        from .ocr import available_backends
+        b = available_backends()
+        out.append(("OCR backends", "OK" if b else "FAIL", ", ".join(b) or "none available (install winocr)"))
+    except Exception as exc:
+        out.append(("OCR backends", "FAIL", str(exc)[:120]))
+    try:
+        import windows_capture  # noqa: F401
+        out.append(("Windows Graphics Capture", "OK", "windows-capture importable"))
+    except Exception as exc:
+        out.append(("Windows Graphics Capture", "WARN", f"not importable ({str(exc)[:80]}); PrintWindow fallback is blank for Studio"))
+    from .detectors.presenter import YuNetDetector, model_path
+    out.append(("face model", "OK" if YuNetDetector.available() else "WARN", model_path()))
+    usage = shutil.disk_usage(cfg.data_dir if os.path.isdir(cfg.data_dir) else os.path.dirname(cfg_path) or ".")
+    free_pct = usage.free / usage.total * 100
+    out.append(("disk space", "OK" if free_pct > 5 else "WARN", f"{free_pct:.0f}% free on the data drive"))
+    out.append(("target", "OK" if cfg.target.is_set else "WARN", cfg.target.title or "no Studio window selected"))
+    out.append(("bots", "OK" if any(b.enabled for b in cfg.bots) else "WARN", f"{sum(1 for b in cfg.bots if b.enabled)} enabled"))
+    out.append(("live-state rules", "WARN", "seeded, unverified against real Studio screenshots (calibrate-live)"))
+    try:
+        from .startup import is_enabled
+        out.append(("start at sign-in", "OK", "enabled" if is_enabled() else "disabled"))
+    except Exception:
+        pass
+    if cfg.hub.url:
+        out.append(("hub", "OK" if cfg.hub.enrolled else "WARN", f"{cfg.hub.url} enrolled={cfg.hub.enrolled} mode={cfg.device.mode}"))
+    else:
+        out.append(("hub", "OK", "not configured (standalone)"))
+    return out
+
+
 def make_capture_service(cfg: AppConfig, system=None):
     from .win32.capture import CaptureService
     from .win32.windows import Win32WindowSystem
@@ -291,6 +352,8 @@ def build_monitor(cfg: AppConfig, cfg_path: Path, registry: Optional[BotRegistry
         callbacks["hub_sync"] = make_hub_sync(cfg, on_event=callbacks.get("on_event"))
     callbacks.setdefault("email_backup", make_email_backup(cfg))
     callbacks.setdefault("memory", make_memory_provider(cfg))
+    callbacks.setdefault("pc_health", make_pc_health(cfg))
+    callbacks.setdefault("clips", make_clips(cfg))
     monitor = Monitor(cfg, system, capturer, ocr, rules, queue, registry, factory,
                       live_rules=load_live_rules(cfg), **callbacks)
     if monitor.command_poller is None:

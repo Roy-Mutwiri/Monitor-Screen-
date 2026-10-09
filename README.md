@@ -162,6 +162,42 @@ and a mode: `standalone` (local Telegram delivery) or `managed` (a hub owns deli
 recorded locally and delivered by the hub, so there are no duplicate notifications). Local bot
 settings are kept in both modes.
 
+## PC health, watchdog, clips and engagement
+
+- **PC health** (`pc_health.py`, psutil): CPU, memory, free disk on the data drive, battery (only when
+  discharging), the Studio process load, and whole-PC upload throughput (checked only while LIVE and only when a
+  minimum is configured). A threshold must hold for 2 minutes (default) to open one health-category incident per
+  condition; recovery after 1 minute resolves it with a threaded notice. Samples appear in Diagnostics, `/status`
+  and the hub heartbeat. These are measurements of the PC, not of Studio's stream.
+- **Watchdog**: an in-process stall detector flags a monitor loop that has not completed a poll for 2 minutes
+  (logged, shown in the heartbeat as `stalled`); `studio-monitor supervise [--gui]` runs the monitor under a
+  restarting supervisor (exponential backoff, at most 10 restarts per hour, stops on a clean exit). The hub's
+  unreachable detection covers the case where the whole PC is gone.
+- **Clips** (`clips.py`, off by default): a ring buffer of the last 10 s of already-redacted frames (1 fps) is
+  written as a GIF when a popup alert is raised and sent as a reply to the alert (`sendAnimation`); failures never
+  affect the alert. No audio is recorded.
+- **Engagement** (`engagement.py`): viewer and like counts parsed from Studio's own on-screen counters in the
+  live-status OCR text (`1,204 viewers`, `12.5K`), tracked per broadcast episode (latest / peak / average) for
+  `/status` and the broadcast report. Observations only; they never trigger alerts.
+- **Hardening**: `studio-monitor doctor` checks the credential store, OCR backends, Windows Graphics Capture, the
+  face model checksum, disk space, target, bots, rule verification state, sign-in startup and hub enrollment.
+  Log redaction now also covers Supermemory keys and agent credentials; settings are written atomically; evidence
+  uploads are type-checked (PNG/JPEG/GIF) and size-limited.
+
+## Deployment guide
+
+**One PC (standalone)**: unzip `StudioMonitor-<version>-win64.zip`, run `StudioMonitor.exe`, select the Studio
+window, draw regions, add a bot and send the test notification, set *Whose PC?*, enable *Start at sign-in* (or run
+`studio-monitor-cli.exe supervise --gui` from a shortcut for crash restarts). Run `studio-monitor-cli.exe doctor`.
+
+**Several PCs with a hub**: follow `deploy/README.md` (Docker Compose: PostgreSQL + hub behind TLS), create a
+Telegram route and a pairing code per PC, then on each PC `studio-monitor-cli.exe hub enroll --url https://hub…
+--code CODE --mode managed` (hub sends notifications) or `--mode standalone` (PC sends, hub mirrors). Enable
+`commands_enabled` on the route for `/status`, `/screenshot DEVICE`, `/ack`, `/snooze`, `/report` from Telegram.
+Optional: `SUPERMEMORY_API_KEY` on the hub for long-term memory; `smtp` settings per PC for the e-mail backup.
+
+See `VERIFICATION.md` for what has and has not been verified against real services, and the acceptance checklist.
+
 ## Reports and long-term memory (Supermemory)
 
 **Reports** (`session_report.py`): when a broadcast ends (confirmed NOT_LIVE) a *broadcast report* goes to bots
@@ -558,6 +594,7 @@ src/studio_monitor/
   commands.py   Telegram command router, inline keyboards, single getUpdates consumer (agent + hub)
   email_backup.py  SMTP backup route for failed urgent deliveries
   memory.py / session_report.py  Supermemory provider (scoped, key-hygienic) and broadcast/session reports
+  pc_health.py / watchdog.py / clips.py / engagement.py  PC health sampling, stall detector + supervisor, GIF clips, viewer counts
 src/hub/        the central hub: FastAPI app, SQLAlchemy models, services, Telegram routing, dashboard templates
 deploy/         Dockerfile, docker-compose.yml (PostgreSQL + hub), .env.example, deployment README
   reminders.py  offline episodes + not-live reminders

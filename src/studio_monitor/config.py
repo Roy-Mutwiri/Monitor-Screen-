@@ -219,6 +219,31 @@ class SmtpConfig:
 
 
 @dataclass
+class PcHealthSettings:
+    """PC health sampling (psutil): sustained thresholds become PC_HEALTH incidents."""
+    enabled: bool = True
+    interval_seconds: float = 30.0
+    cpu_percent: float = 90.0
+    memory_percent: float = 90.0
+    disk_free_percent: float = 5.0
+    battery_percent: float = 20.0
+    upload_kbps_min: float = 0.0          # 0 = off; evaluated only while LIVE
+    sustain_seconds: float = 120.0
+    recover_seconds: float = 60.0
+    stall_after_seconds: float = 120.0    # monitor loop watchdog
+
+
+@dataclass
+class ClipsSettings:
+    """Optional incident clips (GIF of the last seconds of redacted frames). Off by default."""
+    enabled: bool = False
+    seconds_before: float = 10.0
+    fps: float = 1.0
+    max_width: int = 640
+    send: bool = True
+
+
+@dataclass
 class MemoryConfig:
     """Supermemory long-term memory (standalone PCs; in managed mode the hub syncs with its own key).
     The API key is entered locally (`studio-monitor memory set-key`) and lives only in the credential store."""
@@ -284,6 +309,8 @@ class AppConfig:
     escalation: EscalationConfig = field(default_factory=EscalationConfig)
     smtp: SmtpConfig = field(default_factory=SmtpConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    pc_health: PcHealthSettings = field(default_factory=PcHealthSettings)
+    clips: ClipsSettings = field(default_factory=ClipsSettings)
     config_version: int = CONFIG_VERSION
 
     # -- serialisation ----------------------------------------------------
@@ -320,6 +347,8 @@ class AppConfig:
         cfg.escalation = EscalationConfig(**_known(EscalationConfig, data.get("escalation", {})))
         cfg.smtp = SmtpConfig(**_known(SmtpConfig, data.get("smtp", {})))
         cfg.memory = MemoryConfig(**_known(MemoryConfig, data.get("memory", {})))
+        cfg.pc_health = PcHealthSettings(**_known(PcHealthSettings, data.get("pc_health", {})))
+        cfg.clips = ClipsSettings(**_known(ClipsSettings, data.get("clips", {})))
         if cfg.device.mode not in ("standalone", "managed"):
             cfg.device.mode = "standalone"
         cfg.device = DeviceConfig(**_known(DeviceConfig, data.get("device", {})))

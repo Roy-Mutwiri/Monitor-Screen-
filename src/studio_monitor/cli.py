@@ -656,6 +656,9 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("hub", help="fleet hub: enroll --url URL --code CODE [--mode managed|standalone] | status | unenroll | sync-once")
     p.add_argument("action", choices=["enroll", "status", "unenroll", "sync-once"])
     p.add_argument("--url", default=""); p.add_argument("--code", default=""); p.add_argument("--mode", default="")
+    p = sub.add_parser("supervise", help="run the monitor under a restarting supervisor (watchdog): supervise [--gui]")
+    p.add_argument("--gui", action="store_true", help="supervise the GUI with --autostart instead of the headless runner")
+    sub.add_parser("doctor", help="environment checks (credential store, OCR, capture, model, disk, target, bots, hub)")
     p = sub.add_parser("memory", help="Supermemory: set-key | clear-key | status | search QUERY")
     p.add_argument("action", choices=["set-key", "clear-key", "status", "search"]); p.add_argument("query", nargs="?", default="")
     p = sub.add_parser("smtp", help="e-mail backup route: set-password | status | test")
@@ -716,6 +719,23 @@ def main(argv: list[str] | None = None) -> int:
         return _smtp(cfg, args.action)
     if args.cmd == "memory":
         return _memory(cfg, args.action, args.query)
+    if args.cmd == "doctor":
+        from .app import doctor
+        worst = 0
+        for name, status, detail in doctor(cfg, cfg_path):
+            print(f"[{status:<4}] {name}: {detail}")
+            worst = max(worst, {"OK": 0, "WARN": 1, "FAIL": 2}[status])
+        return worst
+    if args.cmd == "supervise":
+        from .watchdog import Supervisor, default_spawn
+        argv = ["gui", "--autostart"] if args.gui else ["run"]
+        print(f"supervising `studio-monitor {' '.join(argv)}` (restarts on crash, max 10/hour; Ctrl+C to stop)")
+        sup = Supervisor(default_spawn(argv), on_event=print)
+        try:
+            state = sup.run()
+        except KeyboardInterrupt:
+            sup.stop(); state = sup.state
+        return 1 if state.gave_up else 0
     if cmd == "autostart":
         return _autostart(cfg, cfg_path, args.enable, args.disable)
     if cmd == "maintenance":

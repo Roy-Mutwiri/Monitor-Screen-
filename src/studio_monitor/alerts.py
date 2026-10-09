@@ -296,6 +296,23 @@ def format_stream_recovered(condition: str, detail: str, machine_label: str, ts:
     return _finish(lines, ts)
 
 
+def format_pc_health_alert(kind: str, condition: str, text: str, machine_label: str, ts: float, label: str = "",
+                           sample: Optional[dict] = None) -> dict:
+    label = label or f"{machine_label}\u2019s Live"
+    title = condition.replace("_", " ")
+    if kind == "problem":
+        lines = [headline("\U0001F4BB", label, f"PC HEALTH: {title}"), html.escape(text)]
+        if sample:
+            lines.append(f"CPU {sample.get('cpu_percent', 0):.0f}% \u00b7 memory {sample.get('memory_percent', 0):.0f}% \u00b7 "
+                         f"disk free {sample.get('disk_free_percent', 0):.0f}%"
+                         + (f" \u00b7 upload {sample.get('upload_kbps'):.0f} kbps" if sample.get("upload_kbps") is not None else ""))
+        lines.append("Measured on the PC by the monitor; it does not change what Studio is doing.")
+    else:
+        lines = [headline("\u2705", label, f"PC HEALTH OK: {title}"), html.escape(text)]
+    lines += [f"Time: {local_ts(ts)}", f"PC: {html.escape(machine_label)}"]
+    return _finish(lines, ts)
+
+
 def format_status_alert(status: str, reason: str, machine_label: str, ts: float, label: str = "") -> str:
     label = label or f"{machine_label}’s Live"
     return "\n".join([

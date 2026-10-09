@@ -823,6 +823,19 @@ class App:
                  lambda v: setattr(c.smtp, "to_addrs", [a.strip() for a in v.split(",") if a.strip()]), ""),
                 ("smtp_tls", "Use STARTTLS", "bool", lambda: c.smtp.starttls, lambda v: setattr(c.smtp, "starttls", v), "Off = implicit TLS (SMTPS)."),
             ]),
+            ("PC health & clips", [
+                ("pch_enabled", "PC health monitoring (CPU, memory, disk, battery, upload)", "bool", lambda: c.pc_health.enabled,
+                 lambda v: setattr(c.pc_health, "enabled", v), "Sustained thresholds raise health-category incidents."),
+                ("pch_cpu", "CPU alert above (%)", "float", lambda: c.pc_health.cpu_percent, lambda v: setattr(c.pc_health, "cpu_percent", max(50.0, v)), ""),
+                ("pch_mem", "Memory alert above (%)", "float", lambda: c.pc_health.memory_percent, lambda v: setattr(c.pc_health, "memory_percent", max(50.0, v)), ""),
+                ("pch_disk", "Disk free alert below (%)", "float", lambda: c.pc_health.disk_free_percent, lambda v: setattr(c.pc_health, "disk_free_percent", max(1.0, v)), ""),
+                ("pch_upload", "Upload alert below (kbps, while LIVE; 0 = off)", "float", lambda: c.pc_health.upload_kbps_min,
+                 lambda v: setattr(c.pc_health, "upload_kbps_min", max(0.0, v)), "Whole-PC network throughput, not Studio's stream bitrate."),
+                ("pch_sustain", "Sustain before alert (s)", "float", lambda: c.pc_health.sustain_seconds, lambda v: setattr(c.pc_health, "sustain_seconds", max(30.0, v)), ""),
+                ("clips_enabled", "Attach a short clip (GIF) of the seconds before a popup alert", "bool", lambda: c.clips.enabled,
+                 lambda v: setattr(c.clips, "enabled", v), "Redacted frames only; off by default."),
+                ("clips_seconds", "Clip length (s)", "float", lambda: c.clips.seconds_before, lambda v: setattr(c.clips, "seconds_before", max(3.0, min(60.0, v))), ""),
+            ]),
             ("Memory (Supermemory)", [
                 ("mem_enabled", "Store incident and session summaries in Supermemory", "bool", lambda: c.memory.enabled,
                  lambda v: setattr(c.memory, "enabled", v), "Standalone mode only. Key: `studio-monitor memory set-key` (Credential Manager). Retrieved text is reference only."),
@@ -1374,6 +1387,11 @@ class App:
                       "", "[reminder]",
                       f"episode={a.episode_id or '-'} offline={a.offline_seconds:.0f}s accumulating={a.accumulating} "
                       f"remaining={a.remaining_seconds} sent={a.reminders_sent}"]
+        if self.monitor is not None and getattr(self.monitor, "pc_health", None) is not None and self.monitor.pc_health.last is not None:
+            sm = self.monitor.pc_health.last
+            lines += ["", "[pc health]", f"cpu={sm.cpu_percent:.0f}% memory={sm.memory_percent:.0f}% disk_free={sm.disk_free_percent:.0f}% "
+                      f"battery={sm.battery_percent} on_battery={sm.on_battery} studio_cpu={sm.studio_cpu_percent} "
+                      f"upload_kbps={sm.upload_kbps} problems={self.monitor.pc_health.snapshot()['problems']}"]
         if a is not None and a.hub:
             hb = a.hub
             lines += ["", "[hub]", f"url={self.cfg.hub.url} connected={hb.get('connected')} pending={hb.get('pending')} "

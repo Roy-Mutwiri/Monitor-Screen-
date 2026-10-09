@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tiktok-live-studio-monitor"
-version = "1.0.0"
+version = "1.1.0"
 description = "Monitors the TikTok LIVE Studio desktop app for restriction/warning/suspension/interruption/verification popups and alerts via Telegram."
 requires-python = ">=3.10"
 dependencies = [

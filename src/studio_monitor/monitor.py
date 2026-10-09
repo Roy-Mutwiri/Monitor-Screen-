@@ -42,6 +42,11 @@ from .hub_sync import HubSync
 from .commands import CommandRouter, UpdatePoller, incident_keyboard
 from .email_backup import EmailBackup
 from .memory import MemoryProvider, format_hits, incident_doc, session_doc
+from .pc_health import PcHealthSampler
+from .clips import ClipBuffer
+from .engagement import EngagementStats, parse_engagement
+from .watchdog import StallDetector
+from .alerts import format_pc_health_alert
 from .session_report import build_report
 from .ocr.base import OcrBackend, OcrError
 from .privacy import purge_old_screenshots, redact
@@ -135,7 +140,9 @@ class Monitor:
                  hub_sync: Optional[HubSync] = None,
                  command_poller: Optional[UpdatePoller] = None,
                  email_backup: Optional[EmailBackup] = None,
-                 memory: Optional[MemoryProvider] = None) -> None:
+                 memory: Optional[MemoryProvider] = None,
+                 pc_health: Optional[PcHealthSampler] = None,
+                 clips: Optional[ClipBuffer] = None) -> None:
         self.cfg = cfg
         self.system = system
         self.capturer = capturer                 # dialogs only (PrintWindow, no desktop fallback)
@@ -217,6 +224,14 @@ class Monitor:
         self.command_poller: Optional[UpdatePoller] = command_poller
         self.email_backup: Optional[EmailBackup] = email_backup
         self.memory: Optional[MemoryProvider] = memory
+        self.pc_health: Optional[PcHealthSampler] = pc_health
+        self._pc_incidents: dict[str, dict] = {}
+        self.clips: Optional[ClipBuffer] = clips
+        self.engagement = EngagementStats()
+        self._last_live_text = ""
+        self.stall = StallDetector(cfg.pc_health.stall_after_seconds, mono)
+        self._stalled = False
+        self._watchdog_thread: Optional[threading.Thread] = None
         self._stream_episode_counts: dict[str, int] = {}
         self._session_started_utc = ""
         self.last_report: Optional[dict] = None
@@ -347,7 +362,8 @@ class Monitor:
                 "mode": self.cfg.device.mode, "owner_label": self.cfg.notification_label, "session_id": self.sessions.session_id,
                 "episode_id": self.episodes.state.episode_id, "pending": (a.delivery or {}).get("pending", 0),
                 "stream_problems": problems, "version": __import__("studio_monitor").__version__,
-                "target_title": a.target_title}
+                "target_title": a.target_title, "pc_health": self.pc_health.snapshot() if self.pc_health else {},
+                "engagement": self.engagement.to_dict(), "stalled": self._stalled}
 
     def _emit_status(self, status: Status, reason: str) -> None:
         title = self.tracker.state.window.title if self.tracker.state.window else ""
@@ -441,6 +457,8 @@ class Monitor:
         screenshot_ok = main_cap is not None
         if screenshot_ok and fresh_frame:
             self.frame_cache.update(main_cap.image)
+            if self.clips is not None:
+                self.clips.add(main_cap.image)
         self._update_sessions(window_present, screenshot_ok)
         popup_on_main = any(not d.is_dialog for d in detections)
         classification: Optional[Classification] = None
@@ -458,6 +476,9 @@ class Monitor:
         if self.command_poller is not None and self.command_poller._thread is None:
             self.command_poller.poll_once(timeout=0)
         self._check_email_backup()
+        self._observe_engagement(fresh_frame and screenshot_ok)
+        self._run_pc_health()
+        self.stall.beat()
         self._maybe_purge()
         return detections
 
@@ -557,6 +578,9 @@ class Monitor:
             log.error("could not save screenshot: %s", exc)
             inc.screenshot_path = ""
         attach = self.cfg.privacy.send_screenshots and bool(inc.screenshot_path)
+        clip_path = ""
+        if self.clips is not None and attach:
+            clip_path = self.clips.write(shots / f"{inc.incident_id}.gif") or ""
         payload = format_alert(
             inc, self.cfg.machine_label, self.cfg.privacy.max_text_in_alert,
             screenshot_attached=attach, reason=reason if reason != "new incident" else "",
@@ -566,6 +590,9 @@ class Monitor:
         payload["created_at"] = self.clock()
         if self.cfg.commands.enabled and self.cfg.commands.buttons:
             payload["buttons"] = incident_keyboard(inc.incident_id)
+        if clip_path and self.cfg.clips.send:
+            payload["clip_path"] = clip_path
+            payload["clip_caption"] = f"Clip: the {self.cfg.clips.seconds_before:.0f} s before this alert (redacted frames)."
         stored_text = inc.text if self.cfg.privacy.store_detected_text else ""
         self.queue.record_incident(inc.incident_id, inc.category, inc.label, stored_text,
                                    inc.window_title, inc.is_dialog, inc.screenshot_path)
@@ -678,7 +705,9 @@ class Monitor:
                               started_utc=started or "", ended_at=ended_at, summary=summary, reminders_sent=rs.reminders_sent,
                               offline_seconds=rs.accumulated_seconds, stream_problems=dict(self._stream_episode_counts),
                               account=a.handle if a.status == SUCCEEDED else "", account_status=a.status,
-                              live_rules_verified=self.live_rules.verified)
+                              live_rules_verified=self.live_rules.verified,
+                              note=("Engagement (Studio counters): " + self.engagement.summary()) if self.engagement.summary() else "")
+        report["engagement"] = self.engagement.to_dict()
         self.last_report = report
         eid = _event_id("RPT", ended_at)
         payload = {"text": report["text_html"], "caption": report["text_html"], "created_at": ended_at}
@@ -723,6 +752,65 @@ class Monitor:
             return ""
         hits = self.memory.search(query, {"device_id": self.device_id}, self.cfg.memory.retrieval_limit)
         return format_hits(hits, "Similar past incidents / sessions")
+
+    # ---- engagement / PC health / watchdog --------------------------------
+    def _observe_engagement(self, fresh: bool) -> None:
+        ep = self.episodes.state.episode_id
+        if self.engagement.episode_id != ep:
+            self.engagement = EngagementStats(episode_id=ep)
+        if not fresh or not ep or self.broadcast.state.state != LiveState.LIVE or not self._last_live_text:
+            return
+        reading = parse_engagement(self._last_live_text)
+        if reading:
+            self.engagement.observe(self.clock(), reading)
+
+    def _run_pc_health(self) -> None:
+        ph = self.pc_health
+        if ph is None or not ph.due():
+            return
+        sample = ph.sample(self.tracker.identity.pid if self.sessions.running else 0)
+        live = self.broadcast.state.state == LiveState.LIVE
+        confirmed, recovered = ph.evaluate(sample, live)
+        now = self.clock()
+        for name, text in confirmed:
+            eid = _event_id("PCH", now)
+            payload = format_pc_health_alert("problem", name, text, self.cfg.machine_label, now, label=self.cfg.notification_label,
+                                             sample=sample.to_dict())
+            change = self.incident_engine.open_or_update(self.device_id, CAT_HEALTH, f"PC_{name}", Severity.WARNING, text,
+                                                         session_id=self.sessions.session_id, owner_label=self.cfg.notification_label,
+                                                         incident_id=eid)
+            self._pc_incidents[name] = {"incident_id": change.incident.incident_id, "event_id": eid}
+            if not self.registry.targets(CAT_HEALTH) and self.cfg.device.mode != "managed":
+                self.on_event(f"PC health: {name} ({text}) recorded; no bot subscribed to health alerts")
+            self.dispatch(eid, KIND_INCIDENT, CAT_HEALTH, payload, "", label=f"PC health {name}", incident_id=change.incident.incident_id,
+                          event_type="PC_HEALTH", extra_detail={"condition": name, "sample": sample.to_dict()})
+            self.on_event(f"PC health: {name} confirmed -> {eid}")
+        for name, text in recovered:
+            info = self._pc_incidents.pop(name, None)
+            if info is None:
+                continue
+            self.incident_engine.resolve(info["incident_id"], text, observed_utc=_utc(now))
+            payload = format_pc_health_alert("recovered", name, text, self.cfg.machine_label, now, label=self.cfg.notification_label)
+            payload["thread_of"] = info["incident_id"]
+            self.dispatch(f"{info['event_id']}-RES", KIND_INCIDENT, CAT_HEALTH, payload, "", label=f"PC health {name} ok",
+                          incident_id=info["incident_id"], event_type="INCIDENT_RESOLVED")
+            self.on_event(f"PC health: {name} recovered")
+
+    def _watchdog_loop(self) -> None:
+        while not self._stop.is_set():
+            gap = self.stall.check()
+            if gap is not None:
+                self._stalled = True
+                log.error("monitor loop stalled for %.0f s", gap)
+                try:
+                    self.on_event(f"WATCHDOG: monitor loop has not completed a poll for {gap:.0f} s (capture/OCR may be blocked); "
+                                  "heartbeats keep reporting 'stalled'")
+                except Exception:  # pragma: no cover
+                    pass
+            elif self._stalled and self.stall.check() is None and self.mono() - self.stall._last < self.stall.stall_after:
+                self._stalled = False
+                self.on_event("WATCHDOG: monitor loop is polling again")
+            self._stop.wait(10.0)
 
     # ---- predefined remote operations ---------------------------------
     REMOTE_OPS = ("screenshot", "status")
@@ -777,6 +865,12 @@ class Monitor:
         for inc in open_incs[:5]:
             lines.append(f"  \u2013 [{inc.severity}] <code>{_html.escape(inc.incident_id)}</code> {_html.escape(inc.summary[:70])}"
                          + (" (acked)" if inc.acknowledged else ""))
+        if self.engagement.summary():
+            lines.append("Engagement (Studio counters): " + _html.escape(self.engagement.summary()))
+        if self.pc_health is not None and self.pc_health.last is not None:
+            sm = self.pc_health.last
+            lines.append(f"PC: CPU {sm.cpu_percent:.0f}% \u00b7 memory {sm.memory_percent:.0f}% \u00b7 disk free {sm.disk_free_percent:.0f}%"
+                         + (f" \u00b7 problems: {', '.join(self.pc_health.snapshot()['problems'])}" if self.pc_health.snapshot()["problems"] else ""))
         if self.hub_sync is not None:
             hs = self.hub_sync.status
             lines.append(f"Hub: {'connected' if hs.connected else 'disconnected'} \u00b7 pending {hs.pending}")
@@ -947,6 +1041,7 @@ class Monitor:
             text = full_text
         else:
             text = self.detector.ocr_text(cap.image)
+        self._last_live_text = text
         return self.live_rules.classify(text)
 
     def _update_broadcast_and_reminders(self, classification: Optional[Classification],
@@ -1241,6 +1336,9 @@ class Monitor:
             self.hub_sync.start()
         if self.command_poller is not None:
             self.command_poller.start()
+        if self._watchdog_thread is None:
+            self._watchdog_thread = threading.Thread(target=self._watchdog_loop, name="studio-monitor-watchdog", daemon=True)
+            self._watchdog_thread.start()
         try:
             while not self._stop.is_set():
                 started = self.clock()
