@@ -14,6 +14,7 @@ Nothing in the synthetic column is production verification.
 | Broadcast-start alert, not-live reminders, schedules | yes | **unverified** with a real broadcast | run one real broadcast and check the alert, timing and reminder |
 | Account (@username) discovery | yes | menu text **unverified** (no live interaction performed) | header *Detect now* / `account test` during a session |
 | Stream-health detectors (reconnecting, missing source, black/frozen preview, presenter, audio meter) | yes | **unverified**; `rules/connection_rules.json` seeded; YuNet smoke-tested only | `detectors text/face/audio IMAGE` on real screenshots; draw Presenter and Audio-meter regions |
+| End-LIVE confirmation dialog alert (`End streaming?`) | yes | phrases verified with Windows OCR on the operator's real dialog crop (local fixture); full Studio-window capture **unverified** | end a real broadcast via the dialog once: expect LIVE IS BEING ENDED, then LIVE HAS ENDED and one report |
 | Durable incidents, ack / snooze / maintenance / escalation | yes | — | — |
 | Fleet hub (enrollment, ingestion, heartbeats, unreachable, routing, dashboard) | yes (FastAPI TestClient, SQLite, fake Telegram) | **not deployed**; PostgreSQL untested; no real network sync | deploy with `deploy/docker-compose.yml`, enroll one PC, confirm a heartbeat and one routed alert |
 | Telegram commands / buttons / single consumer | yes (scripted transport) | **unverified** against the Telegram API | send `/status` from the bot's chat; press a button on a real alert |

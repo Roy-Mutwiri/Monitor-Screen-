@@ -1,0 +1,22 @@
+{
+  "_comment": [
+    "Studio's end-stream confirmation dialog. All parts must be spatially related: the heading line, the body or",
+    "Cancel line, and the 'End now' button must appear within `max_line_span` consecutive OCR lines (or, when the",
+    "OCR backend yields no lines, within `max_char_span` characters). 'End LIVE' or 'End' alone never matches:",
+    "the heading AND the confirm button are both required.",
+    "Phrases verified 2026-10-09 with Windows OCR on a real dialog crop supplied by the operator (not committed).",
+    "Full-window capture of the dialog inside Studio has not been exercised yet."
+  ],
+  "verified": true,
+  "verified_scope": "dialog crop (Windows OCR); not yet a full Studio window capture",
+  "heading": ["end streaming"],
+  "body": ["end live", "share your live for more viewers", "share your live"],
+  "confirm_button": ["end now"],
+  "cancel_button": ["cancel"],
+  "max_line_span": 6,
+  "max_char_span": 220,
+  "confirm_frames": 2,
+  "confirm_window_seconds": 12,
+  "closed_after_frames": 2,
+  "resolve_timeout_seconds": 180
+}

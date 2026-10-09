@@ -9,3 +9,4 @@ data/
 *.sqlite3
 *.log
 config.json
+tests/fixtures/private/

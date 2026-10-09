@@ -482,6 +482,10 @@ def bundled_rules_path(name: str = "studio_rules.json") -> Path:
     return Path(__file__).resolve().parents[2] / "rules" / name
 
 
+def end_dialog_rules_path(cfg: Optional[AppConfig] = None) -> Path:
+    return bundled_rules_path("end_dialog_rules.json")
+
+
 def connection_rules_path(cfg: Optional[AppConfig] = None) -> Path:
     if cfg and cfg.detectors.rules_file:
         return Path(cfg.detectors.rules_file)

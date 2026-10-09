@@ -46,7 +46,8 @@ from .pc_health import PcHealthSampler
 from .clips import ClipBuffer
 from .engagement import EngagementStats, parse_engagement
 from .watchdog import StallDetector
-from .alerts import format_pc_health_alert
+from .alerts import format_pc_health_alert, format_end_requested, format_end_outcome
+from .end_request import EndDialogRules, EndRequestEvent, EndRequestTracker
 from .session_report import build_report
 from .ocr.base import OcrBackend, OcrError
 from .privacy import purge_old_screenshots, redact
@@ -101,6 +102,7 @@ class ActivitySnapshot:
     stream: dict = field(default_factory=dict)      # condition -> {"state", "detail", "since"}
     stream_end_hint: str = ""
     hub: dict = field(default_factory=dict)         # HubStatus.to_dict() when a hub is configured
+    end_request: dict = field(default_factory=dict) # end-LIVE confirmation dialog episode
 
 
 def _event_id(prefix: str, ts: float) -> str:
@@ -142,7 +144,8 @@ class Monitor:
                  email_backup: Optional[EmailBackup] = None,
                  memory: Optional[MemoryProvider] = None,
                  pc_health: Optional[PcHealthSampler] = None,
-                 clips: Optional[ClipBuffer] = None) -> None:
+                 clips: Optional[ClipBuffer] = None,
+                 end_rules: Optional[EndDialogRules] = None) -> None:
         self.cfg = cfg
         self.system = system
         self.capturer = capturer                 # dialogs only (PrintWindow, no desktop fallback)
@@ -230,6 +233,17 @@ class Monitor:
         self.engagement = EngagementStats()
         self._last_live_text = ""
         self.stall = StallDetector(cfg.pc_health.stall_after_seconds, mono)
+        # end-LIVE confirmation dialog ("End streaming?") episodes, persisted in kv_state
+        if end_rules is None:
+            from .config import end_dialog_rules_path
+            try:
+                end_rules = EndDialogRules.load(end_dialog_rules_path(cfg))
+            except Exception as exc:  # pragma: no cover
+                log.warning("end dialog rules unavailable: %s", exc)
+                end_rules = EndDialogRules({})
+        self.end_rules = end_rules
+        self.end_requests = EndRequestTracker(end_rules, queue.get_state, queue.set_state, clock)
+        self._ocr_views: list = []
         self._stalled = False
         self._watchdog_thread: Optional[threading.Thread] = None
         self._stream_episode_counts: dict[str, int] = {}
@@ -389,6 +403,7 @@ class Monitor:
         detections: list[Detection] = []
         main_cap: Optional[Capture] = None
         main_full_text: Optional[str] = None
+        ocr_views: list = []
         fresh_frame = False
         if state.status in (Status.RUNNING, Status.DEGRADED) and state.window is not None:
             main = state.window
@@ -429,6 +444,14 @@ class Monitor:
                         det = None
                     if c is main_cap:
                         main_full_text = self.detector.last_full_text
+                    view_text, view_lines = self.detector.last_full_text, self.detector.last_full_lines
+                    if view_text is None and self.broadcast.state.state == LiveState.LIVE:
+                        # detect regions configured: one extra whole-frame pass, only while LIVE, for end-dialog evidence
+                        res = self.detector.ocr_result(c.image)
+                        view_text, view_lines = (res.text, list(res.lines)) if res is not None else ("", [])
+                        if c is main_cap:
+                            main_full_text = view_text or None
+                    ocr_views.append((c, view_text or "", view_lines))
                     if det is not None:
                         detections.append(det)
             elif main_cap is not None:
@@ -449,7 +472,7 @@ class Monitor:
             self._resolve_popup_incident(gone)
         self._escalate_due()
         self.last_detections = detections
-        self._blocking_detection = bool(detections)
+        self._blocking_detection = bool(detections) or self.end_requests.dialog_open
         if self._ocr_failures == 0:
             self.health.ocr, self.health.ocr_reason = "OK", ""
 
@@ -465,6 +488,7 @@ class Monitor:
         if screenshot_ok and fresh_frame and not popup_on_main and self.sessions.running:
             classification = self._classify_live(main_cap, main_full_text)
         self._update_broadcast_and_reminders(classification, main_cap if fresh_frame else None)
+        self._observe_end_dialog(ocr_views, fresh_frame and screenshot_ok)
         self._poll_lookup()
         self._run_detectors(main_cap, fresh_frame and screenshot_ok, main_full_text)
 
@@ -706,8 +730,11 @@ class Monitor:
                               offline_seconds=rs.accumulated_seconds, stream_problems=dict(self._stream_episode_counts),
                               account=a.handle if a.status == SUCCEEDED else "", account_status=a.status,
                               live_rules_verified=self.live_rules.verified,
-                              note=("Engagement (Studio counters): " + self.engagement.summary()) if self.engagement.summary() else "")
+                              note="\n".join(n for n in (
+                                  ("Engagement (Studio counters): " + self.engagement.summary()) if self.engagement.summary() else "",
+                                  self.end_requests.report_line(episode_id, session_id)) if n))
         report["engagement"] = self.engagement.to_dict()
+        report["end_request"] = self.end_requests.report_line(episode_id, session_id)
         self.last_report = report
         eid = _event_id("RPT", ended_at)
         payload = {"text": report["text_html"], "caption": report["text_html"], "created_at": ended_at}
@@ -752,6 +779,78 @@ class Monitor:
             return ""
         hits = self.memory.search(query, {"device_id": self.device_id}, self.cfg.memory.retrieval_limit)
         return format_hits(hits, "Similar past incidents / sessions")
+
+    # ---- end-LIVE confirmation dialog ---------------------------------------
+    def _observe_end_dialog(self, ocr_views: list, fresh: bool) -> None:
+        bs = self.broadcast.state
+        views = [(text, lines) for _c, text, lines in ocr_views]
+        events = self.end_requests.observe(views, fresh, bs.state.value, bool(bs.fresh), self.sessions.running,
+                                           self.episodes.state.episode_id, self.sessions.session_id)
+        for ev in events:
+            if ev.kind == "opened":
+                cap = ocr_views[ev.view_index][0] if 0 <= ev.view_index < len(ocr_views) else None
+                self._alert_end_requested(ev, cap)
+            else:
+                self._end_request_outcome(ev)
+        self.activity.end_request = self.end_request_snapshot()
+
+    def end_request_snapshot(self) -> dict:
+        ep = self.end_requests.current or self.end_requests.last
+        if ep is None:
+            return {}
+        return {"episode_id": ep.episode_id, "open": ep.open, "dialog_visible": self.end_requests.dialog_open,
+                "opened_utc": ep.opened_utc, "outcome": ep.outcome, "outcome_reason": ep.outcome_reason, "alerted": ep.alerted}
+
+    def _alert_end_requested(self, ev: EndRequestEvent, cap: Optional[Capture]) -> None:
+        ep = ev.episode
+        if ep.alerted:                      # restart reconciliation: the dialog is still open, already announced
+            return
+        ts = ep.opened_at
+        eid = _event_id("END", ts)
+        shot = self._save_evidence(eid, cap.image if cap is not None else None)   # already-redacted frame
+        account_line = self.current_account_handle() or ("unavailable" if self.account.status != DISABLED_STATUS else
+                                                         "not detected (automatic detection disabled)")
+        payload = format_end_requested(self.cfg.machine_label, ts, account_line, label=self.cfg.notification_label,
+                                       screenshot_attached=bool(shot))
+        change = self.incident_engine.open_or_update(
+            self.device_id, CAT_BROADCAST, "end_requested", Severity.INFO,
+            "End streaming? dialog open (LIVE is being ended; not yet confirmed)", session_id=self.sessions.session_id,
+            evidence_path=shot, account=self.current_account_handle(), owner_label=self.cfg.notification_label,
+            observed_utc=_utc(ts), incident_id=eid)
+        self.end_requests.mark_alerted(eid, change.incident.incident_id, shot)
+        self.queue.record_event(eid, "BROADCAST_END_REQUESTED", _utc(ts),
+                                {"summary": "End streaming? dialog open", "evidence": ev.detail[:300], "screenshot": bool(shot),
+                                 "end_request_episode": ep.episode_id, "broadcast_episode": ep.broadcast_episode},
+                                ep.session_id, ep.broadcast_episode, shot)
+        n = self.dispatch(eid, KIND_ACTIVITY, CAT_BROADCAST, payload, shot, label="LIVE is being ended",
+                          incident_id=change.incident.incident_id, event_type="BROADCAST_END_REQUESTED",
+                          extra_detail={"end_request_episode": ep.episode_id, "evidence": ev.detail[:300]})
+        self.on_event(f"end-LIVE confirmation dialog detected -> {eid} queued for {n} bot(s) (broadcast state unchanged)")
+
+    def _end_request_outcome(self, ev: EndRequestEvent) -> None:
+        ep = ev.episode
+        now = ep.outcome_at or self.clock()
+        if not ep.alerted or not ep.incident_id:
+            self.on_event(f"end dialog episode {ep.episode_id} finished without an alert: {ev.kind} ({ev.detail})")
+            return
+        resolution = {"ended": "broadcast confirmed NOT_LIVE after the end dialog",
+                      "continued": "dialog closed; fresh evidence confirms LIVE continues",
+                      "unknown": f"outcome unknown: {ep.outcome_reason}"}[ev.kind]
+        self.incident_engine.resolve(ep.incident_id, resolution, observed_utc=_utc(now))
+        self.queue.record_event(f"{ep.event_id}-{ev.kind.upper()}", "BROADCAST_END_REQUESTED", _utc(now),
+                                {"summary": f"end dialog outcome: {ev.kind}", "reason": ep.outcome_reason, "outcome": ev.kind,
+                                 "end_request_episode": ep.episode_id, "confirmed_end_utc": ep.confirmed_end_utc},
+                                ep.session_id, ep.broadcast_episode)
+        if ev.kind in ("ended", "continued"):
+            payload = format_end_outcome(ev.kind, self.cfg.machine_label, now, ep.incident_id, label=self.cfg.notification_label,
+                                         account_line=self.current_account_handle())
+            payload["thread_of"] = ep.incident_id
+            self.dispatch(f"{ep.event_id}-{'END' if ev.kind == 'ended' else 'CONT'}", KIND_ACTIVITY, CAT_BROADCAST, payload, "",
+                          label="LIVE has ended" if ev.kind == "ended" else "End confirmation closed",
+                          incident_id=ep.incident_id, event_type="INCIDENT_RESOLVED",
+                          extra_detail={"end_request_episode": ep.episode_id, "outcome": ev.kind})
+        self.remember_incident(ep.incident_id)
+        self.on_event(f"end dialog episode {ep.episode_id}: {ev.kind} ({ep.outcome_reason})")
 
     # ---- engagement / PC health / watchdog --------------------------------
     def _observe_engagement(self, fresh: bool) -> None:
@@ -1093,6 +1192,9 @@ class Monitor:
             self.queue.record_event(eid, EVT_BROADCAST_ENDED, _utc(now),
                                     {"summary": "broadcast ended (confirmed NOT_LIVE)"}, episode_id=bev.episode_id)
             self.on_event(f"broadcast episode {bev.episode_id} ended (confirmed NOT_LIVE)")
+            end_ev = self.end_requests.note_broadcast_ended(now)
+            if end_ev is not None:
+                self._end_request_outcome(end_ev)
             self._emit_report("broadcast_report", bev.episode_id, now)
             return
         eid = _event_id("BCS", now)
@@ -1306,6 +1408,7 @@ class Monitor:
             capture=self.frames.status(), target_title=self.tracker.identity.title, target_hwnd=self.tracker.identity.hwnd,
             stream=dict(self.activity.stream), stream_end_hint=self._stream_end_hint,
             hub=self.hub_sync.status.to_dict() if self.hub_sync is not None else {},
+            end_request=self.end_request_snapshot(),
         )
         self.on_activity(self.activity)
 

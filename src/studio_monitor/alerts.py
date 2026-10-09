@@ -313,6 +313,37 @@ def format_pc_health_alert(kind: str, condition: str, text: str, machine_label: 
     return _finish(lines, ts)
 
 
+# ---------------------------------------------------------------- end-LIVE confirmation dialog
+
+def format_end_requested(machine_label: str, ts: float, account_line: str, label: str = "", screenshot_attached: bool = True) -> dict:
+    label = label or f"{machine_label}\u2019s Live"
+    lines = [headline("\U0001F7E0", label, "LIVE IS BEING ENDED"),
+             f"TikTok account: {html.escape(account_line or 'unavailable')}",
+             "The \u201cEnd streaming?\u201d confirmation dialog is open.",
+             "Ending has not yet been confirmed.",
+             f"Detected at: {local_ts(ts)}",
+             f"PC: {html.escape(machine_label)}",
+             "Screenshot attached." if screenshot_attached else "No screenshot attached."]
+    return _finish(lines, ts)
+
+
+def format_end_outcome(kind: str, machine_label: str, ts: float, incident_id: str, label: str = "", account_line: str = "",
+                       reason: str = "") -> dict:
+    label = label or f"{machine_label}\u2019s Live"
+    if kind == "ended":
+        lines = [headline("\u26AB", label, "LIVE HAS ENDED"),
+                 "Studio is confirmed NOT LIVE after the end confirmation dialog."]
+    elif kind == "continued":
+        lines = [headline("\U0001F7E2", label, "END CONFIRMATION CLOSED \u2014 LIVE CONTINUES"),
+                 "The \u201cEnd streaming?\u201d dialog is no longer visible and fresh evidence confirms the broadcast is still LIVE."]
+    else:
+        lines = [headline("\u2754", label, "END CONFIRMATION OUTCOME UNKNOWN"), html.escape(reason or "no further evidence")]
+    if account_line:
+        lines.append(f"TikTok account: {html.escape(account_line)}")
+    lines += [f"Time: {local_ts(ts)}", f"PC: {html.escape(machine_label)}", f"Incident <code>{html.escape(incident_id)}</code>"]
+    return _finish(lines, ts)
+
+
 def format_status_alert(status: str, reason: str, machine_label: str, ts: float, label: str = "") -> str:
     label = label or f"{machine_label}’s Live"
     return "\n".join([

@@ -44,6 +44,9 @@ src/studio_monitor/
                                   retrieved text = labelled reference), broadcast/session reports from DB facts
   pc_health.py / watchdog.py      psutil sampling -> PC_HEALTH incidents (SustainedCondition); StallDetector + Supervisor
   clips.py / engagement.py        optional GIF ring buffer (redacted frames only); viewer/like counts = observations only
+  end_request.py                  End-LIVE confirmation dialog: spatial OCR match (heading + End now + body/Cancel within
+                                  6 lines), 2-frame confirm, episodes persisted in kv_state; outcomes only from trusted evidence
+                                  (engine NOT_LIVE -> ended; fresh LIVE after close -> continued; exit/no capture -> unknown)
 src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy), services (framework-free logic),
                                   delivery (Telegram routes by token_env), app (API + Jinja dashboard); deploy/ has compose
   account.py                      @username discovery: Interactor protocol (Win32Interactor real), perform_lookup,
@@ -98,5 +101,7 @@ src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy
   documents. Never put an API key in source/tests/logs; `memory.redact_api_key` scrubs sm_… tokens from errors.
 - Milestone 6 (PC health/watchdog/clips/engagement/doctor) is verified with fake psutil/processes; `doctor` ran on this
   PC. VERIFICATION.md is the single place that lists real-world vs synthetic status; keep it current.
+- End-dialog phrases verified with Windows OCR on the operator's real dialog crop (tests/fixtures/private/, git-ignored);
+  the committed fixture is synthetic. Never commit private screenshots. Full-window capture with the dialog: unverified.
 - Detectors never evaluate when the broadcast is not LIVE; a 'reconnecting' overlay keeps the LIVE episode open (UNKNOWN,
   not NOT_LIVE) so RECONNECTING can be reported.

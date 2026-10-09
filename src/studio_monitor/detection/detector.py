@@ -37,6 +37,7 @@ class Detector:
         self.rules = rules
         self.log_text = log_text
         self.last_full_text: Optional[str] = None  # whole-image OCR text of the last scan, if one was done
+        self.last_full_lines: list[str] = []
 
     def ocr_text(self, image: Image.Image) -> str:
         try:
@@ -45,16 +46,26 @@ class Detector:
             log.warning("OCR failed: %s", exc)
             return ""
 
+    def ocr_result(self, image: Image.Image):
+        """Whole-image OCR result (text + lines) or None when OCR fails."""
+        try:
+            return self.ocr.recognize(image)
+        except OcrError as exc:
+            log.warning("OCR failed: %s", exc)
+            return None
+
     def scan_image(self, image: Image.Image, regions: list[Region]) -> list[tuple[Region, str, Optional[Match]]]:
         """OCR each region (or the whole image) and return (region, text, match)."""
         results = []
         self.last_full_text = None
+        self.last_full_lines = []
         for region in regions or [FULL_WINDOW]:
             if region.kind != "detect":
                 continue
             crop = region.crop(image) if region is not FULL_WINDOW else image
             try:
-                text = self.ocr.recognize(crop).text
+                res = self.ocr.recognize(crop)
+                text = res.text
             except OcrError as exc:
                 log.warning("OCR failed for region %s: %s", region.name, exc)
                 continue
@@ -62,6 +73,7 @@ class Detector:
                 log.debug("OCR[%s]: %r", region.name, text[:300])
             if region is FULL_WINDOW:
                 self.last_full_text = text
+                self.last_full_lines = list(getattr(res, "lines", []) or [])
             results.append((region, text, self.rules.match(text)))
         return results
 

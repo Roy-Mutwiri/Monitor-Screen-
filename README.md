@@ -162,6 +162,38 @@ and a mode: `standalone` (local Telegram delivery) or `managed` (a hub owns deli
 recorded locally and delivered by the hub, so there are no duplicate notifications). Local bot
 settings are kept in both modes.
 
+## End-LIVE confirmation alert ("End streaming?")
+
+When the operator clicks *End LIVE*, Studio shows a confirmation dialog (heading **End streaming?**, body
+**End LIVE? Share your LIVE for more viewers.**, buttons **End now** / **Cancel**). `end_request.py` detects that
+combination from spatially related OCR evidence: the heading line, the *End now* button and the body/*Cancel* must
+appear within six consecutive OCR lines of the Studio frame (or a 220-character window when the OCR backend gives no
+line structure). *End LIVE* or *End* alone never matches. Two consecutive fresh frames within 12 s confirm it; the
+exact triggering frame (already redacted) is kept as evidence.
+
+The alert (`🟠 <owner>’s Live — LIVE IS BEING ENDED`, verified `@username` or "unavailable", "Ending has not yet been
+confirmed", detection time, screenshot) goes through the normal delivery owner (local bots in standalone mode, the
+hub in managed mode) under the broadcast category, as event type `BROADCAST_END_REQUESTED` and an INFO incident.
+
+The dialog is tracked as its own **end-request episode** and never changes the broadcast state, ends the session,
+starts the offline timer or produces the report. While it is open, stream-health detectors and the username lookup
+are held (the dialog obscures their regions). Outcomes, decided only by evidence the monitor already trusts:
+
+- **ended** — the live-state engine confirms NOT_LIVE: `⚫ LIVE HAS ENDED` replies in the same incident thread, the
+  broadcast report is produced exactly once by the existing path, and the confirmed end time is recorded;
+- **continued** — the dialog is gone on fresh frames (two misses) and fresh evidence confirms LIVE:
+  `🟢 END CONFIRMATION CLOSED — LIVE CONTINUES` (it never claims *Cancel* was clicked);
+- **unknown** — Studio exits, or no valid capture arrives within 180 s: recorded in history and the incident
+  timeline with the reason; no end claim is made and the existing Studio-exit/health notices carry the evidence.
+
+Invalid capture never counts as the dialog disappearing. One alert per open dialog; closing and reopening starts a
+new episode. The episode is persisted, so after a monitor restart an open dialog is not re-announced and a pending
+outcome is reconciled with fresh frames (bounded; unknown if none arrive). Outcomes appear in session/broadcast
+reports and in the resolved incident that is synced to memory; detection timestamps are preserved when events reach
+the hub late. Calibration: the phrases were verified with Windows OCR on the operator's real dialog crop (kept
+locally, not committed); the committed fixture is synthetic. A full Studio-window capture with the dialog open has
+not been exercised yet.
+
 ## PC health, watchdog, clips and engagement
 
 - **PC health** (`pc_health.py`, psutil): CPU, memory, free disk on the data drive, battery (only when
@@ -595,6 +627,7 @@ src/studio_monitor/
   email_backup.py  SMTP backup route for failed urgent deliveries
   memory.py / session_report.py  Supermemory provider (scoped, key-hygienic) and broadcast/session reports
   pc_health.py / watchdog.py / clips.py / engagement.py  PC health sampling, stall detector + supervisor, GIF clips, viewer counts
+  end_request.py  End streaming? dialog detection (rules/end_dialog_rules.json) and persisted end-request episodes
 src/hub/        the central hub: FastAPI app, SQLAlchemy models, services, Telegram routing, dashboard templates
 deploy/         Dockerfile, docker-compose.yml (PostgreSQL + hub), .env.example, deployment README
   reminders.py  offline episodes + not-live reminders

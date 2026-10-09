@@ -1392,6 +1392,10 @@ class App:
             lines += ["", "[pc health]", f"cpu={sm.cpu_percent:.0f}% memory={sm.memory_percent:.0f}% disk_free={sm.disk_free_percent:.0f}% "
                       f"battery={sm.battery_percent} on_battery={sm.on_battery} studio_cpu={sm.studio_cpu_percent} "
                       f"upload_kbps={sm.upload_kbps} problems={self.monitor.pc_health.snapshot()['problems']}"]
+        if a is not None and a.end_request:
+            er = a.end_request
+            lines += ["", "[end dialog]", f"episode={er.get('episode_id')} visible={er.get('dialog_visible')} open={er.get('open')} "
+                      f"outcome={er.get('outcome') or 'pending'} {er.get('outcome_reason') or ''}".rstrip()]
         if a is not None and a.hub:
             hb = a.hub
             lines += ["", "[hub]", f"url={self.cfg.hub.url} connected={hb.get('connected')} pending={hb.get('pending')} "
