@@ -406,6 +406,15 @@ class DeliveryQueue:
                         "created_at": r[5], "owner_label": r[6], "summary": self.event_summary(r[0])})
         return out
 
+    def failed_deliveries_since(self, after_id: int) -> list[dict]:
+        """Deliveries that gave up (status failed) with id > after_id, joined with their event."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT d.id, d.event_id, e.kind, e.category, e.label, e.payload, d.bot_name, d.last_error FROM deliveries d "
+                "JOIN events e ON e.event_id=d.event_id WHERE d.status='failed' AND d.id>? ORDER BY d.id", (after_id,)).fetchall()
+        return [{"id": r[0], "event_id": r[1], "kind": r[2], "category": r[3], "label": r[4], "payload": json.loads(r[5]),
+                 "bot_name": r[6], "error": r[7]} for r in rows]
+
     def evidence_in_use(self) -> set[str]:
         """Evidence files still needed by a pending delivery."""
         with self._lock:

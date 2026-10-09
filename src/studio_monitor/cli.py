@@ -469,6 +469,29 @@ def _utf8_console() -> None:
             pass
 
 
+def _smtp(cfg: AppConfig, action: str) -> int:
+    from .app import make_email_backup
+    from .credentials import default_store
+    from .email_backup import SMTP_CRED_KEY
+    s = cfg.smtp
+    if action == "set-password":
+        pw = getpass.getpass("SMTP password: ") if sys.stdin.isatty() else sys.stdin.readline().strip()
+        default_store().set(SMTP_CRED_KEY, pw)
+        print("SMTP password stored in the Windows Credential Manager")
+        return 0
+    print(f"e-mail backup enabled={s.enabled} host={s.host or '-'}:{s.port} user={s.username or '-'} from={s.from_addr or '-'} "
+          f"to={','.join(s.to_addrs) or '-'} starttls={s.starttls} min_severity={s.min_severity} "
+          f"password={'stored' if default_store().get(SMTP_CRED_KEY) else 'missing'}")
+    if action == "test":
+        if not s.enabled:
+            print("enable it in Settings first"); return 1
+        eb = make_email_backup(cfg)
+        ok = eb.send(f"[{cfg.notification_label}] e-mail backup test", "This is an explicit test of the SMTP backup route.")
+        print("sent" if ok else f"failed: {eb.last_error}")
+        return 0 if ok else 1
+    return 0
+
+
 def _hub(cfg: AppConfig, cfg_path: Path, action: str, url: str, code: str, mode: str) -> int:
     from .app import enroll_agent, make_hub_sync, unenroll_agent
     from .hub_client import HubClientError
@@ -596,6 +619,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("hub", help="fleet hub: enroll --url URL --code CODE [--mode managed|standalone] | status | unenroll | sync-once")
     p.add_argument("action", choices=["enroll", "status", "unenroll", "sync-once"])
     p.add_argument("--url", default=""); p.add_argument("--code", default=""); p.add_argument("--mode", default="")
+    p = sub.add_parser("smtp", help="e-mail backup route: set-password | status | test")
+    p.add_argument("action", choices=["set-password", "status", "test"])
     p = sub.add_parser("detectors", help="stream-health detectors: status | text IMAGE | face IMAGE | audio IMAGE")
     p.add_argument("action", choices=["status", "text", "face", "audio"]); p.add_argument("image", nargs="?")
     p.add_argument("--backend", default="")
@@ -648,6 +673,8 @@ def main(argv: list[str] | None = None) -> int:
         return _detectors(cfg, args.action, args.image, args.backend)
     if args.cmd == "hub":
         return _hub(cfg, cfg_path, args.action, args.url, args.code, args.mode)
+    if args.cmd == "smtp":
+        return _smtp(cfg, args.action)
     if cmd == "autostart":
         return _autostart(cfg, cfg_path, args.enable, args.disable)
     if cmd == "maintenance":

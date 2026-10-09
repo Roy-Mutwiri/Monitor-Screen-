@@ -185,6 +185,39 @@ def install_fingerprint(data_dir: str = "") -> str:
 
 
 @dataclass
+class CommandsConfig:
+    """Telegram commands and inline buttons (standalone mode; in managed mode the hub answers)."""
+    enabled: bool = True
+    bot_id: str = ""                    # which bot listens for commands; empty = first enabled bot
+    buttons: bool = True                # inline Ack / Snooze / Screenshot buttons under incident alerts
+    rate_per_minute: int = 12
+    long_poll_seconds: int = 20
+
+
+@dataclass
+class EscalationConfig:
+    """Extra destination once an incident has gone unacknowledged through N reminders."""
+    enabled: bool = False
+    after_reminders: int = 2
+    bot_id: str = ""                    # bot used for the escalation message (empty = same bot as the alert)
+    chat_id: str = ""                   # escalation chat (e.g. a second person / group)
+    thread_id: Optional[int] = None
+
+
+@dataclass
+class SmtpConfig:
+    """E-mail backup when Telegram delivery of an urgent event has definitively failed."""
+    enabled: bool = False
+    host: str = ""
+    port: int = 587
+    username: str = ""
+    from_addr: str = ""
+    to_addrs: list[str] = field(default_factory=list)
+    starttls: bool = True
+    min_severity: str = "URGENT"
+
+
+@dataclass
 class HubConfig:
     """Fleet hub connection. The agent secret lives in the credential store (hub-agent/<device_id>)."""
     url: str = ""                       # e.g. https://hub.example.org ; empty = no hub
@@ -235,6 +268,9 @@ class AppConfig:
     device: DeviceConfig = field(default_factory=DeviceConfig)
     detectors: DetectorsSettings = field(default_factory=DetectorsSettings)
     hub: HubConfig = field(default_factory=HubConfig)
+    commands: CommandsConfig = field(default_factory=CommandsConfig)
+    escalation: EscalationConfig = field(default_factory=EscalationConfig)
+    smtp: SmtpConfig = field(default_factory=SmtpConfig)
     config_version: int = CONFIG_VERSION
 
     # -- serialisation ----------------------------------------------------
@@ -267,6 +303,9 @@ class AppConfig:
         cfg.device = DeviceConfig(**_known(DeviceConfig, data.get("device", {})))
         cfg.detectors = DetectorsSettings(**_known(DetectorsSettings, data.get("detectors", {})))
         cfg.hub = HubConfig(**_known(HubConfig, data.get("hub", {})))
+        cfg.commands = CommandsConfig(**_known(CommandsConfig, data.get("commands", {})))
+        cfg.escalation = EscalationConfig(**_known(EscalationConfig, data.get("escalation", {})))
+        cfg.smtp = SmtpConfig(**_known(SmtpConfig, data.get("smtp", {})))
         if cfg.device.mode not in ("standalone", "managed"):
             cfg.device.mode = "standalone"
         cfg.device = DeviceConfig(**_known(DeviceConfig, data.get("device", {})))

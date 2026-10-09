@@ -21,7 +21,7 @@ from typing import Callable, Optional
 from .account import (DISABLED_STATUS, FAILED, IN_PROGRESS, NOT_ATTEMPTED, SUCCEEDED, AccountIdentity, AccountLookupJob,
                       IdentityStore, Interactor, LookupContext, LookupResult, Win32Interactor)
 from .detectors.suite import CATEGORY_OF as STREAM_CATEGORY_OF, DetectorSuite
-from .alerts import (format_stream_alert, format_stream_recovered)
+from .alerts import (format_stream_alert, format_stream_recovered, format_duration, local_ts)
 from .alerts import (format_alert, format_already_live, format_broadcast_started, format_health_alert,
                      format_not_live_reminder, format_studio_already_running, format_studio_closed,
                      format_studio_opened)
@@ -39,6 +39,8 @@ from .incidents import Incident, IncidentTracker
 from .incident_engine import IncidentEngine
 from .contracts.events import Event, EvidenceRef, Severity
 from .hub_sync import HubSync
+from .commands import CommandRouter, UpdatePoller, incident_keyboard
+from .email_backup import EmailBackup
 from .ocr.base import OcrBackend, OcrError
 from .privacy import purge_old_screenshots, redact
 from .queue import KIND_ACTIVITY, KIND_INCIDENT, KIND_REMINDER, KIND_STATUS, Delivery, DeliveryError, DeliveryQueue, DeliveryWorker
@@ -128,7 +130,9 @@ class Monitor:
                  inline_lookup: bool = False,
                  lookup_sleep: Callable[[float], None] = time.sleep,
                  detector_suite: Optional[DetectorSuite] = None,
-                 hub_sync: Optional[HubSync] = None) -> None:
+                 hub_sync: Optional[HubSync] = None,
+                 command_poller: Optional[UpdatePoller] = None,
+                 email_backup: Optional[EmailBackup] = None) -> None:
         self.cfg = cfg
         self.system = system
         self.capturer = capturer                 # dialogs only (PrintWindow, no desktop fallback)
@@ -204,9 +208,13 @@ class Monitor:
         # stream-health detectors (connection / source / presenter / audio), evaluated only while LIVE
         self.detectors: Optional[DetectorSuite] = detector_suite
         # fleet hub mirror (events -> hub outbox; heartbeats carry the status payload)
-        self.hub_sync: Optional[HubSync] = hub_sync
-        if hub_sync is not None:
-            hub_sync.status_provider = self.hub_status_payload
+        self._hub_sync: Optional[HubSync] = None
+        self.hub_sync = hub_sync
+        # Telegram commands (standalone mode) + e-mail backup route
+        self.command_poller: Optional[UpdatePoller] = command_poller
+        self.email_backup: Optional[EmailBackup] = email_backup
+        self._last_failed_delivery_id = int(queue.get_state("email_backup_last_delivery_id", 0) or 0)
+        self._started_mono = mono()
         self._stream_incidents: dict[str, dict] = {}
         self._stream_end_hint = ""
         self.activity = ActivitySnapshot(live_rules_verified=self.live_rules.verified)
@@ -258,6 +266,18 @@ class Monitor:
         return n
 
     # ---- fleet hub ----------------------------------------------------
+    @property
+    def hub_sync(self) -> Optional[HubSync]:
+        return self._hub_sync
+
+    @hub_sync.setter
+    def hub_sync(self, sync: Optional[HubSync]) -> None:
+        """Wire the status payload and the predefined remote-operation handler whenever a sync is attached."""
+        self._hub_sync = sync
+        if sync is not None:
+            sync.status_provider = self.hub_status_payload
+            sync.on_command = self.execute_remote_command
+
     POPUP_EVENT_TYPES = {"restriction_notice": "RESTRICTION", "content_warning": "CONTENT_WARNING",
                          "account_suspension": "ACCOUNT_SUSPENSION", "live_interruption": "LIVE_INTERRUPTED",
                          "verification_puzzle": "VERIFICATION"}
@@ -293,7 +313,7 @@ class Monitor:
                 CAT_RESTRICTIONS: "RESTRICTION"}.get(category, "TEST")
 
     def mirror_to_hub(self, event_id: str, kind: str, category: str, payload: dict, evidence_path: str, label: str = "",
-                      incident_id: str = "", event_type: str = "") -> bool:
+                      incident_id: str = "", event_type: str = "", extra_detail: Optional[dict] = None) -> bool:
         if self.hub_sync is None:
             return False
         etype = event_type or self._guess_event_type(kind, category, event_id, label)
@@ -307,7 +327,7 @@ class Monitor:
                    owner_label=self.cfg.notification_label, account=self.current_account_handle(),
                    account_status=self.account.status, expected_account=self.cfg.device.expected_account,
                    detail={"local_event_id": event_id, "kind": kind, "label": label, "thread_of": payload.get("thread_of", ""),
-                           "mode": self.cfg.device.mode},
+                           "mode": self.cfg.device.mode, **(extra_detail or {})},
                    evidence=evidence,
                    payload={k: payload[k] for k in ("text", "caption", "created_at", "thread_of") if k in payload})
         return self.hub_sync.outbox.enqueue(ev.to_dict(), evidence.path, evidence.sha256)
@@ -428,6 +448,9 @@ class Monitor:
         self._emit_activity()
         if self.hub_sync is not None and self.hub_sync._thread is None:
             self.hub_sync.tick()                       # inline mode (tests / --once); production runs a thread
+        if self.command_poller is not None and self.command_poller._thread is None:
+            self.command_poller.poll_once(timeout=0)
+        self._check_email_backup()
         self._maybe_purge()
         return detections
 
@@ -532,6 +555,8 @@ class Monitor:
             account=self.current_account_handle(),
         )
         payload["created_at"] = self.clock()
+        if self.cfg.commands.enabled and self.cfg.commands.buttons:
+            payload["buttons"] = incident_keyboard(inc.incident_id)
         stored_text = inc.text if self.cfg.privacy.store_detected_text else ""
         self.queue.record_incident(inc.incident_id, inc.category, inc.label, stored_text,
                                    inc.window_title, inc.is_dialog, inc.screenshot_path)
@@ -575,9 +600,179 @@ class Monitor:
             text = (f"\u23F0 <b>{self.cfg.notification_label} \u2014 STILL OPEN</b>\n{inc.summary}\n"
                     f"Reminder {inc.reminders_sent}; open since {inc.opened_utc}. Reply /ack {inc.incident_id} when handled.")
             payload = {"text": text, "caption": text, "created_at": self.clock(), "thread_of": inc.incident_id}
+            if self.cfg.commands.enabled and self.cfg.commands.buttons:
+                payload["buttons"] = incident_keyboard(inc.incident_id, with_screenshot=False)
             self.dispatch(f"{inc.incident_id}-E{inc.reminders_sent}", KIND_INCIDENT, inc.category, payload, inc.evidence_path,
                           label=f"Escalation {inc.reminders_sent}", incident_id=inc.incident_id, event_type="INCIDENT_ESCALATION")
             self.on_event(f"escalation reminder {inc.reminders_sent} for {inc.incident_id} queued")
+            self._escalation_route(inc, payload)
+
+    def _escalation_route(self, inc, payload: dict) -> None:
+        """Once an incident stayed unacknowledged through N reminders, also notify the escalation destination."""
+        esc = self.cfg.escalation
+        if not (esc.enabled and esc.chat_id) or inc.reminders_sent < esc.after_reminders or self.cfg.device.mode == "managed":
+            return
+        from .bots import BotTarget
+        bot_id = esc.bot_id or next((b.bot_id for b in self.cfg.bots if b.enabled), "")
+        if not bot_id:
+            return
+        bot = next((b for b in self.cfg.bots if b.bot_id == bot_id), None)
+        if bot is None or not bot.enabled:
+            return
+        esc_text = (f"\U0001F6A8 <b>{self.cfg.notification_label} \u2014 ESCALATION</b>\n{inc.summary}\n"
+                    f"Unacknowledged after {inc.reminders_sent} reminder(s); open since {inc.opened_utc}. "
+                    f"Incident <code>{inc.incident_id}</code>.")
+        esc_payload = {"text": esc_text, "caption": esc_text, "created_at": self.clock()}
+        eid = f"{inc.incident_id}-X{inc.reminders_sent}"
+        self.queue.create_event(eid, KIND_INCIDENT, inc.category, esc_payload, inc.evidence_path,
+                                [BotTarget(bot.bot_id, bot.name, esc.chat_id, esc.thread_id)], f"Escalation route {inc.reminders_sent}",
+                                owner_label=self.cfg.notification_label)
+        self.on_event(f"escalation route notified for {inc.incident_id} (chat {esc.chat_id})")
+        self._kick()
+
+    # ---- e-mail backup --------------------------------------------------
+    def _check_email_backup(self) -> None:
+        eb = self.email_backup
+        if eb is None or not eb.configured:
+            return
+        rank = {Severity.INFO: 0, Severity.WARNING: 1, Severity.URGENT: 2}
+        minimum = rank.get(self.cfg.smtp.min_severity, 2)
+        for f in self.queue.failed_deliveries_since(self._last_failed_delivery_id):
+            self._last_failed_delivery_id = f["id"]
+            sev = Severity.INFO
+            if f["kind"] == KIND_INCIDENT:
+                inc_id = f["event_id"].split("-RES")[0]
+                inc = self.incident_engine.get(inc_id) if inc_id.startswith("INC") or inc_id.startswith("STR") else None
+                sev = inc.severity if inc is not None else Severity.URGENT
+            if rank.get(sev, 0) < minimum:
+                continue
+            body = (f"{self.cfg.notification_label}: Telegram delivery to '{f['bot_name']}' failed for {f['label'] or f['event_id']}.\n"
+                    f"Last error: {f['error']}\n\n{self._plain(f['payload'].get('text') or f['payload'].get('caption') or '')}\n\n"
+                    f"PC: {self.cfg.machine_label}  Event: {f['event_id']}")
+            ok = eb.send(f"[{self.cfg.notification_label}] {f['label'] or f['event_id']} (Telegram failed)", body)
+            self.on_event(f"e-mail backup {'sent' if ok else 'failed: ' + eb.last_error} for {f['event_id']}")
+        self.queue.set_state("email_backup_last_delivery_id", self._last_failed_delivery_id)
+
+    # ---- predefined remote operations ---------------------------------
+    REMOTE_OPS = ("screenshot", "status")
+
+    def execute_remote_command(self, cmd: dict) -> None:
+        """Only predefined operations; anything else is recorded and ignored."""
+        op = str((cmd or {}).get("op", ""))
+        if op not in self.REMOTE_OPS:
+            self.on_event(f"remote command ignored (not a predefined operation): {op!r}")
+            return
+        if op == "screenshot":
+            path, caption = self.command_screenshot()
+            eid = _event_id("SHOT", self.clock())
+            payload = {"text": caption, "caption": caption, "created_at": self.clock()}
+            self.mirror_to_hub(eid, KIND_ACTIVITY, CAT_HEALTH, payload, path, label="Screenshot on request", event_type="SCREENSHOT")
+            self.queue.record_event(eid, "SCREENSHOT", _utc(self.clock()), {"summary": "screenshot requested remotely",
+                                                                           "requested_by": cmd.get("requested_by", "")},
+                                    self.sessions.session_id, "", path)
+            self.on_event("remote screenshot captured and mirrored to the hub" if path else "remote screenshot: no fresh frame")
+        elif op == "status":
+            self.on_event("remote status request answered via heartbeat")
+
+    def command_screenshot(self, _device: str = "") -> tuple[Optional[str], str]:
+        frame = self.frame_cache.fresh(self.cfg.activity.fresh_screenshot_max_age_seconds)
+        if frame is None or not self.cfg.privacy.send_screenshots:
+            reason = "screenshots disabled by privacy settings" if not self.cfg.privacy.send_screenshots else \
+                ("Studio is not running" if not self.sessions.running else "no fresh frame (window minimized or capture degraded)")
+            return None, f"No screenshot available: {reason}."
+        dest = self.cfg.activity_screenshots_dir / f"CMD-{datetime.fromtimestamp(self.clock()):%Y%m%d-%H%M%S}.png"
+        path = self.frame_cache.export(dest)
+        if not path:
+            return None, "No screenshot available: could not export the cached frame."
+        return path, (f"\U0001F4F7 <b>{self.cfg.notification_label}</b> \u2014 Studio frame captured "
+                      f"{datetime.fromtimestamp(frame.captured_at):%H:%M:%S} (redacted). Broadcast: {self.broadcast.state.state.value}.")
+
+    # ---- Telegram command backend (standalone) --------------------------
+    def command_status(self) -> str:
+        import html as _html
+        a = self.activity
+        acct = self.account_snapshot()
+        lines = [f"<b>{_html.escape(self.cfg.notification_label)} \u2014 status</b>",
+                 f"Studio: {a.app_state.replace('_', ' ')}" + (f" (session {a.session_id})" if a.session_id else ""),
+                 f"Broadcast: {a.live_state.replace('_', ' ')}" + ("" if a.live_rules_verified else " (rules unverified)"),
+                 f"TikTok account: {_html.escape(acct.get('handle') or acct.get('display') or 'unknown')}",
+                 f"Capture: {a.health.capture}" + (f" ({_html.escape(a.health.capture_reason)})" if a.health.capture_reason else ""),
+                 f"OCR: {a.health.ocr} \u00b7 Delivery: {a.health.delivery}"]
+        problems = [k.replace("_", " ").lower() for k, v in (a.stream or {}).items() if v.get("state") == "PROBLEM"]
+        if problems:
+            lines.append("Stream health: " + ", ".join(problems))
+        open_incs = self.incident_engine.list(self.device_id, "OPEN", 10)
+        lines.append(f"Open incidents: {len(open_incs)}")
+        for inc in open_incs[:5]:
+            lines.append(f"  \u2013 [{inc.severity}] <code>{_html.escape(inc.incident_id)}</code> {_html.escape(inc.summary[:70])}"
+                         + (" (acked)" if inc.acknowledged else ""))
+        if self.hub_sync is not None:
+            hs = self.hub_sync.status
+            lines.append(f"Hub: {'connected' if hs.connected else 'disconnected'} \u00b7 pending {hs.pending}")
+        lines.append(f"Monitor up {format_duration(self.mono() - self._started_mono)} \u00b7 PC {_html.escape(self.cfg.machine_label)}")
+        return "\n".join(lines)
+
+    def command_sessions(self, limit: int = 10) -> str:
+        import html as _html
+        rows = self.queue.recent_events(limit * 3, ["STUDIO_OPENED", "STUDIO_ALREADY_RUNNING", "STUDIO_CLOSED",
+                                                     EVT_BROADCAST_STARTED, EVT_ALREADY_LIVE, EVT_BROADCAST_ENDED])
+        if not rows:
+            return "No Studio sessions recorded yet."
+        lines = ["<b>Recent sessions</b>"]
+        for r in rows[:limit * 2]:
+            d = r.get("details") or {}
+            lines.append(f"{str(r.get('ts_utc', ''))[11:19]} UTC \u00b7 {r['event_type'].replace('_', ' ').title()}"
+                         + (f" \u00b7 {_html.escape(str(d.get('account')))}" if d.get("account") else ""))
+        return "\n".join(lines)
+
+    def command_ack(self, incident_id: str, actor: str) -> str:
+        import html as _html
+        inc = self.incident_engine.acknowledge(incident_id, actor)
+        if inc is None:
+            return f"Unknown incident <code>{_html.escape(incident_id)}</code>."
+        self.mirror_to_hub(f"{incident_id}-ACK", KIND_INCIDENT, inc.category, {"text": f"acknowledged by {actor}", "created_at": self.clock()},
+                           "", label="Acknowledged", incident_id=incident_id, event_type="INCIDENT_ACKED", extra_detail={"actor": actor})
+        self.on_event(f"incident {incident_id} acknowledged by {actor}")
+        return (f"Acknowledged <code>{_html.escape(incident_id)}</code> by {_html.escape(actor)}. "
+                "Reminders paused; the fault stays open until Studio no longer shows it.")
+
+    def command_snooze(self, incident_id: str, minutes: int, actor: str) -> str:
+        import html as _html
+        if self.incident_engine.get(incident_id) is None:
+            return f"Unknown incident <code>{_html.escape(incident_id)}</code>."
+        until = self.incident_engine.snooze("incident", incident_id, minutes * 60, actor, "telegram")
+        self.mirror_to_hub(f"{incident_id}-SNZ{int(self.clock())}", KIND_INCIDENT, "", {"text": f"snoozed {minutes} min by {actor}",
+                           "created_at": self.clock()}, "", label="Snoozed", incident_id=incident_id, event_type="INCIDENT_SNOOZED",
+                           extra_detail={"actor": actor, "until_utc": _utc(until)})
+        self.on_event(f"incident {incident_id} snoozed {minutes} min by {actor}")
+        return f"Snoozed <code>{_html.escape(incident_id)}</code> for {minutes} min (until {local_ts(until)})."
+
+    def command_report(self) -> str:
+        import html as _html
+        a = self.activity
+        summ = self.incident_engine.session_summary(self.device_id, self.sessions.session_id) if self.sessions.session_id else {"incidents": 0, "by_category": {}}
+        lines = [f"<b>{_html.escape(self.cfg.notification_label)} \u2014 session report</b>",
+                 f"Studio session: {a.session_id or 'none'} ({a.app_state.replace('_', ' ')})",
+                 f"Broadcast: {a.live_state.replace('_', ' ')}" + (f", episode {a.broadcast_episode}" if a.broadcast_episode else ""),
+                 f"Offline accumulated: {format_duration(a.offline_seconds)} \u00b7 reminders sent: {a.reminders_sent}",
+                 f"Incidents this session: {summ['incidents']}"]
+        for cat, b in summ["by_category"].items():
+            lines.append(f"  \u2013 {cat}: {b['count']} ({b['open']} open, {b['resolved']} resolved, {format_duration(b['total_seconds'])} total)")
+        if self.detectors is not None and a.stream:
+            lines.append("Stream health: " + ", ".join(f"{k.lower()}={v.get('state')}" for k, v in a.stream.items()))
+        return "\n".join(lines)
+
+    def command_backend(self):
+        mon = self
+
+        class _Backend:
+            def status(self): return mon.command_status()
+            def screenshot(self): return mon.command_screenshot()
+            def sessions(self, limit): return mon.command_sessions(limit)
+            def ack(self, incident_id, actor): return mon.command_ack(incident_id, actor)
+            def snooze(self, incident_id, minutes, actor): return mon.command_snooze(incident_id, minutes, actor)
+            def report(self): return mon.command_report()
+        return _Backend()
 
     def _check_schedule(self, confirmed: LiveState) -> None:
         sched = self.cfg.schedule
@@ -962,6 +1157,8 @@ class Monitor:
         self.on_event("monitoring started (Studio activity is only observed while the monitor runs)")
         if self.hub_sync is not None:
             self.hub_sync.start()
+        if self.command_poller is not None:
+            self.command_poller.start()
         try:
             while not self._stop.is_set():
                 started = self.clock()
@@ -982,6 +1179,8 @@ class Monitor:
                 self.frames.stop()
             if self.hub_sync is not None:
                 self.hub_sync.stop()
+            if self.command_poller is not None:
+                self.command_poller.stop()
             self._emit_status(Status.STOPPED, "")
             self.on_event("monitoring stopped")
 

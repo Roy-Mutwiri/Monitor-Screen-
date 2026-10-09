@@ -37,6 +37,9 @@ src/studio_monitor/
   schedules.py                    IANA-timezone streaming schedule, DST/overnight, missed start
   hub_client.py / hub_outbox.py / hub_sync.py  agent->hub: httpx client (injectable transport), durable outbox with
                                   deterministic UUID5 event ids, heartbeat/drain loop; Monitor.dispatch mirrors every event
+  commands.py / email_backup.py   Telegram commands (/status /screenshot /sessions /ack /snooze /report + buttons),
+                                  UpdatePoller = single getUpdates consumer per bot (offset + lease, 409 backoff);
+                                  Monitor.execute_remote_command runs ONLY predefined ops (screenshot, status)
 src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy), services (framework-free logic),
                                   delivery (Telegram routes by token_env), app (API + Jinja dashboard); deploy/ has compose
   account.py                      @username discovery: Interactor protocol (Win32Interactor real), perform_lookup,
@@ -85,5 +88,7 @@ src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy
   agent round trip. Not deployed anywhere; PostgreSQL untested; no real network sync. Agent secrets live in the
   credential store under hub-agent/<device_id>; `cfg.ensure_device_id()` regenerates the id when the install
   fingerprint changes (copied install) and drops enrollment.
+- Telegram commands/buttons, escalation route and SMTP backup (Milestone 4) are verified with scripted transports only;
+  no real getUpdates session, second chat or SMTP server was exercised. Commands are never arbitrary.
 - Detectors never evaluate when the broadcast is not LIVE; a 'reconnecting' overlay keeps the LIVE episode open (UNKNOWN,
   not NOT_LIVE) so RECONNECTING can be reported.

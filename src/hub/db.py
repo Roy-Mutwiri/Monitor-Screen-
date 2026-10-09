@@ -120,6 +120,7 @@ class Route(Base):
     categories: Mapped[list] = mapped_column(JSON, default=list)      # [] = all
     min_severity: Mapped[str] = mapped_column(String(16), default="INFO")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    commands_enabled: Mapped[bool] = mapped_column(Boolean, default=False)   # this route's bot answers /commands (hub is the single consumer)
 
 
 class DeliveryRow(Base):

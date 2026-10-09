@@ -2,6 +2,8 @@
 migrations and the monitor."""
 from __future__ import annotations
 
+import os
+
 import logging
 import logging.handlers
 from pathlib import Path
@@ -9,7 +11,7 @@ from typing import Optional
 
 from .bots import CAT_BROADCAST, CAT_HEALTH, BotRegistry, BotTarget
 from .broadcast import LiveRules
-from .config import AppConfig, default_config_path, live_rules_path, rules_path
+from .config import AppConfig, TelegramConfig, default_config_path, live_rules_path, rules_path
 from .credentials import CredentialStore, default_store
 from .detection.rules import RuleSet, load_rules
 from .monitor import Monitor, ensure_dirs
@@ -211,6 +213,35 @@ def unenroll_agent(cfg: AppConfig, cfg_path: Path, store: Optional[CredentialSto
     cfg.save(cfg_path)
 
 
+def make_command_poller(cfg: AppConfig, monitor, registry: BotRegistry, factory, on_event=None):
+    """UpdatePoller for the command bot (standalone mode only; the hub answers commands for managed devices)."""
+    from .commands import CommandRouter, UpdatePoller
+    if not cfg.commands.enabled or cfg.device.mode == "managed" or factory is None:
+        return None
+    bot = next((b for b in cfg.bots if b.enabled and (not cfg.commands.bot_id or b.bot_id == cfg.commands.bot_id)), None)
+    if bot is None:
+        return None
+    token = factory.token(bot.bot_id)
+    if not token:
+        return None
+    from .telegram import TelegramClient
+    tg_cfg = TelegramConfig(**{**cfg.telegram.__dict__, "timeout_seconds": max(cfg.telegram.timeout_seconds, cfg.commands.long_poll_seconds + 15)})
+    client = TelegramClient(tg_cfg, token, bot.chat_id, bot.thread_id, transport=factory.transport)
+    router = CommandRouter(monitor.command_backend(), {bot.chat_id}, on_audit=on_event or monitor.on_event,
+                           rate_per_minute=cfg.commands.rate_per_minute)
+    cfg.ensure_device_id()
+    return UpdatePoller(client, router, monitor.queue.get_state, monitor.queue.set_state, bot.bot_id,
+                        f"{cfg.device.device_id}:{os.getpid()}", on_event=on_event or monitor.on_event,
+                        long_poll_seconds=cfg.commands.long_poll_seconds)
+
+
+def make_email_backup(cfg: AppConfig, store: Optional[CredentialStore] = None):
+    from .email_backup import EmailBackup, SmtpSettings
+    s = cfg.smtp
+    settings = SmtpSettings(s.enabled, s.host, s.port, s.username, s.from_addr, list(s.to_addrs), s.starttls, 20.0, s.min_severity)
+    return EmailBackup(settings, store or default_store())
+
+
 def make_capture_service(cfg: AppConfig, system=None):
     from .win32.capture import CaptureService
     from .win32.windows import Win32WindowSystem
@@ -243,5 +274,9 @@ def build_monitor(cfg: AppConfig, cfg_path: Path, registry: Optional[BotRegistry
     callbacks.setdefault("detector_suite", make_detector_suite(cfg))
     if "hub_sync" not in callbacks:
         callbacks["hub_sync"] = make_hub_sync(cfg, on_event=callbacks.get("on_event"))
-    return Monitor(cfg, system, capturer, ocr, rules, queue, registry, factory,
-                   live_rules=load_live_rules(cfg), **callbacks)
+    callbacks.setdefault("email_backup", make_email_backup(cfg))
+    monitor = Monitor(cfg, system, capturer, ocr, rules, queue, registry, factory,
+                      live_rules=load_live_rules(cfg), **callbacks)
+    if monitor.command_poller is None:
+        monitor.command_poller = make_command_poller(cfg, monitor, registry, factory, callbacks.get("on_event"))
+    return monitor

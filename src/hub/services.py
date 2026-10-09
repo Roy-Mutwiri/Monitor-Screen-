@@ -23,9 +23,10 @@ from studio_monitor.contracts.events import EVENT_TYPES, SEVERITIES, Severity, u
 from .db import AuditRow, DeliveryRow, Device, EventRow, HeartbeatRow, IncidentRow, PairingCode, Route, Workspace
 
 RESOLVING_TYPES = {"INCIDENT_RESOLVED", "HEALTH_RECOVERED", "DEVICE_REACHABLE", "BROADCAST_RECONNECTED"}
+ANNOTATION_TYPES = {"INCIDENT_ACKED", "INCIDENT_SNOOZED"}
 NON_INCIDENT_TYPES = {"STUDIO_OPENED", "STUDIO_ALREADY_RUNNING", "STUDIO_CLOSED", "BROADCAST_STARTED", "BROADCAST_ALREADY_LIVE",
                       "BROADCAST_ENDED", "NOT_LIVE_REMINDER", "MAINTENANCE_ENTER", "MAINTENANCE_EXIT", "MONITORING_GAP", "TEST",
-                      "INCIDENT_ESCALATION"} | RESOLVING_TYPES
+                      "INCIDENT_ESCALATION", "SCREENSHOT"} | RESOLVING_TYPES | ANNOTATION_TYPES
 SEVERITY_RANK = {Severity.INFO: 0, Severity.WARNING: 1, Severity.URGENT: 2}
 
 
@@ -222,6 +223,13 @@ class HubService:
         if not row.incident_id:
             return
         inc = self.s.get(IncidentRow, row.incident_id)
+        if row.type in ANNOTATION_TYPES:
+            if inc is not None:
+                if row.type == "INCIDENT_ACKED":
+                    inc.acked_utc, inc.acked_by = row.observed_utc, (row.detail or {}).get("actor", "") or "agent"
+                else:
+                    inc.snoozed_until_utc = (row.detail or {}).get("until_utc", "") or row.observed_utc
+            return
         if row.type in RESOLVING_TYPES:
             if inc is not None and not inc.resolved_utc:
                 inc.resolved_utc, inc.resolution, inc.last_event_id = row.observed_utc, row.summary, row.event_id
@@ -326,11 +334,12 @@ class HubService:
 
     # ------------------------------------------------------------- routing
     def add_route(self, workspace_id: str, name: str, token_env: str, chat_id: str, thread_id: str = "",
-                  categories: Optional[list[str]] = None, min_severity: str = Severity.INFO, actor: str = "admin") -> Route:
+                  categories: Optional[list[str]] = None, min_severity: str = Severity.INFO, actor: str = "admin",
+                  commands_enabled: bool = False) -> Route:
         if min_severity not in SEVERITIES:
             raise HubError("bad severity", 400)
         r = Route(workspace_id=workspace_id, name=name[:120], token_env=token_env[:120], chat_id=str(chat_id), thread_id=str(thread_id or ""),
-                  categories=list(categories or []), min_severity=min_severity)
+                  categories=list(categories or []), min_severity=min_severity, commands_enabled=commands_enabled)
         self.s.add(r)
         self.audit(actor, "route.add", name, token_env=token_env, chat_id=str(chat_id))
         self.s.flush()

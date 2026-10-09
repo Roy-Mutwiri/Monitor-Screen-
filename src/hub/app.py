@@ -62,6 +62,7 @@ class RouteRequest(BaseModel):
     thread_id: str = ""
     categories: list[str] = Field(default_factory=list)
     min_severity: str = "INFO"
+    commands_enabled: bool = False
 
 
 class IncidentAction(BaseModel):
@@ -86,6 +87,9 @@ def create_app(settings: Optional[HubSettings] = None, engine=None, clock=None, 
                                clock=clock or __import__("time").time, evidence_dir=settings.evidence_dir)
     background = HubBackground(session_factory, worker, settings.unreachable_after, retention_days=settings.retention_days,
                                clock=clock or __import__("time").time)
+    from .commands import HubCommandPollers
+    background.commands = HubCommandPollers(session_factory, worker.env, settings.telegram_api_base, telegram_transport,
+                                            clock or __import__("time").time, settings.evidence_dir)
     templates = Jinja2Templates(directory=str(TEMPLATES))
 
     with session_factory() as s:
@@ -245,7 +249,7 @@ def create_app(settings: Optional[HubSettings] = None, engine=None, clock=None, 
     def add_route(req: RouteRequest, actor: str = Depends(admin_actor), s: Session = Depends(db), service: HubService = Depends(svc)):
         ws = service.ensure_workspace(req.workspace or settings.default_workspace)
         r = commit(s, lambda: service.add_route(ws.id, req.name, req.token_env, req.chat_id, req.thread_id, req.categories,
-                                                req.min_severity, actor))
+                                                req.min_severity, actor, req.commands_enabled))
         return {"id": r.id, "name": r.name, "token_env": r.token_env, "token_configured": bool(os.environ.get(r.token_env))}
 
     @app.post("/api/v1/admin/sweep")

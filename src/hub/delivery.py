@@ -76,6 +76,7 @@ class HubBackground:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._last_purge = 0.0
+        self.commands = None          # HubCommandPollers, attached by create_app
 
     def once(self) -> dict:
         with self.sf() as s:
@@ -87,7 +88,14 @@ class HubBackground:
                 self._last_purge = self.clock()
             s.commit()
         delivered = self.worker.process_round()
-        return {"unreachable": len(flipped), "delivered": delivered, "purged": purged}
+        commands = 0
+        if self.commands is not None:
+            try:
+                self.commands.env = self.worker.env
+                commands = self.commands.poll_once()
+            except Exception as exc:  # pragma: no cover
+                log.error("command polling failed: %s", sanitize(str(exc)))
+        return {"unreachable": len(flipped), "delivered": delivered, "purged": purged, "commands": commands}
 
     def _run(self) -> None:
         while not self._stop.is_set():

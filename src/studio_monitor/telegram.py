@@ -150,21 +150,46 @@ class TelegramClient:
             fields["message_thread_id"] = str(self.thread_id)
         return fields
 
-    def send_message(self, text: str, parse_mode: str = "HTML", reply_to: Optional[int] = None) -> dict:
+    def for_destination(self, chat_id: str, thread_id: Optional[int] = None) -> "TelegramClient":
+        """Same bot, another chat (command replies go back to the asking chat)."""
+        if str(chat_id) == str(self.chat_id) and thread_id == self.thread_id:
+            return self
+        return TelegramClient(self.cfg, self.token, str(chat_id), thread_id, self.transport)
+
+    def send_message(self, text: str, parse_mode: str = "HTML", reply_to: Optional[int] = None,
+                     reply_markup: Optional[dict] = None) -> dict:
         fields = self._dest({"text": text, "parse_mode": parse_mode, "disable_web_page_preview": "true"})
         if reply_to:
             fields["reply_to_message_id"] = str(reply_to)
             fields["allow_sending_without_reply"] = "true"
+        if reply_markup:
+            fields["reply_markup"] = json.dumps(reply_markup, separators=(",", ":"))
         return self._call("sendMessage", fields)
 
-    def send_photo(self, photo_path: str, caption: str, parse_mode: str = "HTML", reply_to: Optional[int] = None) -> dict:
+    def send_photo(self, photo_path: str, caption: str, parse_mode: str = "HTML", reply_to: Optional[int] = None,
+                   reply_markup: Optional[dict] = None) -> dict:
         path = Path(photo_path)
         content = path.read_bytes()
         fields = self._dest({"caption": caption[:1024], "parse_mode": parse_mode})
         if reply_to:
             fields["reply_to_message_id"] = str(reply_to)
             fields["allow_sending_without_reply"] = "true"
+        if reply_markup:
+            fields["reply_markup"] = json.dumps(reply_markup, separators=(",", ":"))
         return self._call("sendPhoto", fields, files={"photo": (path.name, content)})
+
+    def get_updates(self, offset: int = 0, timeout: int = 20) -> list:
+        """Long-poll for messages and button presses (single consumer per bot)."""
+        fields = {"offset": str(offset), "timeout": str(timeout),
+                  "allowed_updates": json.dumps(["message", "edited_message", "callback_query"])}
+        result = self._call("getUpdates", fields)
+        return list(result) if isinstance(result, list) else []
+
+    def answer_callback(self, callback_id: str, text: str = "") -> dict:
+        fields = {"callback_query_id": callback_id}
+        if text:
+            fields["text"] = text[:200]
+        return self._call("answerCallbackQuery", fields)
 
 
 LATE_AFTER_SECONDS = 120.0
@@ -191,9 +216,10 @@ def deliver(client: TelegramClient, payload: dict, screenshot_path: str, clock: 
     if payload.get("thread_of") and not reply_to:
         prefix = f"<i>Continuation of incident {payload['thread_of']}</i>\n"
     caption = prefix + (payload.get("caption") or payload.get("text") or "") + note
+    markup = payload.get("buttons") if isinstance(payload.get("buttons"), dict) else None
     if screenshot_path and Path(screenshot_path).exists():
         try:
-            return client.send_photo(screenshot_path, caption[:1024], reply_to=reply_to)
+            return client.send_photo(screenshot_path, caption[:1024], reply_to=reply_to, reply_markup=markup)
         except DeliveryError as exc:
             msg = str(exc)
             if exc.permanent or "network" in msg or "rate limited" in msg or "server" in msg or "timeout" in msg:
@@ -202,7 +228,7 @@ def deliver(client: TelegramClient, payload: dict, screenshot_path: str, clock: 
     text = prefix + (payload.get("text") or payload.get("caption") or "") + note
     if screenshot_path and not Path(screenshot_path).exists():
         text += "\n(screenshot no longer available locally)"
-    return client.send_message(text, reply_to=reply_to)
+    return client.send_message(text, reply_to=reply_to, reply_markup=markup)
 
 
 class ClientFactory:

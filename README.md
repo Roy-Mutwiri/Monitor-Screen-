@@ -162,6 +162,30 @@ and a mode: `standalone` (local Telegram delivery) or `managed` (a hub owns deli
 recorded locally and delivered by the hub, so there are no duplicate notifications). Local bot
 settings are kept in both modes.
 
+## Telegram commands, buttons, escalation and e-mail backup
+
+**Commands** (`commands.py`): `/status`, `/screenshot`, `/sessions`, `/ack INCIDENT`, `/snooze INCIDENT MINUTES`,
+`/report`, `/help`. Incident alerts carry inline **Acknowledge / Snooze 30 min / Screenshot now** buttons that do the
+same. Only the bot's configured chat may issue commands (others are ignored and audited), there is a per-chat rate
+limit, and every command is a predefined operation: nothing typed in Telegram is ever executed. Acknowledging pauses
+reminders but never resolves the fault; the resolution still comes from Studio no longer showing the problem.
+
+**Single consumer per bot**: in standalone mode the monitor long-polls `getUpdates` for one bot (Settings → *Telegram
+commands*, default: the first enabled bot). The offset is persisted after processing (Telegram replays are
+deduplicated by update id), an in-process lease stops two pollers in one installation, and Telegram's `409 Conflict`
+(someone else polling the same bot) pauses polling for 60 s and is reported. In **managed** mode the hub is the only
+consumer: routes with `commands_enabled` answer `/status` (fleet), `/screenshot [DEVICE]`, `/sessions`, `/ack`,
+`/snooze`, `/report`. `/screenshot` queues the predefined `screenshot` operation for that device; the agent executes it
+on its next heartbeat and mirrors a `SCREENSHOT` event with redacted evidence, which the hub routes back to Telegram.
+Unknown operations are recorded and ignored.
+
+**Escalation route** (Settings → *Telegram commands & escalation*): once an incident stayed unacknowledged through N
+reminders, an extra message goes to a second chat (same or another bot). **E-mail backup** (`email_backup.py`, SMTP
+with STARTTLS or SMTPS, password in the Credential Manager via `studio-monitor smtp set-password`): when a Telegram
+delivery of an URGENT event has definitively failed, a plain-text e-mail with the alert text is sent once per failed
+delivery. `studio-monitor smtp test` sends an explicit test e-mail. Both are verified with fakes only; no real SMTP
+server or second Telegram chat has been exercised.
+
 ## Fleet hub (multi-PC)
 
 `src/hub` is a central FastAPI + SQLAlchemy service (PostgreSQL via `deploy/docker-compose.yml`, SQLite for
@@ -504,6 +528,8 @@ src/studio_monitor/
   broadcast.py  LIVE / NOT_LIVE / UNKNOWN engine
   detectors/    stream-health conditions: text rules, presenter (YuNet), audio meter, suite
   hub_client.py / hub_outbox.py / hub_sync.py  agent side of the fleet hub (enroll, durable outbox, heartbeats)
+  commands.py   Telegram command router, inline keyboards, single getUpdates consumer (agent + hub)
+  email_backup.py  SMTP backup route for failed urgent deliveries
 src/hub/        the central hub: FastAPI app, SQLAlchemy models, services, Telegram routing, dashboard templates
 deploy/         Dockerfile, docker-compose.yml (PostgreSQL + hub), .env.example, deployment README
   reminders.py  offline episodes + not-live reminders
