@@ -16,7 +16,7 @@ hidden = ["studio_monitor.gui.app", "PIL.ImageTk"]
 datas = [(os.path.join(ROOT, "rules", name), "rules") for name in ("studio_rules.json", "live_state_rules.json", "connection_rules.json")]
 datas += [(os.path.join(ROOT, "models", "face_detection_yunet_2023mar.onnx"), "models")]
 binaries = []
-for pkg in ("winrt", "winocr", "windows_capture", "numpy", "ttkbootstrap", "uiautomation", "comtypes", "tzdata", "cv2", "psutil"):
+for pkg in ("winrt", "winocr", "windows_capture", "numpy", "ttkbootstrap", "uiautomation", "comtypes", "tzdata", "cv2", "psutil", "httpx", "httpcore", "h11", "anyio", "sniffio", "certifi", "idna"):
     try:
         hidden += collect_submodules(pkg)
         datas += collect_data_files(pkg)

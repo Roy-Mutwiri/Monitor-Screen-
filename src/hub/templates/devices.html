@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="cards">
+  <div class="card"><div class="v">{{ counts.devices }}</div><div class="k">Devices</div></div>
+  <div class="card"><div class="v">{{ counts.open_incidents }}</div><div class="k">Open incidents</div></div>
+  <div class="card"><div class="v">{{ counts.events }}</div><div class="k">Events stored</div></div>
+  <div class="card"><div class="v">{{ counts.pending_deliveries }}</div><div class="k">Pending Telegram</div></div>
+</div>
+<table>
+  <thead><tr><th>Device</th><th>Status</th><th>Owner</th><th>Account</th><th>Mode</th><th>Last heartbeat</th><th>Agent</th></tr></thead>
+  <tbody>
+  {% for d in devices %}
+  <tr>
+    <td><a href="/devices/{{ d.id }}">{{ d.name }}</a><br><code class="muted">{{ d.id }}</code></td>
+    <td><span class="pill {{ d.status }}">{{ d.status.replace('_',' ') }}</span>{% if d.live_state %}<br><span class="muted">{{ d.live_state }}</span>{% endif %}</td>
+    <td>{{ d.owner_label or '—' }}</td>
+    <td>{{ d.observed_account or '—' }}{% if d.expected_account %}<br><span class="muted">expected {{ d.expected_account }}</span>{% endif %}
+        {% if d.account_mismatch %}<br><span class="pill WARNING">mismatch</span>{% endif %}</td>
+    <td>{{ d.mode }}</td>
+    <td>{{ d.last_heartbeat_utc or 'never' }}</td>
+    <td class="muted">{{ d.agent_version or '—' }}</td>
+  </tr>
+  {% else %}<tr><td colspan="7" class="muted">No devices enrolled yet. Create a pairing code via <code>POST /api/v1/pairing-codes</code> and run <code>studio-monitor hub enroll</code> on the PC.</td></tr>{% endfor %}
+  </tbody>
+</table>
+<h2>Open incidents</h2>
+{% include "_incidents_table.html" %}
+{% endblock %}

@@ -169,6 +169,33 @@ class DetectorsSettings:
     rules_file: str = ""
 
 
+def install_fingerprint(data_dir: str = "") -> str:
+    """Per-installation fingerprint (machine GUID + Windows user + data dir). A copied install on another
+    PC or user account yields a different value and therefore enrolls as a *new* device."""
+    import hashlib
+    import platform
+    parts = [platform.node(), os.environ.get("USERNAME", ""), os.path.normcase(data_dir or "")]
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as k:
+            parts.append(str(winreg.QueryValueEx(k, "MachineGuid")[0]))
+    except Exception:
+        parts.append("no-machine-guid")
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:24]
+
+
+@dataclass
+class HubConfig:
+    """Fleet hub connection. The agent secret lives in the credential store (hub-agent/<device_id>)."""
+    url: str = ""                       # e.g. https://hub.example.org ; empty = no hub
+    enrolled: bool = False
+    workspace_id: str = ""
+    enrolled_utc: str = ""
+    heartbeat_seconds: float = 15.0
+    verify_tls: bool = True
+    upload_evidence: bool = True        # redacted screenshots to the hub (still subject to privacy.send_screenshots)
+
+
 @dataclass
 class DeviceConfig:
     """Stable installation identity and fleet settings (used standalone and when managed by a hub)."""
@@ -177,6 +204,7 @@ class DeviceConfig:
     expected_account: str = ""          # configured expectation; observed account is tracked separately
     mode: str = "standalone"            # standalone | managed (hub owns Telegram delivery)
     schedule: dict = field(default_factory=dict)   # schedules.Schedule.to_dict()
+    install_fingerprint: str = ""       # see install_fingerprint(); mismatch -> new device_id, enrollment dropped
 
 
 @dataclass
@@ -216,6 +244,7 @@ class AppConfig:
     account: AccountConfig = field(default_factory=AccountConfig)
     device: DeviceConfig = field(default_factory=DeviceConfig)
     detectors: DetectorsSettings = field(default_factory=DetectorsSettings)
+    hub: HubConfig = field(default_factory=HubConfig)
     config_version: int = CONFIG_VERSION
 
     # -- serialisation ----------------------------------------------------
@@ -247,6 +276,7 @@ class AppConfig:
         cfg.account = AccountConfig(**_known(AccountConfig, data.get("account", {})))
         cfg.device = DeviceConfig(**_known(DeviceConfig, data.get("device", {})))
         cfg.detectors = DetectorsSettings(**_known(DetectorsSettings, data.get("detectors", {})))
+        cfg.hub = HubConfig(**_known(HubConfig, data.get("hub", {})))
         if cfg.device.mode not in ("standalone", "managed"):
             cfg.device.mode = "standalone"
         cfg.device = DeviceConfig(**_known(DeviceConfig, data.get("device", {})))
@@ -297,10 +327,20 @@ class AppConfig:
     def activity_screenshots_dir(self) -> Path:
         return self.data_path / "activity_screenshots"
 
-    def ensure_device_id(self) -> str:
+    def ensure_device_id(self, fingerprint: Optional[str] = None) -> str:
+        """Create the device id on first use. When the stored install fingerprint no longer matches this
+        machine/user (a copied installation), a fresh id is generated and any hub enrollment is dropped;
+        the copied install must enroll as a new device with its own pairing code."""
+        import uuid
+        fp = fingerprint if fingerprint is not None else install_fingerprint(self.data_dir)
+        self.identity_reset = False
+        if self.device.device_id and self.device.install_fingerprint and self.device.install_fingerprint != fp:
+            self.device.device_id = ""
+            self.hub.enrolled, self.hub.workspace_id, self.hub.enrolled_utc = False, "", ""
+            self.identity_reset = True
         if not self.device.device_id:
-            import uuid
             self.device.device_id = str(uuid.uuid4())
+        self.device.install_fingerprint = fp
         if not self.device.device_name:
             self.device.device_name = self.machine_label
         return self.device.device_id

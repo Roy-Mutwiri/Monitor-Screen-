@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Studio Monitor Hub{% endblock %}</title>
+<style>
+  :root { color-scheme: dark; --bg:#0f1115; --panel:#171a21; --line:#262b36; --fg:#e6e8ee; --muted:#8b93a7;
+          --ok:#3fb950; --warn:#d29922; --bad:#f85149; --info:#58a6ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 "Segoe UI Variable", "Segoe UI", system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  header { display:flex; align-items:center; gap:20px; padding:12px 24px; border-bottom:1px solid var(--line); background:var(--panel); }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header nav a { color:var(--muted); text-decoration:none; margin-right:14px; }
+  header nav a:hover { color:var(--fg); }
+  main { padding:20px 24px; max-width:1200px; margin:0 auto; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin-bottom:20px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px 14px; }
+  .card .v { font-size:24px; font-weight:600; }
+  .card .k { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  tr:last-child td { border-bottom:none; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; font-weight:600; }
+  .LIVE { background:#1f3b2a; color:var(--ok); } .ONLINE, .STUDIO_OPEN { background:#1b2a40; color:var(--info); }
+  .UNREACHABLE, .URGENT, .REVOKED { background:#3b1d1d; color:var(--bad); } .WARNING, .NEVER_SEEN { background:#3b2f14; color:var(--warn); }
+  .INFO { background:#1b2a40; color:var(--info); }
+  .muted { color:var(--muted); } code { font-family:"Cascadia Mono", Consolas, monospace; font-size:12px; }
+  form.inline { display:inline; } button, input { font:inherit; } button { background:#21262d; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:4px 10px; cursor:pointer; }
+  input[type=password] { background:#0f1115; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 10px; }
+  h2 { font-size:15px; margin:24px 0 10px; font-weight:600; }
+  a { color:var(--info); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Studio Monitor Hub</h1>
+  <nav><a href="/">Devices</a><a href="/incidents">Incidents</a><a href="/events">Events</a><a href="/api/docs">API</a></nav>
+  <span style="margin-left:auto" class="muted">v{{ version }}{% if actor %} · {{ actor }}
+    <form class="inline" method="post" action="/logout"><button>Sign out</button></form>{% endif %}</span>
+</header>
+<main>{% block content %}{% endblock %}</main>
+</body>
+</html>

@@ -1,0 +1,14 @@
+<table>
+  <thead><tr><th>Severity</th><th>Incident</th><th>Device</th><th>Opened (UTC)</th><th>State</th></tr></thead>
+  <tbody>
+  {% for i in incidents %}
+  <tr>
+    <td><span class="pill {{ i.severity }}">{{ i.severity }}</span></td>
+    <td>{{ i.summary }}<br><code class="muted">{{ i.incident_id }} · {{ i.type }} · x{{ i.occurrences }}</code></td>
+    <td><a href="/devices/{{ i.device_id }}"><code>{{ i.device_id[:8] }}</code></a></td>
+    <td>{{ i.opened_utc }}</td>
+    <td>{% if i.acked_utc %}acked by {{ i.acked_by }}{% elif i.snoozed_until_utc %}snoozed until {{ i.snoozed_until_utc }}{% else %}open{% endif %}</td>
+  </tr>
+  {% else %}<tr><td colspan="5" class="muted">No open incidents.</td></tr>{% endfor %}
+  </tbody>
+</table>

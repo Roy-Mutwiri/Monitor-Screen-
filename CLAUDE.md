@@ -35,6 +35,10 @@ src/studio_monitor/
   incident_engine.py              durable incidents: OPEN/RESOLVED, ack, snooze, maintenance, escalation claims,
                                   per-destination root message ids (Monitor.dispatch honours suppression + managed mode)
   schedules.py                    IANA-timezone streaming schedule, DST/overnight, missed start
+  hub_client.py / hub_outbox.py / hub_sync.py  agent->hub: httpx client (injectable transport), durable outbox with
+                                  deterministic UUID5 event ids, heartbeat/drain loop; Monitor.dispatch mirrors every event
+src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy), services (framework-free logic),
+                                  delivery (Telegram routes by token_env), app (API + Jinja dashboard); deploy/ has compose
   account.py                      @username discovery: Interactor protocol (Win32Interactor real), perform_lookup,
                                   IdentityStore; Monitor pauses the broadcast engine during the lookup
   target.py / tracker.py          identity validation, rediscovery, RUNNING/DEGRADED/LOST
@@ -77,5 +81,9 @@ src/studio_monitor/
 - Stream-health detectors (Milestone 2): `rules/connection_rules.json` is an unverified seed; YuNet is smoke-tested only
   (loads, no false positive on synthetic frames) — accuracy on real camera framing, the meter reader against Studio's
   real meter and all thresholds are unverified. Presenter conditions are DISABLED without the verified model, never guessed.
+- Hub (Milestone 3) is verified only with the FastAPI TestClient + SQLite + FakeTransport and an httpx MockTransport
+  agent round trip. Not deployed anywhere; PostgreSQL untested; no real network sync. Agent secrets live in the
+  credential store under hub-agent/<device_id>; `cfg.ensure_device_id()` regenerates the id when the install
+  fingerprint changes (copied install) and drops enrollment.
 - Detectors never evaluate when the broadcast is not LIVE; a 'reconnecting' overlay keeps the LIVE episode open (UNKNOWN,
   not NOT_LIVE) so RECONNECTING can be reported.

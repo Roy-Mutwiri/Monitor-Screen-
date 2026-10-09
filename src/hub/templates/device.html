@@ -1,0 +1,15 @@
+{% extends "base.html" %}{% block title %}{{ device.name }} · Studio Monitor Hub{% endblock %}
+{% block content %}
+<h2 style="margin-top:0">{{ device.name }} <span class="pill {{ device.status }}">{{ device.status.replace('_',' ') }}</span></h2>
+<div class="cards">
+  <div class="card"><div class="v">{{ device.live_state or '—' }}</div><div class="k">Broadcast</div></div>
+  <div class="card"><div class="v">{{ device.app_state or '—' }}</div><div class="k">Studio</div></div>
+  <div class="card"><div class="v">{{ device.observed_account or '—' }}</div><div class="k">Account{% if device.expected_account %} (expected {{ device.expected_account }}){% endif %}</div></div>
+  <div class="card"><div class="v">{{ device.mode }}</div><div class="k">Mode</div></div>
+</div>
+<p class="muted">Device <code>{{ device.id }}</code> · host {{ device.hostname or '—' }} · owner {{ device.owner_label or '—' }} · agent {{ device.agent_version or '—' }} · enrolled {{ device.enrolled_utc }} · last heartbeat {{ device.last_heartbeat_utc or 'never' }}</p>
+<h2>Open incidents</h2>
+{% include "_incidents_table.html" %}
+<h2>Recent events</h2>
+{% include "_events_table.html" %}
+{% endblock %}

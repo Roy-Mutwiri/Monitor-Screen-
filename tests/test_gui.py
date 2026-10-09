@@ -82,6 +82,14 @@ def ui(tmp_path, monkeypatch):
             FakeBotDialog.opened.append(bot)
             self.result = None
     monkeypatch.setattr(gui, "BotDialog", FakeBotDialog)
+
+    class FakeEnrollDialog:
+        opened = []
+
+        def __init__(self, parent, url="", mode="standalone"):
+            FakeEnrollDialog.opened.append((url, mode))
+            self.result = None
+    monkeypatch.setattr(gui, "EnrollDialog", FakeEnrollDialog)
     monkeypatch.setattr(gui, "validate_bot", lambda factory, reg, bot_id: {"id": 7, "username": "fake_bot", "first_name": "F"})
     monkeypatch.setattr(gui, "enqueue_test", lambda q, r, c, bot_id: "TEST-1")
     monkeypatch.setattr(gui, "deliver_test_now", lambda q, r, f, eid: "test delivered (fake)")

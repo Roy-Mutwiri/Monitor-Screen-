@@ -12,6 +12,7 @@ import logging
 import secrets
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -36,10 +37,11 @@ from .framecache import FrameCache
 from .health import HealthAlertPolicy, HealthSnapshot
 from .incidents import Incident, IncidentTracker
 from .incident_engine import IncidentEngine
-from .contracts.events import Severity
+from .contracts.events import Event, EvidenceRef, Severity
+from .hub_sync import HubSync
 from .ocr.base import OcrBackend, OcrError
 from .privacy import purge_old_screenshots, redact
-from .queue import KIND_ACTIVITY, KIND_INCIDENT, KIND_STATUS, Delivery, DeliveryError, DeliveryQueue, DeliveryWorker
+from .queue import KIND_ACTIVITY, KIND_INCIDENT, KIND_REMINDER, KIND_STATUS, Delivery, DeliveryError, DeliveryQueue, DeliveryWorker
 from .reminders import EVT_REMINDER_CANCELLED, OfflineReminderEngine, ReminderDue
 from .sessions import EVT_ALREADY_RUNNING, EVT_CLOSED, EVT_OPENED, SessionEvent, StudioSessionTracker
 from .target import related_windows
@@ -89,6 +91,7 @@ class ActivitySnapshot:
     target_hwnd: int = 0
     stream: dict = field(default_factory=dict)      # condition -> {"state", "detail", "since"}
     stream_end_hint: str = ""
+    hub: dict = field(default_factory=dict)         # HubStatus.to_dict() when a hub is configured
 
 
 def _event_id(prefix: str, ts: float) -> str:
@@ -124,7 +127,8 @@ class Monitor:
                  interactor: Optional[Interactor] = None,
                  inline_lookup: bool = False,
                  lookup_sleep: Callable[[float], None] = time.sleep,
-                 detector_suite: Optional[DetectorSuite] = None) -> None:
+                 detector_suite: Optional[DetectorSuite] = None,
+                 hub_sync: Optional[HubSync] = None) -> None:
         self.cfg = cfg
         self.system = system
         self.capturer = capturer                 # dialogs only (PrintWindow, no desktop fallback)
@@ -199,6 +203,10 @@ class Monitor:
         self._blocking_detection = False
         # stream-health detectors (connection / source / presenter / audio), evaluated only while LIVE
         self.detectors: Optional[DetectorSuite] = detector_suite
+        # fleet hub mirror (events -> hub outbox; heartbeats carry the status payload)
+        self.hub_sync: Optional[HubSync] = hub_sync
+        if hub_sync is not None:
+            hub_sync.status_provider = self.hub_status_payload
         self._stream_incidents: dict[str, dict] = {}
         self._stream_end_hint = ""
         self.activity = ActivitySnapshot(live_rules_verified=self.live_rules.verified)
@@ -233,10 +241,11 @@ class Monitor:
         return message_id
 
     def dispatch(self, event_id: str, kind: str, category: str, payload: dict, evidence_path: str,
-                 label: str = "", incident_id: str = "") -> int:
+                 label: str = "", incident_id: str = "", event_type: str = "") -> int:
         """Create one event + one delivery per enabled subscribed bot. Deliveries
         are withheld (the event is still recorded) while the category is
-        suppressed by maintenance or a snooze, or when a hub owns delivery."""
+        suppressed by maintenance or a snooze, or when a hub owns delivery.
+        Every event is also mirrored to the hub outbox when a hub is configured."""
         suppressed = self.incident_engine.is_suppressed(self.device_id, category, incident_id)
         managed = self.cfg.device.mode == "managed"
         targets = [] if (suppressed or managed) else self.registry.targets(category)
@@ -244,8 +253,74 @@ class Monitor:
                                     owner_label=self.cfg.notification_label)
         if suppressed:
             self.on_event(f"{label or event_id}: recorded but not delivered (maintenance/snooze active for {category})")
+        self.mirror_to_hub(event_id, kind, category, payload, evidence_path, label, incident_id, event_type)
         self._kick()
         return n
+
+    # ---- fleet hub ----------------------------------------------------
+    POPUP_EVENT_TYPES = {"restriction_notice": "RESTRICTION", "content_warning": "CONTENT_WARNING",
+                         "account_suspension": "ACCOUNT_SUSPENSION", "live_interruption": "LIVE_INTERRUPTED",
+                         "verification_puzzle": "VERIFICATION"}
+    HUB_NAMESPACE = uuid.UUID("6f1b9b3e-6d55-4a0e-9d2b-0a1b2c3d4e5f")
+
+    def hub_event_id(self, local_event_id: str) -> str:
+        """Deterministic UUID5 of the local event id: re-dispatch -> same id -> hub dedup."""
+        return str(uuid.uuid5(self.HUB_NAMESPACE, f"{self.device_id}:{local_event_id}"))
+
+    @staticmethod
+    def _plain(text: str) -> str:
+        import html as _html
+        import re as _re
+        return _html.unescape(_re.sub(r"<[^>]+>", "", text or "")).strip()
+
+    def _guess_event_type(self, kind: str, category: str, event_id: str, label: str) -> str:
+        if event_id.endswith("-RES"):
+            return "INCIDENT_RESOLVED"
+        if "-E" in event_id.rsplit("-", 1)[-1] and event_id.rsplit("-", 1)[-1][1:].isdigit():
+            return "INCIDENT_ESCALATION"
+        if event_id.startswith("SCH"):
+            return "SCHEDULE_MISSED_START"
+        if event_id.startswith("HLT"):
+            return "HEALTH_RECOVERED" if "recovered" in label.lower() else "HEALTH_DEGRADED"
+        if event_id.startswith("REM"):
+            return "NOT_LIVE_REMINDER"
+        if event_id.startswith("TEST") or category == "test":
+            return "TEST"
+        return {CAT_STUDIO_OPENED: "STUDIO_ALREADY_RUNNING" if "already" in label.lower() else "STUDIO_OPENED",
+                CAT_STUDIO_CLOSED: "STUDIO_CLOSED",
+                CAT_BROADCAST: "BROADCAST_ALREADY_LIVE" if "already" in label.lower() else "BROADCAST_STARTED",
+                CAT_REMINDERS: "NOT_LIVE_REMINDER", CAT_HEALTH: "HEALTH_DEGRADED", CAT_VERIFICATION: "VERIFICATION",
+                CAT_RESTRICTIONS: "RESTRICTION"}.get(category, "TEST")
+
+    def mirror_to_hub(self, event_id: str, kind: str, category: str, payload: dict, evidence_path: str, label: str = "",
+                      incident_id: str = "", event_type: str = "") -> bool:
+        if self.hub_sync is None:
+            return False
+        etype = event_type or self._guess_event_type(kind, category, event_id, label)
+        text = payload.get("text") or payload.get("caption") or label
+        summary = (label + ": " if label and label not in text else "") + self._plain(text).split("\n", 1)[0]
+        attach = bool(evidence_path) and self.cfg.privacy.send_screenshots and self.cfg.hub.upload_evidence
+        evidence = EvidenceRef.from_file(evidence_path, _utc(self.clock())) if attach else EvidenceRef()
+        ev = Event(device_id=self.device_id, type=etype, summary=summary[:1000], event_id=self.hub_event_id(event_id),
+                   session_id=self.sessions.session_id, incident_id=incident_id or (event_id if kind == KIND_INCIDENT else ""),
+                   category=category, observed_utc=_utc(payload.get("created_at") or self.clock()),
+                   owner_label=self.cfg.notification_label, account=self.current_account_handle(),
+                   account_status=self.account.status, expected_account=self.cfg.device.expected_account,
+                   detail={"local_event_id": event_id, "kind": kind, "label": label, "thread_of": payload.get("thread_of", ""),
+                           "mode": self.cfg.device.mode},
+                   evidence=evidence,
+                   payload={k: payload[k] for k in ("text", "caption", "created_at", "thread_of") if k in payload})
+        return self.hub_sync.outbox.enqueue(ev.to_dict(), evidence.path, evidence.sha256)
+
+    def hub_status_payload(self) -> dict:
+        a = self.activity
+        problems = [k for k, v in (a.stream or {}).items() if v.get("state") == "PROBLEM"]
+        return {"live_state": a.live_state, "app_state": a.app_state, "capture": a.health.capture, "ocr": a.health.ocr,
+                "delivery": a.health.delivery, "account": self.current_account_handle(), "account_status": self.account.status,
+                "mode": self.cfg.device.mode, "owner_label": self.cfg.notification_label, "session_id": self.sessions.session_id,
+                "episode_id": self.episodes.state.episode_id, "pending": (a.delivery or {}).get("pending", 0),
+                "stream_problems": problems, "version": __import__("studio_monitor").__version__,
+                "target_title": a.target_title}
 
     def _emit_status(self, status: Status, reason: str) -> None:
         title = self.tracker.state.window.title if self.tracker.state.window else ""
@@ -351,6 +426,8 @@ class Monitor:
         self._update_health(state)
         self._emit_status(self.tracker.state.status, self.tracker.state.reason)
         self._emit_activity()
+        if self.hub_sync is not None and self.hub_sync._thread is None:
+            self.hub_sync.tick()                       # inline mode (tests / --once); production runs a thread
         self._maybe_purge()
         return detections
 
@@ -412,7 +489,8 @@ class Monitor:
         self._stream_incidents[name] = {"incident_id": change.incident.incident_id, "since": since, "event_id": eid}
         if not change.is_new:
             payload["thread_of"] = change.incident.incident_id
-        n = self.dispatch(eid, KIND_INCIDENT, CAT_STREAM, payload, shot, label=f"Stream {name}", incident_id=change.incident.incident_id)
+        n = self.dispatch(eid, KIND_INCIDENT, CAT_STREAM, payload, shot, label=f"Stream {name}", incident_id=change.incident.incident_id,
+                          event_type=name if name in ("FACE_ABSENT", "FACE_MOTION_LOW", "PREVIEW_FROZEN", "SOURCE_MISSING", "BLACK_PREVIEW", "AUDIO_SILENCE") else "BROADCAST_RECONNECTING")
         self.on_event(f"stream health: {name} confirmed -> {eid} queued for {n} bot(s): {detail}")
 
     def _resolve_stream_incident(self, name: str, detail: str, final: bool = False) -> None:
@@ -428,7 +506,7 @@ class Monitor:
                                           label=self.cfg.notification_label)
         payload["thread_of"] = info["incident_id"]
         self.dispatch(f"{info['event_id']}-RES", KIND_INCIDENT, CAT_STREAM, payload, "", label=f"Stream {name} cleared",
-                      incident_id=info["incident_id"])
+                      incident_id=info["incident_id"], event_type="BROADCAST_RECONNECTED" if name == "RECONNECTING" else "INCIDENT_RESOLVED")
         self.on_event(f"stream health: {name} cleared -> {info['event_id']}-RES queued")
 
     def _close_stream_incidents(self, reason: str) -> None:
@@ -466,7 +544,8 @@ class Monitor:
         if inc.alerts_sent > 1:
             payload["thread_of"] = change.incident.incident_id
         n = self.dispatch(event_id, KIND_INCIDENT, category, payload, inc.screenshot_path if attach else "",
-                          label=inc.label, incident_id=change.incident.incident_id)
+                          label=inc.label, incident_id=change.incident.incident_id,
+                          event_type=self.POPUP_EVENT_TYPES.get(inc.category, "RESTRICTION"))
         self.on_event(
             f"{'MANUAL ATTENTION: ' if inc.manual_attention else ''}{inc.label} detected in "
             f"{'dialog' if inc.is_dialog else 'main window'} -> {event_id} queued for {n} bot(s) ({reason})"
@@ -484,7 +563,7 @@ class Monitor:
                    "thread_of": inc.incident_id}
         payload["caption"] = payload["text"]
         self.dispatch(f"{inc.incident_id}-RES", KIND_INCIDENT, incident_category(inc.category), payload, "",
-                      label=f"{inc.label} resolved", incident_id=inc.incident_id)
+                      label=f"{inc.label} resolved", incident_id=inc.incident_id, event_type="INCIDENT_RESOLVED")
         self.on_event(f"incident {inc.incident_id} resolved: {text}")
 
     def _escalate_due(self) -> None:
@@ -497,7 +576,7 @@ class Monitor:
                     f"Reminder {inc.reminders_sent}; open since {inc.opened_utc}. Reply /ack {inc.incident_id} when handled.")
             payload = {"text": text, "caption": text, "created_at": self.clock(), "thread_of": inc.incident_id}
             self.dispatch(f"{inc.incident_id}-E{inc.reminders_sent}", KIND_INCIDENT, inc.category, payload, inc.evidence_path,
-                          label=f"Escalation {inc.reminders_sent}", incident_id=inc.incident_id)
+                          label=f"Escalation {inc.reminders_sent}", incident_id=inc.incident_id, event_type="INCIDENT_ESCALATION")
             self.on_event(f"escalation reminder {inc.reminders_sent} for {inc.incident_id} queued")
 
     def _check_schedule(self, confirmed: LiveState) -> None:
@@ -793,8 +872,11 @@ class Monitor:
         )
         details = {"summary": f"not-live reminder {due.sequence} after {int(due.accumulated_seconds)} s confirmed offline",
                    "sequence": due.sequence, "offline_seconds": due.accumulated_seconds, "screenshot": bool(shot)}
-        n = self.reminders.enqueue_reminder(due, payload, shot, eid, details, self.registry.targets(CAT_REMINDERS),
+        n = self.reminders.enqueue_reminder(due, payload, shot, eid, details,
+                                            [] if self.cfg.device.mode == "managed" else self.registry.targets(CAT_REMINDERS),
                                             CAT_REMINDERS, owner_label=self.cfg.notification_label)
+        self.mirror_to_hub(eid, KIND_REMINDER, CAT_REMINDERS, payload, shot, label=f"Not-live reminder {due.sequence}",
+                           event_type="NOT_LIVE_REMINDER")
         self.on_event(f"TIME TO GO LIVE reminder {due.sequence} -> {eid} queued for {n} bot(s)")
         self._kick()
 
@@ -851,6 +933,7 @@ class Monitor:
             account=self.account_snapshot(),
             capture=self.frames.status(), target_title=self.tracker.identity.title, target_hwnd=self.tracker.identity.hwnd,
             stream=dict(self.activity.stream), stream_end_hint=self._stream_end_hint,
+            hub=self.hub_sync.status.to_dict() if self.hub_sync is not None else {},
         )
         self.on_activity(self.activity)
 
@@ -877,6 +960,8 @@ class Monitor:
         if self.worker and not self.worker.is_alive():
             self.worker.start()
         self.on_event("monitoring started (Studio activity is only observed while the monitor runs)")
+        if self.hub_sync is not None:
+            self.hub_sync.start()
         try:
             while not self._stop.is_set():
                 started = self.clock()
@@ -895,6 +980,8 @@ class Monitor:
                 log.warning("could not persist latest frame")
             if self._owns_frames:
                 self.frames.stop()
+            if self.hub_sync is not None:
+                self.hub_sync.stop()
             self._emit_status(Status.STOPPED, "")
             self.on_event("monitoring stopped")
 

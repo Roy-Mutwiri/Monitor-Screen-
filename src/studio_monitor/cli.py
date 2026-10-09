@@ -469,6 +469,59 @@ def _utf8_console() -> None:
             pass
 
 
+def _hub(cfg: AppConfig, cfg_path: Path, action: str, url: str, code: str, mode: str) -> int:
+    from .app import enroll_agent, make_hub_sync, unenroll_agent
+    from .hub_client import HubClientError
+    if action == "enroll":
+        url = url or cfg.hub.url
+        if not url:
+            print("--url is required (e.g. https://hub.example.org)"); return 2
+        if not code:
+            code = getpass.getpass("Pairing code (single use): ") if sys.stdin.isatty() else sys.stdin.readline().strip()
+        try:
+            res = enroll_agent(cfg, cfg_path, url, code, mode or None)
+        except HubClientError as exc:
+            print(f"enrollment failed: {sanitize(str(exc))}"); return 1
+        print(f"enrolled device {res['device_id']} in workspace {res['workspace_id']} ({res['mode']} mode); "
+              f"heartbeat every {res['heartbeat_interval']} s, unreachable after {res['unreachable_after']} s. "
+              "The agent credential is stored in the Windows Credential Manager.")
+        return 0
+    if action == "unenroll":
+        unenroll_agent(cfg, cfg_path)
+        print("enrollment removed (agent credential deleted; the hub keeps the device record until revoked there)")
+        return 0
+    if not cfg.device.device_id or not cfg.device.install_fingerprint:
+        cfg.ensure_device_id()
+        cfg.save(cfg_path)                      # persist the identity so it stays stable across runs
+    else:
+        cfg.ensure_device_id()
+    h = cfg.hub
+    print(f"device_id: {cfg.device.device_id}  name: {cfg.device.device_name}  mode: {cfg.device.mode}")
+    print(f"hub: {h.url or '(none)'}  enrolled: {h.enrolled}  workspace: {h.workspace_id or '-'}  since: {h.enrolled_utc or '-'}")
+    if not (h.url and h.enrolled):
+        return 0
+    sync = make_hub_sync(cfg, on_event=print)
+    if sync is None:
+        print("agent credential missing from the credential store; run `hub enroll` again"); return 1
+    try:
+        if action == "sync-once":
+            sync.tick()
+        else:
+            try:
+                sync.client.health()
+                print("hub reachable")
+            except HubClientError as exc:
+                print(f"hub not reachable: {sanitize(str(exc))}")
+        c = sync.outbox.counts()
+        print(f"outbox: pending={c['pending']} evidence={c['evidence']} done={c['done']} rejected={c['rejected']} "
+              f"last_error={sync.outbox.last_error() or '-'}")
+        st = sync.status
+        print(f"sync: connected={st.connected} last_error={st.last_error or '-'}")
+    finally:
+        sync.client.close()
+    return 0
+
+
 def _detectors(cfg: AppConfig, action: str, image: str | None, backend: str) -> int:
     """Operator calibration helpers for the stream-health detectors. Never changes settings."""
     from PIL import Image
@@ -540,6 +593,9 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("schedule", help="show or set the streaming schedule")
     p.add_argument("--enable", action="store_true"); p.add_argument("--disable", action="store_true")
     p.add_argument("--tz"); p.add_argument("--days"); p.add_argument("--start"); p.add_argument("--end"); p.add_argument("--grace", type=int)
+    p = sub.add_parser("hub", help="fleet hub: enroll --url URL --code CODE [--mode managed|standalone] | status | unenroll | sync-once")
+    p.add_argument("action", choices=["enroll", "status", "unenroll", "sync-once"])
+    p.add_argument("--url", default=""); p.add_argument("--code", default=""); p.add_argument("--mode", default="")
     p = sub.add_parser("detectors", help="stream-health detectors: status | text IMAGE | face IMAGE | audio IMAGE")
     p.add_argument("action", choices=["status", "text", "face", "audio"]); p.add_argument("image", nargs="?")
     p.add_argument("--backend", default="")
@@ -590,6 +646,8 @@ def main(argv: list[str] | None = None) -> int:
         return _history(cfg, args.kind, args.limit, args.expand)
     if args.cmd == "detectors":
         return _detectors(cfg, args.action, args.image, args.backend)
+    if args.cmd == "hub":
+        return _hub(cfg, cfg_path, args.action, args.url, args.code, args.mode)
     if cmd == "autostart":
         return _autostart(cfg, cfg_path, args.enable, args.disable)
     if cmd == "maintenance":

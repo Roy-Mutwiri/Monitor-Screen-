@@ -162,6 +162,38 @@ and a mode: `standalone` (local Telegram delivery) or `managed` (a hub owns deli
 recorded locally and delivered by the hub, so there are no duplicate notifications). Local bot
 settings are kept in both modes.
 
+## Fleet hub (multi-PC)
+
+`src/hub` is a central FastAPI + SQLAlchemy service (PostgreSQL via `deploy/docker-compose.yml`, SQLite for
+development/tests) that many monitor installations report to. See `deploy/README.md` for setup.
+
+- **Enrollment**: an operator creates a single-use, expiring pairing code (`POST /api/v1/pairing-codes` or
+  `python -m hub pairing-code`); the PC runs `studio-monitor hub enroll --url URL --code CODE --mode managed|standalone`
+  (or Settings → *Enroll with pairing code*). The hub issues a per-device secret (stored hashed with a per-device salt
+  on the hub, and in the Windows Credential Manager under `MonitorScreen/hub-agent/<device_id>` on the PC; never in
+  settings or logs). Re-enrolling rotates the secret; revoking a device invalidates it.
+- **Device identity**: `device.device_id` is a UUID bound to an install fingerprint (machine GUID + Windows user + data
+  dir). A copied installation gets a fresh id and its enrollment is dropped, so it must enroll as a new device.
+- **Events**: every dispatched notification is also written to a durable agent outbox (`hub_outbox` table) as a
+  schema-v1 contract event with a deterministic UUID (so retries deduplicate) and uploaded in batches with exponential
+  backoff; the hub accepts, deduplicates by `event_id`, rejects events for other devices, mirrors incidents
+  (open / occurrence / resolve) and stores redacted evidence after a SHA-256 check. Offline periods lose nothing.
+- **Heartbeats**: every 15 s with live/app/capture state, account and outbox depth. No heartbeat for 90 s →
+  `DEVICE_UNREACHABLE` ("Device unreachable — heartbeat missing for N s"), one incident per outage, resolved by the
+  next heartbeat. Hub-originated events are always routed because the agent cannot report its own absence.
+- **Modes**: `standalone` keeps local Telegram delivery and only mirrors to the hub; `managed` withholds local
+  delivery and the hub routes notifications via **routes** (`POST /api/v1/routes`: workspace, categories, minimum
+  severity, chat id, and the *name* of the environment variable holding the bot token on the hub). Snoozed incidents
+  are not routed; resolutions always are. Tokens never leave the hub.
+- **Dashboard**: `/` devices with status (LIVE / STUDIO OPEN / ONLINE / UNREACHABLE / NEVER SEEN), expected vs
+  observed account with mismatch flag, `/incidents`, `/events`, `/devices/{id}`; optional password login
+  (`HUB_ADMIN_PASSWORD_HASH`) and an admin API token for automation. Remote commands returned with heartbeats are
+  recorded by the agent but not executed in this version.
+
+**Not verified in production**: everything above is validated with the FastAPI test client, SQLite and fake
+Telegram transports. No hub has been deployed (no deployment target is configured), PostgreSQL has not been
+exercised, and no agent has synced across a real network.
+
 ## Stream-health detectors (while LIVE)
 
 `detectors/` evaluates the fresh Studio frame only while the broadcast is confirmed LIVE (or shows a
@@ -471,6 +503,9 @@ src/studio_monitor/
   framecache.py latest valid redacted frame
   broadcast.py  LIVE / NOT_LIVE / UNKNOWN engine
   detectors/    stream-health conditions: text rules, presenter (YuNet), audio meter, suite
+  hub_client.py / hub_outbox.py / hub_sync.py  agent side of the fleet hub (enroll, durable outbox, heartbeats)
+src/hub/        the central hub: FastAPI app, SQLAlchemy models, services, Telegram routing, dashboard templates
+deploy/         Dockerfile, docker-compose.yml (PostgreSQL + hub), .env.example, deployment README
   reminders.py  offline episodes + not-live reminders
   startup.py    start at Windows sign-in (HKCU Run)
   bots.py       bot registry (max 10), subscriptions, fingerprints

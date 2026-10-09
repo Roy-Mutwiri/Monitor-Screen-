@@ -1,0 +1,45 @@
+# Studio Monitor Hub + PostgreSQL. Copy .env.example to .env and fill in the secrets first.
+# This file describes the deployment; nothing is deployed until you run it on your own host.
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: hub
+      POSTGRES_USER: hub
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - hub-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hub -d hub"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  hub:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      HUB_DATABASE_URL: postgresql+psycopg://hub:${POSTGRES_PASSWORD}@db:5432/hub
+      HUB_SECRET_KEY: ${HUB_SECRET_KEY:?set HUB_SECRET_KEY in .env}
+      HUB_ADMIN_PASSWORD_HASH: ${HUB_ADMIN_PASSWORD_HASH:-}
+      HUB_ADMIN_API_TOKEN: ${HUB_ADMIN_API_TOKEN:-}
+      HUB_PUBLIC_URL: ${HUB_PUBLIC_URL:-}
+      HUB_EVIDENCE_DIR: /data/evidence
+      HUB_HEARTBEAT_INTERVAL: ${HUB_HEARTBEAT_INTERVAL:-15}
+      HUB_UNREACHABLE_AFTER: ${HUB_UNREACHABLE_AFTER:-90}
+      # Telegram bot tokens for routes, referenced by variable NAME in each route (token_env). Add as many as you need.
+      HUB_BOT_OPS: ${HUB_BOT_OPS:-}
+    volumes:
+      - hub-evidence:/data/evidence
+    ports:
+      - "${HUB_PORT:-8080}:8080"
+
+volumes:
+  hub-db:
+  hub-evidence:

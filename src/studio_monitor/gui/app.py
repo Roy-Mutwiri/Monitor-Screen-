@@ -27,7 +27,7 @@ from ttkbootstrap import Fonts, Icon, ScrolledFrame, ScrolledText, ToolTip
 
 from .. import SOURCE_LABEL, __version__
 from ..alerts import format_duration
-from ..app import (build_monitor, load_live_rules, load_ruleset, make_capture_service, make_registry, open_queue,
+from ..app import (enroll_agent, build_monitor, load_live_rules, load_ruleset, make_capture_service, make_registry, open_queue,
                    run_migrations, setup_logging)
 from ..bot_tests import deliver_test_now, enqueue_test, validate_bot, validate_token
 from ..bots import EVENT_CATEGORIES, MAX_BOTS, BotError, BotRegistry
@@ -177,6 +177,43 @@ class Tile(tb.Labelframe):
 
 
 # ---------------------------------------------------------------- bot add/edit dialog
+
+class EnrollDialog(simpledialog.Dialog):
+    """Hub URL + single-use pairing code + delivery mode."""
+
+    def __init__(self, parent, url: str = "", mode: str = "standalone"):
+        self.result = None
+        self._url, self._mode = url, mode
+        super().__init__(parent, "Enroll with the fleet hub")
+
+    def body(self, master):
+        tb.Label(master, text="Hub URL").grid(row=0, column=0, sticky="w", pady=4)
+        self.url_var = tk.StringVar(value=self._url)
+        tb.Entry(master, textvariable=self.url_var, width=46).grid(row=0, column=1, pady=4)
+        tb.Label(master, text="Pairing code").grid(row=1, column=0, sticky="w", pady=4)
+        self.code_var = tk.StringVar()
+        e = tb.Entry(master, textvariable=self.code_var, width=46)
+        e.grid(row=1, column=1, pady=4)
+        tb.Label(master, text="Delivery mode").grid(row=2, column=0, sticky="w", pady=4)
+        self.mode_var = tk.StringVar(value=self._mode)
+        tb.Combobox(master, textvariable=self.mode_var, values=["standalone", "managed"], state="readonly", width=20).grid(row=2, column=1, sticky="w", pady=4)
+        tb.Label(master, text="The code is single use and expires. The hub issues this PC a private credential stored in the "
+                              "Windows Credential Manager; it is never written to settings.", wraplength=420, justify="left",
+                 bootstyle="secondary").grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        return e
+
+    def validate(self):
+        if not self.url_var.get().strip().startswith(("http://", "https://")):
+            messagebox.showerror("Hub URL", "Enter the hub URL including http:// or https://", parent=self)
+            return False
+        if len(self.code_var.get().replace("-", "").strip()) < 8:
+            messagebox.showerror("Pairing code", "Enter the pairing code shown by the hub.", parent=self)
+            return False
+        return True
+
+    def apply(self):
+        self.result = (self.url_var.get().strip(), self.code_var.get().strip(), self.mode_var.get())
+
 
 class BotDialog(simpledialog.Dialog):
     """Add or edit a bot. getMe runs off the UI thread; the dialog stays open
@@ -662,6 +699,9 @@ class App:
         self.settings_save_btn.pack(side="right")
         self.settings_revert_btn = tb.Button(head, text="Revert", command=self.refresh_settings, bootstyle="secondary-outline")
         self.settings_revert_btn.pack(side="right", padx=8)
+        self.enroll_btn = tb.Button(head, text="Enroll with pairing code", command=self.enroll_hub, bootstyle="info-outline",
+                                    image=ico("link-45deg"), compound="left")
+        self.enroll_btn.pack(side="right", padx=8)
         self.settings_status = tk.StringVar(value="")
         tb.Label(page, textvariable=self.settings_status, bootstyle="info", font=self.fonts["caption"]).pack(anchor="w", pady=(2, 6))
 
@@ -762,6 +802,16 @@ class App:
                  lambda v: setattr(c.telegram, "delivery_max_age_hours", max(1.0, v)), ""),
                 ("concurrency", "Bots delivered in parallel", "int", lambda: c.telegram.delivery_concurrency,
                  lambda v: setattr(c.telegram, "delivery_concurrency", max(1, min(10, v))), ""),
+            ]),
+            ("Fleet hub", [
+                ("hub_url", "Hub URL", "str", lambda: c.hub.url, lambda v: setattr(c.hub, "url", v.strip().rstrip("/")),
+                 "Central server (https://...). Use 'Enroll with pairing code' after saving; the agent credential is stored in the Credential Manager."),
+                ("hub_mode", "Delivery mode", ("choice", ["standalone", "managed"]), lambda: c.device.mode,
+                 lambda v: setattr(c.device, "mode", v), "managed = the hub sends Telegram notifications; standalone = this PC sends them."),
+                ("hub_hb", "Heartbeat interval (s)", "float", lambda: c.hub.heartbeat_seconds,
+                 lambda v: setattr(c.hub, "heartbeat_seconds", max(5.0, v)), "Hub marks the device unreachable after 90 s without a heartbeat."),
+                ("hub_evidence", "Upload redacted screenshots to the hub", "bool", lambda: c.hub.upload_evidence,
+                 lambda v: setattr(c.hub, "upload_evidence", v), "Only already-redacted evidence; also subject to the privacy screenshot setting."),
             ]),
             ("Device & schedule", [
                 ("device_name", "Device display name", "str", lambda: c.device.device_name, lambda v: setattr(c.device, "device_name", v),
@@ -1297,6 +1347,13 @@ class App:
                       "", "[reminder]",
                       f"episode={a.episode_id or '-'} offline={a.offline_seconds:.0f}s accumulating={a.accumulating} "
                       f"remaining={a.remaining_seconds} sent={a.reminders_sent}"]
+        if a is not None and a.hub:
+            hb = a.hub
+            lines += ["", "[hub]", f"url={self.cfg.hub.url} connected={hb.get('connected')} pending={hb.get('pending')} "
+                      f"evidence_pending={hb.get('evidence_pending')} rejected={hb.get('rejected')} uploaded={hb.get('uploaded_total')} "
+                      f"last_error={hb.get('last_error') or '-'}"]
+        elif self.cfg.hub.url:
+            lines += ["", "[hub]", f"url={self.cfg.hub.url} enrolled={self.cfg.hub.enrolled} (sync starts with monitoring)"]
         counts = self.queue.counts()
         lines += ["", "[outbox]", " ".join(f"{k}={v}" for k, v in counts.items()),
                   f"bots={self.registry.count} enabled={sum(1 for b in self.registry.bots if b.enabled)} "
@@ -1385,6 +1442,23 @@ class App:
         except Exception as exc:  # never kill the UI loop
             self.log_line(f"preview error: {exc}")
         self.root.after(700, self._refresh_preview)
+
+    def enroll_hub(self) -> None:
+        """Pair this PC with the fleet hub. The pairing code is single use; the secret never touches settings."""
+        dlg = EnrollDialog(self.root, self.cfg.hub.url, self.cfg.device.mode)
+        if not dlg.result:
+            return
+        url, code, mode = dlg.result
+        try:
+            res = enroll_agent(self.cfg, self.cfg_path, url, code, mode)
+        except Exception as exc:
+            messagebox.showerror("Enrollment failed", sanitize(str(exc)))
+            self.log_line(f"hub enrollment failed: {sanitize(str(exc))}")
+            return
+        self.refresh_settings()
+        self.log_line(f"enrolled with hub {url} as device {res['device_id']} ({res['mode']} mode); restart monitoring to start syncing")
+        messagebox.showinfo("Enrolled", f"This PC is now enrolled in workspace {res['workspace_id'] or 'default'} "
+                                        f"({res['mode']} mode). Stop and start monitoring to begin heartbeats.")
 
     def _show_stream(self, stream: dict) -> None:
         if not stream:

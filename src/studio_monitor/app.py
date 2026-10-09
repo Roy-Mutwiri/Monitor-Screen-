@@ -152,6 +152,65 @@ def make_detector_suite(cfg: AppConfig, clock=None, mono=None):
     return DetectorSuite(dc, rules, backend, clock or time.time, mono or time.monotonic)
 
 
+def make_hub_sync(cfg: AppConfig, store: Optional[CredentialStore] = None, on_event=None, clock=None, mono=None):
+    """HubSync for an enrolled agent, else None. The secret comes from the credential store only."""
+    import time
+    from .hub_client import HubClient, load_secret
+    from .hub_outbox import HubOutbox
+    from .hub_sync import HubSync
+    if not cfg.hub.url or not cfg.hub.enrolled:
+        return None
+    cfg.ensure_device_id()
+    secret = load_secret(store or default_store(), cfg.device.device_id)
+    if not secret:
+        log.warning("hub enrollment is recorded but no agent credential is stored; run `studio-monitor hub enroll` again")
+        return None
+    client = HubClient(cfg.hub.url, cfg.device.device_id, secret, verify=cfg.hub.verify_tls)
+    outbox = HubOutbox(cfg.db_path, clock or time.time)
+    return HubSync(client, outbox, lambda: {}, heartbeat_seconds=cfg.hub.heartbeat_seconds,
+                   upload_evidence=cfg.hub.upload_evidence, clock=clock or time.time, mono=mono or time.monotonic,
+                   on_event=on_event)
+
+
+def enroll_agent(cfg: AppConfig, cfg_path: Path, url: str, code: str, mode: Optional[str] = None,
+                 store: Optional[CredentialStore] = None, transport=None) -> dict:
+    """Exchange a single-use pairing code for an agent credential, store it in the credential store and
+    record the enrollment in settings. Never logs the secret."""
+    import socket
+    from .hub_client import HubClient, save_secret
+    from .contracts.events import utc_now_iso
+    store = store or default_store()
+    cfg.ensure_device_id()
+    if mode:
+        if mode not in ("standalone", "managed"):
+            raise ValueError("mode must be standalone or managed")
+        cfg.device.mode = mode
+    client = HubClient(url, transport=transport, verify=cfg.hub.verify_tls)
+    try:
+        res = client.enroll(code, cfg.device.device_id, cfg.device.device_name or cfg.machine_label, socket.gethostname(),
+                            cfg.device.mode, cfg.notification_label, cfg.device.expected_account)
+    finally:
+        client.close()
+    save_secret(store, cfg.device.device_id, res.secret)
+    cfg.hub.url, cfg.hub.enrolled, cfg.hub.workspace_id = url.rstrip("/"), True, res.workspace_id
+    cfg.hub.enrolled_utc = utc_now_iso()
+    cfg.hub.heartbeat_seconds = float(res.heartbeat_interval or cfg.hub.heartbeat_seconds)
+    cfg.save(cfg_path)
+    return {"device_id": res.device_id, "workspace_id": res.workspace_id, "heartbeat_interval": res.heartbeat_interval,
+            "unreachable_after": res.unreachable_after, "mode": cfg.device.mode}
+
+
+def unenroll_agent(cfg: AppConfig, cfg_path: Path, store: Optional[CredentialStore] = None) -> None:
+    from .hub_client import clear_secret
+    store = store or default_store()
+    try:
+        clear_secret(store, cfg.device.device_id)
+    except Exception as exc:  # pragma: no cover
+        log.warning("could not remove the agent credential: %s", exc)
+    cfg.hub.enrolled, cfg.hub.workspace_id, cfg.hub.enrolled_utc = False, "", ""
+    cfg.save(cfg_path)
+
+
 def make_capture_service(cfg: AppConfig, system=None):
     from .win32.capture import CaptureService
     from .win32.windows import Win32WindowSystem
@@ -182,5 +241,7 @@ def build_monitor(cfg: AppConfig, cfg_path: Path, registry: Optional[BotRegistry
         log.info(note)
     factory = ClientFactory(cfg.telegram, registry.token_for)
     callbacks.setdefault("detector_suite", make_detector_suite(cfg))
+    if "hub_sync" not in callbacks:
+        callbacks["hub_sync"] = make_hub_sync(cfg, on_event=callbacks.get("on_event"))
     return Monitor(cfg, system, capturer, ocr, rules, queue, registry, factory,
                    live_rules=load_live_rules(cfg), **callbacks)

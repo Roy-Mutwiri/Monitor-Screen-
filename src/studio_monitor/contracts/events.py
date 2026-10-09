@@ -61,6 +61,7 @@ EVENT_TYPES: dict[str, str] = {
     "DEVICE_UNREACHABLE": Severity.WARNING,
     "DEVICE_REACHABLE": Severity.INFO,
     "INCIDENT_RESOLVED": Severity.INFO,
+    "INCIDENT_ESCALATION": Severity.WARNING,
     "TEST": Severity.INFO,
 }
 

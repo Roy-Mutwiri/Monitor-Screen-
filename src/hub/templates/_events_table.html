@@ -1,0 +1,14 @@
+<table>
+  <thead><tr><th>Observed (UTC)</th><th>Type</th><th>Summary</th><th>Device</th><th>Evidence</th></tr></thead>
+  <tbody>
+  {% for e in events %}
+  <tr>
+    <td>{{ e.observed_utc }}{% if e.synthetic %}<br><span class="muted">hub</span>{% endif %}</td>
+    <td><span class="pill {{ e.severity }}">{{ e.type }}</span></td>
+    <td>{{ e.summary }}{% if e.incident_id %}<br><code class="muted">{{ e.incident_id }}</code>{% endif %}</td>
+    <td><a href="/devices/{{ e.device_id }}"><code>{{ e.device_id[:8] }}</code></a></td>
+    <td>{{ 'stored' if e.evidence else '—' }}</td>
+  </tr>
+  {% else %}<tr><td colspan="5" class="muted">No events.</td></tr>{% endfor %}
+  </tbody>
+</table>
