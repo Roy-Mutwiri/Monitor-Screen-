@@ -129,6 +129,7 @@ def test_modal_with_its_own_live_center_and_close_circle_does_not_fool_the_profi
     assert lay.get("top_bar").box[3] < 60                                                              # the bar did not stretch to the modal
     pv = lay.get("program_preview")
     assert pv is not None and pv.confidence < 0.5 and "covered" in pv.detail
+    assert lay.get("presenter_search").confidence < 0.5                                                # no presenter judgement under a modal
 
 
 def test_signature_scopes_by_size_language_and_columns():

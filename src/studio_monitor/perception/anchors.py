@@ -172,6 +172,41 @@ def find_bars(frame: Image.Image, row_band: Box, min_len: int = 40, max_thick: i
     return merged
 
 
+def find_filled_disc(frame: Image.Image, band: Box, size: tuple[int, int] = (14, 46), tol: int = 10) -> tuple[Optional[Box], float]:
+    """A filled, roughly circular blob (the profile avatar) inside ``band``: pixels that differ from the bar colour
+    form compact components; a disc has aspect ~1 and fills ~pi/4 of its box, unlike stroke icons (bell, gear).
+    Prefers the right-most disc. Returns (box, confidence)."""
+    x, y, x2, y2 = band
+    arr = np.asarray(frame.convert("L").crop((x, y, x2, y2)), dtype=np.int16)
+    if arr.size == 0:
+        return None, 0.0
+    bg = int(np.bincount(arr.ravel(), minlength=256).argmax())
+    mask = (np.abs(arr - bg) > tol).astype(np.uint8)
+    comps: list[tuple[int, int, int, int, int]] = []
+    try:
+        import cv2
+        n, _lab, stats, _c = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        for i in range(1, n):
+            cx, cy, cw, ch, area = (int(v) for v in stats[i])
+            comps.append((cx, cy, cw, ch, area))
+    except Exception:
+        return None, 0.0
+    best, best_conf = None, 0.0
+    for cx, cy, cw, ch, area in comps:
+        if not (size[0] <= cw <= size[1] and size[0] <= ch <= size[1]):
+            continue
+        aspect = cw / ch
+        fill = area / float(cw * ch)
+        if 0.75 <= aspect <= 1.33 and 0.6 <= fill <= 0.92:
+            conf = 0.8 - abs(fill - 0.785) - abs(aspect - 1.0) * 0.3
+            if best is None or cx > best[0]:                   # right-most disc on the title row
+                best, best_conf = (cx, cy, cw, ch), max(0.5, conf)
+    if best is None:
+        return None, 0.0
+    cx, cy, cw, ch = best
+    return (x + cx, y + cy, x + cx + cw, y + cy + ch), round(min(1.0, best_conf), 2)
+
+
 def find_avatar_circle(frame: Image.Image, band: Box, radius: tuple[int, int] = (8, 22)) -> tuple[Optional[Box], float]:
     """A small circular control (profile avatar) inside ``band``. Uses cv2 Hough circles when available, else a
     contrast-blob fallback. Returns (box, confidence)."""

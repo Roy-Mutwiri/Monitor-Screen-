@@ -28,7 +28,7 @@ from typing import Any, Callable, Iterable, Optional
 
 from PIL import Image
 
-from .anchors import LIVE_TIMER_RE, content_rect, find_avatar_circle, find_bars, find_colored_button, grow_panel, refine_band
+from .anchors import LIVE_TIMER_RE, content_rect, find_avatar_circle, find_bars, find_colored_button, find_filled_disc, grow_panel, refine_band
 from .clusters import TextBlock, dialog_candidates, group_blocks
 from .ocr_boxes import OcrBox, boxes_in, find_text
 from .uia import UiaElement
@@ -280,12 +280,18 @@ def discover_layout(frame: Image.Image, boxes: list[OcrBox], uia: list[UiaElemen
     lc_text = find_text(top_boxes, "live center")
     px0 = (lc_text.x2 + 8) if lc_text else int(w * 0.75)
     row_y0, row_y1 = (lc_text.y - 10, lc_text.y2 + 10) if lc_text else (2, top_bar_bottom)
-    pbox, pconf = find_avatar_circle(frame, (px0, max(0, row_y0), w - 120, min(top_bar_bottom, row_y1)))
+    pband = (px0, max(0, row_y0), w - 120, min(top_bar_bottom, row_y1))
+    pbox, pconf = find_filled_disc(frame, pband)                              # a filled avatar disc beats stroke icons
+    pdetail = "filled disc (avatar) on the title row"
+    if not pbox:
+        pbox, pconf = find_avatar_circle(frame, pband)
+        pconf = min(pconf, 0.5)                                                # ring/stroke circles (bell, gear) stay below the click threshold
+        pdetail = "circular outline in the top bar (low confidence)"
     if pbox:
         cy = (pbox[1] + pbox[3]) / 2
         if lc_text and abs(cy - lc_text.cy) > max(8, lc_text.h):
             pconf *= 0.5                                                       # not on the title row: doubtful
-        put("profile_control", pbox, pconf * (1.0 if lc_text else 0.8), "visual", "circular control in the top bar")
+        put("profile_control", pbox, pconf * (1.0 if lc_text else 0.8), "visual", pdetail)
     else:
         notes.append("profile control not located (no circular control found in the top bar)")
 
@@ -308,6 +314,9 @@ def discover_layout(frame: Image.Image, boxes: list[OcrBox], uia: list[UiaElemen
             if t.type == "dialog" and (ix2 - ix) > 0 and (iy2 - iy) > 0 and (ix2 - ix) * (iy2 - iy) > 0.1 * area:
                 pv.confidence = round(pv.confidence * 0.5, 2)
                 pv.detail += f"; partly covered by a {t.type}"
+                ps = lay.get("presenter_search")
+                if ps is not None:
+                    ps.confidence, ps.detail = pv.confidence, ps.detail + f"; covered by a {t.type}: presenter not evaluated"
                 notes.append(f"program preview partly covered by a {t.type}; presenter evaluation paused until it closes")
                 break
 
