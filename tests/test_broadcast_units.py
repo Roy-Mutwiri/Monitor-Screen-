@@ -113,7 +113,7 @@ def test_startup_registry_toggle():
     assert "studio_monitor" in launch_command() or ".exe" in launch_command()
 
 
-def test_queue_migration_adds_kind_column(tmp_path):
+def test_queue_schema_migration_from_v1_db(tmp_path):
     db = tmp_path / "old.sqlite3"
     conn = sqlite3.connect(db)
     conn.execute("CREATE TABLE alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id TEXT NOT NULL, payload TEXT NOT NULL, "
@@ -122,24 +122,22 @@ def test_queue_migration_adds_kind_column(tmp_path):
     conn.execute("INSERT INTO alerts (incident_id, payload, created_at) VALUES ('INC-1', '{\"text\":\"x\"}', 1)")
     conn.commit(); conn.close()
     q = DeliveryQueue(db)
-    item = q.next_due()
-    assert item.kind == "incident" and item.incident_id == "INC-1"
-    assert q.counts_by_kind() == {"incident": 1}
+    assert q.legacy_pending_count() == 1 and q.get_state("schema_version") == 3
+    from studio_monitor.bots import BotTarget
+    done = q.migrate_legacy_alerts(BotTarget("b", "Default Bot", "42", None))
+    assert done == {"pending": 1, "history": 0}
+    d = q.due_deliveries()[0]
+    assert d.event_id == "INC-1" and d.kind == "incident" and d.chat_id == "42"
+    assert q.legacy_pending_count() == 0 and q.migrate_legacy_alerts(None) == {"pending": 0, "history": 0}
 
 
-def test_queue_cancel_and_transaction(tmp_path):
+def test_queue_cancel_event_and_history_tables(tmp_path):
+    from studio_monitor.bots import BotTarget
     q = DeliveryQueue(tmp_path / "q.sqlite3")
-    a = q.enqueue("R", {"text": "r"}, "", kind="reminder")
-    assert q.cancel(a, "went live") and q.alert_status(a) == "cancelled"
-    assert not q.cancel(a, "again")
-    assert q.counts()["cancelled"] == 1 and q.next_due() is None
-    with pytest.raises(RuntimeError):
-        with q.transaction() as conn:
-            conn.execute("INSERT INTO alerts (incident_id, payload, created_at, kind) VALUES ('X','{}',1,'reminder')")
-            raise RuntimeError("boom")
-    assert q.counts()["pending"] == 0           # rolled back
-    q.set_state("k", {"a": 1})
-    assert q.get_state("k") == {"a": 1} and q.get_state("missing", 5) == 5
+    q.create_event("R1", "reminder", "reminders", {"text": "r"}, "", [BotTarget("b", "B", "1", None)])
+    assert q.event_has_pending("R1") and q.cancel_event("R1", "went live") == 1
+    assert not q.event_has_pending("R1") and q.deliveries_for("R1")[0].status == "cancelled"
+    assert q.counts()["cancelled"] == 1 and q.due_deliveries() == []
     q.record_event("E1", "STUDIO_OPENED", "2026-10-09T10:00:00+00:00", {"summary": "s"})
     q.record_event("E2", "NOT_LIVE_REMINDER", "2026-10-09T11:00:00+00:00", {"summary": "r"})
     assert [e["event_id"] for e in q.recent_events(event_types=["NOT_LIVE_REMINDER"])] == ["E2"]

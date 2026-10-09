@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from conftest import FakeCapturer, FakeClock, FakeOcr, FakeWindowSystem, make_window
+from conftest import TOKEN_A, FakeCapturer, FakeClock, FakeOcr, FakeWindowSystem, all_deliveries, make_window
 
 from studio_monitor.alerts import local_ts
 from studio_monitor.broadcast import LiveRules, LiveState
@@ -34,8 +34,13 @@ class Harness:
         self.ocr = FakeOcr()
         self.ocr.default = NOT_LIVE_TEXT
         self.queue = queue or DeliveryQueue(cfg.db_path, clock=clock)
+        from studio_monitor.bots import BotRegistry
+        from studio_monitor.credentials import MemoryCredentialStore
+        self.registry = BotRegistry(cfg, MemoryCredentialStore(), save=lambda: None, queue=self.queue)
+        if not cfg.bots:
+            self.registry.add("Default Bot", TOKEN_A, "42")
         self.events, self.statuses, self.activity = [], [], []
-        self.mon = Monitor(cfg, self.sys, self.cap, self.ocr, rules, self.queue, None, clock,
+        self.mon = Monitor(cfg, self.sys, self.cap, self.ocr, rules, self.queue, self.registry, None, clock,
                            on_event=self.events.append, on_status=self.statuses.append,
                            live_rules=LiveRules.load(RULES), mono=clock, on_activity=self.activity.append)
 
@@ -49,11 +54,7 @@ class Harness:
         return [a for a in self._all_alerts() if a["kind"] == kind]
 
     def _all_alerts(self):
-        import json
-        rows = self.queue._conn.execute(
-            "SELECT id, incident_id, payload, screenshot_path, status, kind, last_error FROM alerts ORDER BY id").fetchall()
-        return [dict(id=r[0], incident_id=r[1], payload=json.loads(r[2]), screenshot_path=r[3], status=r[4], kind=r[5],
-                     last_error=r[6]) for r in rows]
+        return all_deliveries(self.queue)
 
     def event_types(self):
         return [e["event_type"] for e in reversed(self.queue.recent_events(100))]
@@ -353,8 +354,9 @@ def test_restriction_and_activity_are_independent(h):
     h.run(30)
     assert len(h.alerts("incident")) == 1 and len(h.alerts("activity")) == 2
     hist = h.queue.history(kind="activity")
-    assert all(x["kind"] == "activity" for x in hist) and len(hist) == 2
-    assert len(h.queue.history(kind="incident")) == 1 and len(h.queue.history(kind="all")) == 3
+    assert all(x["kind"] != "incident" for x in hist) and sum(x["kind"] == "activity" for x in hist) == 2
+    assert len(h.queue.history(kind="incident")) == 1 and len(h.queue.history(kind="all")) == len(hist) + 1
+    assert all("Delivered to" in x["detail"] for x in h.queue.history(kind="all"))
 
 
 def test_privacy_masks_apply_to_all_activity_screenshots(cfg, rules, clock):
@@ -404,5 +406,5 @@ def test_settings_persist_and_migrate(tmp_path):
     c.save(p)
     back = AppConfig.load(p)
     assert back.activity.offline_threshold_minutes == 45 and back.activity.repeat_enabled
-    assert back.live_regions == c.regions and back.config_version == 2
+    assert back.live_regions == c.regions and back.config_version == 3
     assert AppConfig.from_dict({"activity": {"bogus": 1, "notify_opened": False}}).activity.notify_opened is False

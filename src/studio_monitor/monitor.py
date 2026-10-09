@@ -3,6 +3,8 @@ match rules, de-duplicate, and queue Telegram alerts.
 
 Also drives the Studio activity features: application session (opened /
 closed), latest-frame cache, broadcast-state engine and not-live reminders.
+Every notification becomes one event with immutable redacted evidence and one
+delivery per enabled, subscribed bot (see :mod:`queue`).
 """
 from __future__ import annotations
 
@@ -17,6 +19,8 @@ from typing import Callable, Optional
 
 from .alerts import (format_alert, format_not_live_reminder, format_status_alert, format_studio_already_running,
                      format_studio_closed, format_studio_opened)
+from .bots import (CAT_HEALTH, CAT_REMINDERS, CAT_RESTRICTIONS, CAT_STUDIO_CLOSED, CAT_STUDIO_OPENED,
+                   CAT_VERIFICATION, BotRegistry)
 from .broadcast import BroadcastStateEngine, Classification, LiveRules, LiveState
 from .config import AppConfig, TargetIdentity
 from .detection.detector import Detection, Detector
@@ -25,10 +29,11 @@ from .framecache import FrameCache
 from .incidents import Incident, IncidentTracker
 from .ocr.base import OcrBackend
 from .privacy import purge_old_screenshots, redact
-from .queue import KIND_ACTIVITY, DeliveryQueue, DeliveryWorker
+from .queue import KIND_ACTIVITY, KIND_INCIDENT, KIND_STATUS, Delivery, DeliveryError, DeliveryQueue, DeliveryWorker
 from .reminders import EVT_REMINDER_CANCELLED, OfflineReminderEngine, ReminderDue
 from .sessions import EVT_ALREADY_RUNNING, EVT_CLOSED, EVT_OPENED, SessionEvent, StudioSessionTracker
 from .target import related_windows
+from .telegram import ClientFactory, deliver
 from .tracker import Status, WindowTracker
 from .win32.capture import Capture, Capturer
 from .win32.windows import WindowSystem
@@ -67,9 +72,14 @@ def _event_id(prefix: str, ts: float) -> str:
     return f"{prefix}-{datetime.fromtimestamp(ts):%Y%m%d-%H%M%S}-{secrets.token_hex(2).upper()}"
 
 
+def incident_category(popup_category: str) -> str:
+    return CAT_VERIFICATION if popup_category == "verification_puzzle" else CAT_RESTRICTIONS
+
+
 class Monitor:
     def __init__(self, cfg: AppConfig, system: WindowSystem, capturer: Capturer, ocr: OcrBackend,
-                 rules: RuleSet, queue: DeliveryQueue, sender: Optional[Callable[[dict, str], None]] = None,
+                 rules: RuleSet, queue: DeliveryQueue, registry: BotRegistry,
+                 client_factory: Optional[ClientFactory] = None,
                  clock: Callable[[], float] = time.time,
                  on_event: Optional[Callable[[str], None]] = None,
                  on_status: Optional[Callable[[StatusUpdate], None]] = None,
@@ -83,6 +93,8 @@ class Monitor:
         self.system = system
         self.capturer = capturer
         self.queue = queue
+        self.registry = registry
+        self.client_factory = client_factory
         self.clock = clock
         self.mono = mono
         self.on_event = on_event or (lambda msg: log.info(msg))
@@ -115,8 +127,10 @@ class Monitor:
             enabled=act.reminders_enabled, clock=clock, mono=mono,
         )
         self.worker: Optional[DeliveryWorker] = None
-        if sender is not None:
-            self.worker = DeliveryWorker(queue, sender, on_event=self.on_event)
+        if client_factory is not None:
+            self.worker = DeliveryWorker(queue, self.send_delivery, cfg.telegram.delivery_concurrency,
+                                         on_event=self.on_event)
+            registry.listeners.append(self._registry_changed)
         self._stop = threading.Event()
         self._last_status: tuple[Status, str] = (Status.STOPPED, "")
         self._last_purge = 0.0
@@ -129,15 +143,38 @@ class Monitor:
         if self._on_identity_change:
             self._on_identity_change(identity)
 
+    def _registry_changed(self, action: str, bot_id: str) -> None:
+        if self.client_factory is not None and action in ("token", "removed"):
+            self.client_factory.invalidate(bot_id)
+        self._kick()
+
+    def send_delivery(self, d: Delivery) -> Optional[int]:
+        """Worker callback: send one delivery with that bot's own token/destination."""
+        assert self.client_factory is not None
+        client = self.client_factory.client(d.bot_id, d.chat_id, d.thread_id)
+        if client is None:
+            raise DeliveryError("bot token not available in the credential store", permanent=True)
+        result = deliver(client, d.payload, d.evidence_path, self.clock)
+        return result.get("message_id") if isinstance(result, dict) else None
+
+    def dispatch(self, event_id: str, kind: str, category: str, payload: dict, evidence_path: str,
+                 label: str = "") -> int:
+        """Create one event + one delivery per enabled subscribed bot."""
+        targets = self.registry.targets(category)
+        n = self.queue.create_event(event_id, kind, category, payload, evidence_path, targets, label)
+        self._kick()
+        return n
+
     def _emit_status(self, status: Status, reason: str) -> None:
         title = self.tracker.state.window.title if self.tracker.state.window else ""
         self.on_status(StatusUpdate(status, reason, title, self.queue.counts()))
         if (status, reason) != self._last_status:
             self._last_status = (status, reason)
-            if self.cfg.telegram.notify_status_changes and status in (Status.LOST, Status.DEGRADED, Status.RUNNING):
+            if status in (Status.LOST, Status.DEGRADED, Status.RUNNING) and self.registry.targets(CAT_HEALTH):
                 text = format_status_alert(status.value, reason, self.cfg.machine_label, self.clock())
-                self.queue.enqueue("STATUS", {"text": text, "caption": text}, "", kind="status")
-                self._kick()
+                self.dispatch(_event_id("HLT", self.clock()), KIND_STATUS, CAT_HEALTH,
+                              {"text": text, "caption": text, "created_at": self.clock()}, "",
+                              label=f"Monitor {status.value}")
 
     def _kick(self) -> None:
         if self.worker:
@@ -235,12 +272,13 @@ class Monitor:
         stored_text = inc.text if self.cfg.privacy.store_detected_text else ""
         self.queue.record_incident(inc.incident_id, inc.category, inc.label, stored_text,
                                    inc.window_title, inc.is_dialog, inc.screenshot_path)
-        self.queue.enqueue(inc.incident_id, payload, inc.screenshot_path if attach else "")
+        event_id = inc.incident_id if inc.alerts_sent <= 1 else f"{inc.incident_id}-R{inc.alerts_sent}"
+        n = self.dispatch(event_id, KIND_INCIDENT, incident_category(inc.category), payload,
+                          inc.screenshot_path if attach else "", label=inc.label)
         self.on_event(
             f"{'MANUAL ATTENTION: ' if inc.manual_attention else ''}{inc.label} detected in "
-            f"{'dialog' if inc.is_dialog else 'main window'} -> {inc.incident_id} queued ({reason})"
+            f"{'dialog' if inc.is_dialog else 'main window'} -> {event_id} queued for {n} bot(s) ({reason})"
         )
-        self._kick()
 
     # ---- sessions ----------------------------------------------------
     def _update_sessions(self, window_present: bool, screenshot_ok: bool) -> None:
@@ -261,7 +299,7 @@ class Monitor:
         act = self.cfg.activity
         eid = _event_id("EVT", ev.ts)
         if ev.type == EVT_OPENED:
-            summary = "Studio opened"
+            summary, category = "Studio opened", CAT_STUDIO_OPENED
             if not act.notify_opened:
                 self.queue.record_event(eid, ev.type, ev.ts_utc, {"summary": summary, "notified": False}, ev.session_id)
                 self.on_event(f"{summary} (session {ev.session_id}); notification disabled")
@@ -270,12 +308,12 @@ class Monitor:
             shot = self._activity_shot(eid, frame)
             payload = format_studio_opened(self.cfg.machine_label, ev.ts, bool(shot), act.open_screenshot_timeout_seconds)
         elif ev.type == EVT_ALREADY_RUNNING:
-            summary = "Studio already running at monitor start"
+            summary, category = "Studio already running at monitor start", CAT_STUDIO_OPENED
             frame = self.frame_cache.fresh(act.fresh_screenshot_max_age_seconds) if ev.screenshot_available else None
             shot = self._activity_shot(eid, frame)
             payload = format_studio_already_running(self.cfg.machine_label, ev.ts, bool(shot))
         elif ev.type == EVT_CLOSED:
-            summary = f"Studio closed ({ev.note})"
+            summary, category = f"Studio closed ({ev.note})", CAT_STUDIO_CLOSED
             if not act.notify_closed:
                 self.queue.record_event(eid, ev.type, ev.ts_utc, {"summary": summary, "notified": False}, ev.session_id)
                 self.on_event(f"{summary}; notification disabled")
@@ -285,12 +323,11 @@ class Monitor:
             payload = format_studio_closed(self.cfg.machine_label, ev.ts, frame.captured_at if shot else None)
         else:  # pragma: no cover
             return
-        alert_id = self.queue.enqueue(eid, payload, shot, kind=KIND_ACTIVITY)
+        n = self.dispatch(eid, KIND_ACTIVITY, category, payload, shot, label=summary)
         self.queue.record_event(eid, ev.type, ev.ts_utc,
-                                {"summary": summary, "notified": True, "screenshot": bool(shot), "note": ev.note},
-                                ev.session_id, "", shot, alert_id)
-        self.on_event(f"{summary} -> {eid} queued{'' if shot else ' (text only)'}")
-        self._kick()
+                                {"summary": summary, "notified": True, "screenshot": bool(shot), "note": ev.note,
+                                 "bots": n}, ev.session_id, "", shot, None)
+        self.on_event(f"{summary} -> {eid} queued for {n} bot(s){'' if shot else ' (text only)'}")
 
     # ---- broadcast state + reminders ---------------------------------
     def _classify_live(self, cap: Capture, full_text: Optional[str]) -> Classification:
@@ -311,11 +348,11 @@ class Monitor:
         out = self.reminders.update(session is not None, session.pid if session else 0, cs.state, cs.fresh)
         if out.episode_started:
             self.on_event(f"offline episode {self.reminders.state.episode_id} started (confirmed NOT_LIVE)")
-        for alert_id, reason in out.cancelled:
+        for event_id, reason in out.cancelled:
             eid = _event_id("EVT", self.clock())
             self.queue.record_event(eid, EVT_REMINDER_CANCELLED, _utc(self.clock()),
-                                    {"summary": f"reminder cancelled: {reason}", "alert_id": alert_id})
-            self.on_event(f"pending not-live reminder (alert {alert_id}) cancelled: {reason}")
+                                    {"summary": f"reminder cancelled: {reason}", "event_id": event_id})
+            self.on_event(f"pending not-live reminder {event_id} cancelled: {reason}")
         if out.episode_ended and not out.episode_started:
             self.on_event(f"offline episode ended: {out.episode_ended}")
         if out.due is not None:
@@ -333,8 +370,9 @@ class Monitor:
         )
         details = {"summary": f"not-live reminder {due.sequence} after {int(due.accumulated_seconds)} s confirmed offline",
                    "sequence": due.sequence, "offline_seconds": due.accumulated_seconds, "screenshot": bool(shot)}
-        alert_id = self.reminders.enqueue_reminder(due, payload, shot, eid, details)
-        self.on_event(f"TIME TO GO LIVE reminder {due.sequence} -> {eid} queued (alert {alert_id})")
+        n = self.reminders.enqueue_reminder(due, payload, shot, eid, details, self.registry.targets(CAT_REMINDERS),
+                                            CAT_REMINDERS)
+        self.on_event(f"TIME TO GO LIVE reminder {due.sequence} -> {eid} queued for {n} bot(s)")
         self._kick()
 
     def _emit_activity(self) -> None:
@@ -357,8 +395,12 @@ class Monitor:
         if now - self._last_purge < 3600:
             return
         self._last_purge = now
-        removed = purge_old_screenshots(self.cfg.screenshots_dir, self.cfg.privacy, now)
-        removed += purge_old_screenshots(self.cfg.activity_screenshots_dir, self.cfg.privacy, now)
+        dead = self.queue.expire_stale(self.cfg.telegram.delivery_max_age_hours * 3600)
+        if dead:
+            self.on_event(f"{dead} delivery(ies) dead-lettered after {self.cfg.telegram.delivery_max_age_hours:g} h")
+        keep = self.queue.evidence_in_use()   # evidence stays while any delivery still needs it
+        removed = purge_old_screenshots(self.cfg.screenshots_dir, self.cfg.privacy, now, keep)
+        removed += purge_old_screenshots(self.cfg.activity_screenshots_dir, self.cfg.privacy, now, keep)
         if self.frame_cache.purge(self.cfg.privacy.screenshot_retention_days, now):
             removed += 1
         self.queue.purge_sent(30 * 86400)
@@ -394,6 +436,10 @@ class Monitor:
         self._stop.set()
         if self.worker:
             self.worker.stop()
+        try:
+            self.registry.listeners.remove(self._registry_changed)
+        except ValueError:
+            pass
 
     def start_background(self) -> threading.Thread:
         thread = threading.Thread(target=self.run, name="studio-monitor", daemon=True)

@@ -42,15 +42,20 @@ def mask_secret(value: str, keep: int = 4) -> str:
     return "*" * (len(value) - keep) + value[-keep:]
 
 
-def purge_old_screenshots(directory: Path, cfg: PrivacyConfig, now: float | None = None) -> int:
-    """Delete screenshots older than the retention window. Returns count removed."""
+def purge_old_screenshots(directory: Path, cfg: PrivacyConfig, now: float | None = None,
+                          keep: set[str] | None = None) -> int:
+    """Delete screenshots older than the retention window, except paths in
+    ``keep`` (evidence a pending delivery still needs). Returns count removed."""
     if cfg.screenshot_retention_days <= 0 or not directory.exists():
         return 0
     now = time.time() if now is None else now
     cutoff = now - cfg.screenshot_retention_days * 86400
+    keep_norm = {str(Path(p).resolve()) for p in (keep or ())}
     removed = 0
     for path in directory.glob("*.png"):
         try:
+            if str(path.resolve()) in keep_norm:
+                continue
             if path.stat().st_mtime < cutoff:
                 path.unlink()
                 removed += 1

@@ -11,18 +11,20 @@ Semantics (also documented in README):
   (monotonic clock). Larger gaps (sleep, lock, UNKNOWN, capture loss, monitor
   downtime) contribute nothing; accumulation resumes after the next fresh
   NOT_LIVE confirmation. UNKNOWN never counts.
-* When accumulated time reaches the threshold, one reminder is enqueued in the
-  same SQLite transaction that marks it queued, so a crash or restart cannot
-  produce a duplicate. Optional repeats fire every ``repeat_interval`` of
-  *additional* confirmed offline time, up to ``repeat_max``.
-* A reminder still pending in the outbox when the episode ends (LIVE confirmed
-  or Studio closed) is cancelled and the reason recorded.
-* State (episode id, accumulated seconds, reminders sent, pending alert id,
+* When accumulated time reaches the threshold, one reminder event (with one
+  delivery per subscribed bot) is created in the same SQLite transaction that
+  marks it queued, so a crash or restart cannot produce a duplicate. Optional
+  repeats fire every ``repeat_interval`` of *additional* confirmed offline
+  time, up to ``repeat_max``.
+* A reminder whose deliveries are still pending when the episode ends (LIVE
+  confirmed or Studio closed) is cancelled and the reason recorded.
+* State (episode id, accumulated seconds, reminders sent, pending event id,
   session pid) is persisted so a monitor restart continues the episode without
   counting downtime and without re-sending a reminder.
 """
 from __future__ import annotations
 
+import json
 import secrets
 import time
 from dataclasses import dataclass, field, asdict
@@ -47,7 +49,7 @@ class ReminderState:
     session_pid: int = 0
     accumulated_seconds: float = 0.0
     reminders_sent: int = 0
-    pending_alert_id: Optional[int] = None
+    pending_event_id: str = ""
     episode_started_utc: str = ""
     last_confirmed_utc: str = ""
     last_reminder_utc: str = ""
@@ -68,7 +70,7 @@ class ReminderDue:
 @dataclass
 class EngineOutput:
     due: Optional[ReminderDue] = None
-    cancelled: list[tuple[int, str]] = field(default_factory=list)   # (alert_id, reason)
+    cancelled: list[tuple[str, str]] = field(default_factory=list)   # (event_id, reason)
     episode_started: bool = False
     episode_ended: str = ""
 
@@ -87,30 +89,23 @@ class OfflineReminderEngine:
         self.enabled = enabled
         self.clock = clock
         self.mono = mono
-        self.state = ReminderState(**{k: v for k, v in (queue.get_state(STATE_KEY) or {}).items()
-                                      if k in ReminderState.__dataclass_fields__})
+        raw = queue.get_state(STATE_KEY) or {}
+        raw.pop("pending_alert_id", None)   # pre-multi-bot field
+        self.state = ReminderState(**{k: v for k, v in raw.items() if k in ReminderState.__dataclass_fields__})
         self._last_counted_mono: Optional[float] = None   # None -> need a fresh confirmation first
         self._prev_live: Optional[LiveState] = None
 
     # ------------------------------------------------------------------
     def _persist(self, conn=None) -> None:
-        if conn is None:
-            self.queue.set_state(STATE_KEY, asdict(self.state))
-        else:
-            import json
-            conn.execute(
-                "INSERT INTO kv_state(key, value, updated_at) VALUES (?,?,?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                (STATE_KEY, json.dumps(asdict(self.state)), self.clock()),
-            )
+        self.queue.set_state(STATE_KEY, asdict(self.state), conn)
 
     def _end_episode(self, reason: str, out: EngineOutput) -> None:
         st = self.state
         if not st.active:
             return
-        if st.pending_alert_id is not None and self.queue.alert_status(st.pending_alert_id) == "pending":
-            if self.queue.cancel(st.pending_alert_id, reason):
-                out.cancelled.append((st.pending_alert_id, reason))
+        if st.pending_event_id and self.queue.event_has_pending(st.pending_event_id):
+            if self.queue.cancel_event(st.pending_event_id, reason):
+                out.cancelled.append((st.pending_event_id, reason))
         out.episode_ended = reason
         self.state = ReminderState(last_cancel_reason=reason if out.cancelled else "")
         self._last_counted_mono = None
@@ -200,26 +195,23 @@ class OfflineReminderEngine:
         return None
 
     def enqueue_reminder(self, due: ReminderDue, payload: dict, screenshot_path: str, event_id: str,
-                         details: dict) -> int:
-        """Atomically enqueue the reminder, record the event and mark it queued."""
-        import json
+                         details: dict, targets: list, category: str) -> int:
+        """Atomically create the reminder event + per-bot deliveries, record the
+        history row and mark the reminder as queued. Returns deliveries created."""
         st = self.state
         with self.queue.transaction() as conn:
-            cur = conn.execute(
-                "INSERT INTO alerts (incident_id, payload, screenshot_path, created_at, kind) VALUES (?,?,?,?,?)",
-                (event_id, json.dumps(payload), screenshot_path, self.clock(), KIND_REMINDER),
-            )
-            alert_id = int(cur.lastrowid)
+            n = self.queue.create_event(event_id, KIND_REMINDER, category, payload, screenshot_path, targets,
+                                        label=f"Not-live reminder {due.sequence}", conn=conn)
             st.reminders_sent = due.sequence
-            st.pending_alert_id = alert_id
+            st.pending_event_id = event_id
             st.last_reminder_utc = _utc(self.clock())
             conn.execute(
                 "INSERT OR REPLACE INTO activity_events VALUES (?,?,?,?,?,?,?,?,?)",
                 (event_id, EVT_REMINDER, "", due.episode_id, st.last_reminder_utc, json.dumps(details),
-                 screenshot_path, alert_id, self.clock()),
+                 screenshot_path, None, self.clock()),
             )
             self._persist(conn)
-        return alert_id
+        return n
 
     # -- GUI helpers ------------------------------------------------------
     def remaining_seconds(self) -> Optional[float]:

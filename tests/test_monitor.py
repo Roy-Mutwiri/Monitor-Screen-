@@ -1,7 +1,7 @@
 """End-to-end loop with fakes: capture -> OCR -> rules -> dedup -> queue."""
 from pathlib import Path
 
-from conftest import FakeCapturer, FakeOcr, FakeWindowSystem, make_window
+from conftest import FakeCapturer, FakeOcr, FakeWindowSystem, all_deliveries, make_window
 
 from studio_monitor import SOURCE_LABEL
 from studio_monitor.monitor import Monitor
@@ -14,16 +14,26 @@ MAIN_SIZE = (1280, 720)
 DIALOG_SIZE = (500, 300)
 
 
-def build(cfg, rules, clock, sender=None):
+def build(cfg, rules, clock, registry=None):
+    from conftest import TOKEN_A
+    from studio_monitor.bots import BotRegistry
+    from studio_monitor.credentials import MemoryCredentialStore
     sys_ = FakeWindowSystem()
     sys_.add(make_window())
     cap = FakeCapturer()
     ocr = FakeOcr()
     queue = DeliveryQueue(cfg.db_path, clock=clock)
+    if registry is None:
+        registry = BotRegistry(cfg, MemoryCredentialStore(), save=lambda: None, queue=queue)
+        registry.add("Default Bot", TOKEN_A, "42")
     events, statuses = [], []
-    mon = Monitor(cfg, sys_, cap, ocr, rules, queue, sender, clock,
-                  on_event=events.append, on_status=statuses.append)
+    mon = Monitor(cfg, sys_, cap, ocr, rules, queue, registry, None, clock,
+                  on_event=events.append, on_status=statuses.append, mono=clock)
     return mon, sys_, cap, ocr, queue, events, statuses
+
+
+def first_incident(queue):
+    return [d for d in all_deliveries(queue) if d["kind"] == "incident"][0]
 
 
 def test_restriction_in_main_window_queues_alert_with_screenshot(cfg, rules, clock):
@@ -31,12 +41,11 @@ def test_restriction_in_main_window_queues_alert_with_screenshot(cfg, rules, clo
     ocr.texts[MAIN_SIZE] = "Your LIVE has been restricted for violating our Community Guidelines"
     dets = mon.tick()
     assert len(dets) == 1 and dets[0].category == "restriction_notice"
-    item = queue.next_due()
-    assert item is not None
-    assert SOURCE_LABEL in item.payload["caption"]
+    item = first_incident(queue)
+    assert SOURCE_LABEL in item["payload"]["caption"]
     for field in ("Category:", "Detected text:", "Time:", "Machine:</b> test-pc", "Incident ID:", "main window"):
-        assert field in item.payload["caption"]
-    assert Path(item.screenshot_path).exists() and item.screenshot_path.endswith(f"{item.incident_id}.png")
+        assert field in item["payload"]["caption"]
+    assert Path(item["screenshot_path"]).exists() and item["screenshot_path"].endswith(f"{item['incident_id']}.png")
     assert statuses[-1].status == Status.RUNNING
     inc = queue.recent_incidents()[0]
     assert inc["category"] == "restriction_notice" and inc["detected_text"].startswith("Your LIVE")
@@ -58,9 +67,9 @@ def test_verification_puzzle_in_separate_dialog(cfg, rules, clock):
     ocr.texts[DIALOG_SIZE] = "Verify to continue: drag the slider to fit the puzzle piece"
     dets = mon.tick()
     assert dets and dets[0].is_dialog and dets[0].category == "verification_puzzle"
-    item = queue.next_due()
-    assert "Manual attention required" in item.payload["caption"]
-    assert 'separate dialog "Verify"' in item.payload["caption"]
+    item = first_incident(queue)
+    assert "Manual attention required" in item["payload"]["caption"]
+    assert 'separate dialog "Verify"' in item["payload"]["caption"]
     assert 0x7007 in cap.calls  # the dialog itself was captured, not just the main window
 
 
@@ -80,7 +89,7 @@ def test_redaction_applied_before_save(cfg, rules, clock):
     mon, *_, ocr, queue, events, _ = build(cfg, rules, clock)
     ocr.default = "Your LIVE has been restricted"
     mon.tick()
-    shot = Image.open(queue.next_due().screenshot_path)
+    shot = Image.open(first_incident(queue)["screenshot_path"])
     assert shot.getpixel((shot.width - 1, 0)) == (0, 0, 0) and shot.getpixel((0, 0)) == (40, 40, 40)
 
 
@@ -90,8 +99,8 @@ def test_privacy_no_screenshot_attachment(cfg, rules, clock):
     mon, *_, ocr, queue, events, _ = build(cfg, rules, clock)
     ocr.default = "Your LIVE has been restricted"
     mon.tick()
-    item = queue.next_due()
-    assert item.screenshot_path == "" and "not attached" in item.payload["text"]
+    item = first_incident(queue)
+    assert item["screenshot_path"] == "" and "not attached" in item["payload"]["text"]
     assert queue.recent_incidents()[0]["detected_text"] == ""
 
 
@@ -119,15 +128,10 @@ def test_degraded_when_minimized_skips_ocr(cfg, rules, clock):
     assert statuses[-1].status == Status.DEGRADED and ocr.calls == 0
 
 
-def test_status_change_notification_optional(cfg, rules, clock):
-    cfg.telegram.notify_status_changes = True
+def test_health_status_notifications_go_to_subscribed_bots(cfg, rules, clock):
     mon, sys_, *_, queue, events, statuses = build(cfg, rules, clock)
     mon.tick()
     sys_.remove(0x1001); sys_.alive.clear()
     mon.tick()
-    texts = []
-    while (item := queue.next_due()) is not None:
-        if item.kind == "status":
-            texts.append(item.payload["text"])
-        queue.mark_sent(item.id)
+    texts = [d["payload"]["text"] for d in all_deliveries(queue) if d["kind"] == "status"]
     assert any("RUNNING" in t for t in texts) and any("LOST" in t for t in texts)

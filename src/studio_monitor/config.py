@@ -37,6 +37,8 @@ class TargetIdentity:
 
 @dataclass
 class TelegramConfig:
+    # Legacy single-bot fields: only used to migrate into the bot registry
+    # (or supplied via environment). Tokens are never kept here afterwards.
     bot_token: str = ""
     chat_id: str = ""
     api_base: str = "https://api.telegram.org"
@@ -44,7 +46,11 @@ class TelegramConfig:
     max_attempts: int = 8
     backoff_base_seconds: float = 2.0
     backoff_max_seconds: float = 300.0
-    notify_status_changes: bool = False  # also send LOST/DEGRADED/RUNNING transitions to Telegram
+    notify_status_changes: bool = False  # also send LOST/DEGRADED/RUNNING transitions (health category)
+    fingerprint_salt: str = ""           # per-install salt for non-reversible token fingerprints
+    delivery_concurrency: int = 4        # bots served in parallel by the outbox worker
+    delivery_max_age_hours: float = 48.0 # pending deliveries older than this are dead-lettered
+    legacy_migrated: bool = False
 
 
 @dataclass
@@ -90,7 +96,7 @@ class ActivityConfig:
     start_at_signin: bool = False
 
 
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 
 @dataclass
@@ -103,13 +109,17 @@ class AppConfig:
     privacy: PrivacyConfig = field(default_factory=PrivacyConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     activity: ActivityConfig = field(default_factory=ActivityConfig)
+    bots: list = field(default_factory=list)   # list[BotConfig]; tokens live in the credential store
     config_version: int = CONFIG_VERSION
 
     # -- serialisation ----------------------------------------------------
     def to_dict(self) -> dict:
         d = asdict(self)
         d["regions"] = [r.to_dict() for r in self.regions]
+        d["bots"] = [b.to_dict() if hasattr(b, "to_dict") else b for b in self.bots]
         d["config_version"] = CONFIG_VERSION
+        tg = d["telegram"]
+        tg["bot_token"] = ""   # never written to disk; it lives in the credential store after migration
         return d
 
     @classmethod
@@ -125,6 +135,8 @@ class AppConfig:
         cfg.privacy = PrivacyConfig(**_known(PrivacyConfig, data.get("privacy", {})))
         cfg.detection = DetectionConfig(**_known(DetectionConfig, data.get("detection", {})))
         cfg.activity = ActivityConfig(**_known(ActivityConfig, data.get("activity", {})))
+        from .bots import BotConfig
+        cfg.bots = [BotConfig.from_dict(b) for b in data.get("bots", []) if isinstance(b, dict)]
         cfg.config_version = int(data.get("config_version", 1))
         return cfg
 

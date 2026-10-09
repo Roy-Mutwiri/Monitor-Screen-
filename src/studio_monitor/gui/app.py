@@ -1,25 +1,30 @@
-"""Tkinter GUI: pick the Studio window, preview it, draw regions, monitor,
-and show Studio activity (session, broadcast state, reminder progress)."""
+"""Tkinter GUI: Monitor tab (window picker, preview, regions, status, Studio
+activity, history with per-bot delivery details) and Telegram Bots tab."""
 from __future__ import annotations
 
 import queue as _queue
 import threading
 import time
 import tkinter as tk
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from typing import Optional
+from typing import Callable, Optional
 
 from PIL import Image, ImageTk
 
 from .. import SOURCE_LABEL, __version__
 from ..alerts import format_duration
-from ..app import build_monitor, load_live_rules, load_ruleset, setup_logging
+from ..app import (build_monitor, load_live_rules, load_ruleset, make_registry, open_queue, run_migrations,
+                   setup_logging)
+from ..bot_tests import deliver_test_now, enqueue_test, validate_bot, validate_token
+from ..bots import EVENT_CATEGORIES, MAX_BOTS, BotError, BotRegistry
 from ..config import AppConfig
 from ..monitor import ActivitySnapshot, Monitor, StatusUpdate
+from ..queue import DeliveryQueue, DeliveryWorker
 from ..regions import Region
 from ..target import identity_from_window, validate_handle
+from ..telegram import ClientFactory, sanitize
 from ..tracker import Status
 from ..win32.capture import Win32Capturer
 from ..win32.windows import WindowInfo, Win32WindowSystem, looks_like_studio, selectable_windows
@@ -32,6 +37,9 @@ STATUS_COLORS = {
 }
 LIVE_COLORS = {"LIVE": "#c62828", "NOT_LIVE": "#1565c0", "UNKNOWN": "#757575"}
 REGION_COLORS = {"detect": "#ffeb3b", "redact": "#f44336", "live": "#00e676"}
+TOKEN_HELP = ("Enter the bot token from @BotFather. This is not your Telegram account password or a Telegram "
+              "developer API ID/API hash.\nThe token identifies the sending bot; the chat ID identifies the recipient. "
+              "Both are required for delivery.")
 
 
 def _local(iso_utc: str) -> str:
@@ -43,15 +51,52 @@ def _local(iso_utc: str) -> str:
         return iso_utc
 
 
+def _fmt_ts(ts) -> str:
+    if not ts:
+        return "-"
+    return datetime.fromtimestamp(float(ts)).strftime("%m-%d %H:%M:%S")
+
+
+class Background:
+    """Run a callable off the Tk thread and deliver its result on the Tk thread."""
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self._results: _queue.Queue = _queue.Queue()
+        self.root.after(150, self._pump)
+
+    def run(self, fn: Callable, on_done: Callable[[object, Optional[BaseException]], None]) -> None:
+        def _work():
+            try:
+                self._results.put((on_done, fn(), None))
+            except BaseException as exc:  # noqa: BLE001
+                self._results.put((on_done, None, exc))
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _pump(self) -> None:
+        try:
+            while True:
+                on_done, result, exc = self._results.get_nowait()
+                try:
+                    on_done(result, exc)
+                except Exception:  # pragma: no cover
+                    pass
+        except _queue.Empty:
+            pass
+        self.root.after(150, self._pump)
+
+
+# ---------------------------------------------------------------- settings dialog
+
 class SettingsDialog(simpledialog.Dialog):
     def __init__(self, parent, cfg: AppConfig):
         self.cfg = cfg
         super().__init__(parent, "Settings")
 
-    def _entry(self, master, row, label, key, value, secret=False):
+    def _entry(self, master, row, label, key, value):
         ttk.Label(master, text=label).grid(row=row, column=0, sticky="w", padx=4, pady=1)
         var = tk.StringVar(value=value)
-        ttk.Entry(master, textvariable=var, width=44, show="*" if secret else "").grid(row=row, column=1, padx=4, pady=1)
+        ttk.Entry(master, textvariable=var, width=44).grid(row=row, column=1, padx=4, pady=1)
         self.vars[key] = var
 
     def _check(self, master, row, label, key, value):
@@ -65,25 +110,26 @@ class SettingsDialog(simpledialog.Dialog):
         nb = ttk.Notebook(master)
         nb.grid(row=0, column=0, sticky="nsew")
 
-        gen = ttk.Frame(nb, padding=6); nb.add(gen, text="General & Telegram")
+        gen = ttk.Frame(nb, padding=6); nb.add(gen, text="General")
         r = 0
-        for label, key, value, secret in (
-            ("Telegram bot token", "token", c.telegram.bot_token, True),
-            ("Telegram chat id", "chat", c.telegram.chat_id, False),
-            ("Machine label", "label", c.machine_label, False),
-            ("Poll interval (s)", "poll", str(c.detection.poll_interval_seconds), False),
-            ("Confirm polls (popups)", "confirm", str(c.detection.confirm_polls), False),
-            ("Dedup cooldown (s)", "cooldown", str(c.detection.dedup_cooldown_seconds), False),
-            ("Screenshot retention (days)", "retention", str(c.privacy.screenshot_retention_days), False),
-            ("Max text chars in alert", "maxtext", str(c.privacy.max_text_in_alert), False),
-            ("Popup rules file (blank = bundled)", "rules", c.detection.rules_file, False),
+        for label, key, value in (
+            ("Machine label", "label", c.machine_label),
+            ("Poll interval (s)", "poll", str(c.detection.poll_interval_seconds)),
+            ("Confirm polls (popups)", "confirm", str(c.detection.confirm_polls)),
+            ("Dedup cooldown (s)", "cooldown", str(c.detection.dedup_cooldown_seconds)),
+            ("Screenshot retention (days)", "retention", str(c.privacy.screenshot_retention_days)),
+            ("Max text chars in alert", "maxtext", str(c.privacy.max_text_in_alert)),
+            ("Popup rules file (blank = bundled)", "rules", c.detection.rules_file),
+            ("Delivery dead-letter age (hours)", "dead_age", str(c.telegram.delivery_max_age_hours)),
+            ("Bots delivered in parallel", "concurrency", str(c.telegram.delivery_concurrency)),
         ):
-            self._entry(gen, r, label, key, value, secret); r += 1
+            self._entry(gen, r, label, key, value); r += 1
         self._check(gen, r, "Attach screenshots to Telegram alerts", "send_shots", c.privacy.send_screenshots); r += 1
         self._check(gen, r, "Store detected text in local incident history", "store_text", c.privacy.store_detected_text); r += 1
         self._check(gen, r, "Also capture separate Studio dialogs/windows", "dialogs", c.detection.include_dialogs); r += 1
-        self._check(gen, r, "Send LOST/DEGRADED/RUNNING status changes to Telegram", "notify_status",
-                    c.telegram.notify_status_changes); r += 1
+        ttk.Label(gen, foreground="#555", wraplength=420, justify="left",
+                  text="Telegram bots (tokens, destinations, subscriptions) are managed in the Telegram Bots tab "
+                       "of the main window.").grid(row=r, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 0))
 
         act = ttk.Frame(nb, padding=6); nb.add(act, text="Studio activity")
         a = c.activity
@@ -106,7 +152,7 @@ class SettingsDialog(simpledialog.Dialog):
                     "signin", a.start_at_signin); r += 1
         ttk.Label(act, foreground="#555", wraplength=420, justify="left",
                   text="Studio activity is observed only while the monitor is running. Nothing is reported for "
-                       "periods when the monitor was stopped. Use 'Calibrate live state' in the main window to "
+                       "periods when the monitor was stopped. Use 'Calibrate live state' in the Monitor tab to "
                        "check the live-state rules against real Studio screenshots.").grid(
             row=r, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 0))
         return None
@@ -118,6 +164,7 @@ class SettingsDialog(simpledialog.Dialog):
             float(self.vars["threshold"].get()); float(self.vars["repeat_interval"].get()); int(self.vars["repeat_max"].get())
             float(self.vars["open_timeout"].get()); float(self.vars["close_debounce"].get())
             float(self.vars["max_gap"].get()); int(self.vars["confirm_obs"].get())
+            float(self.vars["dead_age"].get()); int(self.vars["concurrency"].get())
         except ValueError:
             messagebox.showerror("Settings", "Numeric fields must be numbers.")
             return False
@@ -125,8 +172,6 @@ class SettingsDialog(simpledialog.Dialog):
 
     def apply(self):
         c, v, b = self.cfg, self.vars, self.bools
-        c.telegram.bot_token = v["token"].get().strip()
-        c.telegram.chat_id = v["chat"].get().strip()
         c.machine_label = v["label"].get().strip() or c.machine_label
         c.detection.poll_interval_seconds = max(0.5, float(v["poll"].get()))
         c.detection.confirm_polls = max(1, int(v["confirm"].get()))
@@ -134,10 +179,11 @@ class SettingsDialog(simpledialog.Dialog):
         c.privacy.screenshot_retention_days = int(v["retention"].get())
         c.privacy.max_text_in_alert = int(v["maxtext"].get())
         c.detection.rules_file = v["rules"].get().strip()
+        c.telegram.delivery_max_age_hours = max(1.0, float(v["dead_age"].get()))
+        c.telegram.delivery_concurrency = max(1, min(10, int(v["concurrency"].get())))
         c.privacy.send_screenshots = b["send_shots"].get()
         c.privacy.store_detected_text = b["store_text"].get()
         c.detection.include_dialogs = b["dialogs"].get()
-        c.telegram.notify_status_changes = b["notify_status"].get()
         a = c.activity
         a.notify_opened = b["notify_opened"].get()
         a.notify_closed = b["notify_closed"].get()
@@ -155,6 +201,124 @@ class SettingsDialog(simpledialog.Dialog):
         a.start_at_signin = b["signin"].get()
         self.result = True
 
+
+# ---------------------------------------------------------------- bot add/edit dialog
+
+class BotDialog(simpledialog.Dialog):
+    """Add or edit a bot. Network calls (getMe) run off the UI thread; the
+    dialog stays open until validation finishes or fails."""
+
+    def __init__(self, parent, registry: BotRegistry, factory: ClientFactory, bg: Background, bot=None):
+        self.registry = registry
+        self.factory = factory
+        self.bg = bg
+        self.bot = bot
+        self.result = None
+        self._busy = False
+        super().__init__(parent, "Edit bot" if bot else "Add bot")
+
+    def body(self, master):
+        b = self.bot
+        ttk.Label(master, text=TOKEN_HELP, wraplength=460, justify="left", foreground="#444").grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=4, pady=(0, 6))
+        ttk.Label(master, text="Bot name").grid(row=1, column=0, sticky="w", padx=4, pady=2)
+        self.name = tk.StringVar(value=b.name if b else "")
+        ttk.Entry(master, textvariable=self.name, width=40).grid(row=1, column=1, columnspan=2, sticky="w", padx=4)
+        ttk.Label(master, text="Bot API token").grid(row=2, column=0, sticky="w", padx=4, pady=2)
+        self.token = tk.StringVar()
+        self.token_entry = ttk.Entry(master, textvariable=self.token, width=40, show="•")
+        self.token_entry.grid(row=2, column=1, sticky="w", padx=4)
+        self._shown = False
+        ttk.Button(master, text="Show", width=6, command=self._toggle).grid(row=2, column=2, padx=2)
+        if b:
+            ttk.Label(master, foreground="#555", wraplength=460, justify="left",
+                      text="Leave the token blank to keep the current one. A new token is validated with getMe and "
+                           "must belong to the same bot as before (otherwise add it as a new bot).").grid(
+                row=3, column=0, columnspan=3, sticky="w", padx=4)
+        ttk.Label(master, text="Destination chat ID").grid(row=4, column=0, sticky="w", padx=4, pady=2)
+        self.chat = tk.StringVar(value=b.chat_id if b else "")
+        ttk.Entry(master, textvariable=self.chat, width=40).grid(row=4, column=1, columnspan=2, sticky="w", padx=4)
+        ttk.Label(master, text="Forum topic ID (optional)").grid(row=5, column=0, sticky="w", padx=4, pady=2)
+        self.topic = tk.StringVar(value=str(b.thread_id) if b and b.thread_id else "")
+        ttk.Entry(master, textvariable=self.topic, width=40).grid(row=5, column=1, columnspan=2, sticky="w", padx=4)
+        self.enabled = tk.BooleanVar(value=b.enabled if b else True)
+        ttk.Checkbutton(master, text="Enabled", variable=self.enabled).grid(row=6, column=0, columnspan=3, sticky="w", padx=4)
+        ttk.Label(master, text="Send this bot:").grid(row=7, column=0, sticky="nw", padx=4, pady=(6, 0))
+        subf = ttk.Frame(master)
+        subf.grid(row=7, column=1, columnspan=2, sticky="w")
+        self.subs: dict[str, tk.BooleanVar] = {}
+        current = set(b.subscriptions) if b else set(EVENT_CATEGORIES)
+        for i, (key, label) in enumerate(EVENT_CATEGORIES.items()):
+            var = tk.BooleanVar(value=key in current)
+            ttk.Checkbutton(subf, text=label, variable=var).grid(row=i, column=0, sticky="w")
+            self.subs[key] = var
+        self.status = tk.StringVar(value="")
+        ttk.Label(master, textvariable=self.status, foreground="#1565c0", wraplength=460, justify="left").grid(
+            row=8, column=0, columnspan=3, sticky="w", padx=4, pady=(6, 0))
+        return self.token_entry if not b else None
+
+    def _toggle(self):
+        self._shown = not self._shown
+        self.token_entry.configure(show="" if self._shown else "•")
+
+    def buttonbox(self):
+        box = ttk.Frame(self)
+        self.ok_btn = ttk.Button(box, text="Save", width=10, command=self.ok, default="active")
+        self.ok_btn.pack(side="left", padx=5, pady=5)
+        ttk.Button(box, text="Cancel", width=10, command=self.cancel).pack(side="left", padx=5, pady=5)
+        self.bind("<Escape>", self.cancel)
+        box.pack()
+
+    def ok(self, event=None):
+        if self._busy:
+            return
+        token = self.token.get().strip()
+        subs = [k for k, v in self.subs.items() if v.get()]
+        kwargs = dict(name=self.name.get(), chat_id=self.chat.get(), thread_id=self.topic.get(),
+                      enabled=self.enabled.get(), subscriptions=subs)
+        if self.bot is None and not token:
+            self.status.set("A bot token is required.")
+            return
+        if token:
+            self._busy = True
+            self.ok_btn.configure(state="disabled")
+            self.status.set("Validating token with Telegram (getMe)…")
+            self.bg.run(lambda: validate_token(self.factory, token), lambda info, exc: self._validated(info, exc, token, kwargs))
+        else:
+            self._save(kwargs, None, None)
+
+    def _validated(self, info, exc, token, kwargs):
+        self._busy = False
+        self.ok_btn.configure(state="normal")
+        if exc is not None:
+            self.status.set(f"Token validation failed: {sanitize(str(exc))}")
+            return
+        self.status.set(f"Token valid: @{info['username']} (id {info['id']})")
+        self._save(kwargs, token, (info["id"], info["username"]))
+
+    def _save(self, kwargs, token, identity):
+        try:
+            if self.bot is None:
+                self.result = self.registry.add(kwargs["name"], token, kwargs["chat_id"], kwargs["thread_id"],
+                                                kwargs["enabled"], kwargs["subscriptions"], identity)
+            else:
+                self.result = self.registry.update(self.bot.bot_id, name=kwargs["name"], chat_id=kwargs["chat_id"],
+                                                   thread_id=kwargs["thread_id"], enabled=kwargs["enabled"],
+                                                   subscriptions=kwargs["subscriptions"], new_token=token or None,
+                                                   new_token_identity=identity)
+        except BotError as exc:
+            self.status.set(str(exc))
+            return
+        except Exception as exc:  # credential store etc.
+            self.status.set(f"Could not save: {sanitize(str(exc))}")
+            return
+        self.withdraw()
+        self.update_idletasks()
+        self.parent.focus_set()
+        self.destroy()
+
+
+# ---------------------------------------------------------------- main window
 
 class App:
     def __init__(self, root: tk.Tk, cfg: AppConfig, cfg_path: Path, autostart: bool = False) -> None:
@@ -175,30 +339,63 @@ class App:
         self._monitor_capture = None
         self._lock = threading.Lock()
         self._history_kind = tk.StringVar(value="all")
+        self._history_items: list[dict] = []
+        self._detail_rows: list = []
+        self.bg = Background(root)
+
+        # Outbox + bot registry are available even while monitoring is stopped.
+        self.queue: DeliveryQueue = open_queue(cfg)
+        try:
+            self.registry: BotRegistry = make_registry(cfg, cfg_path, self.queue)
+            self.registry_error = ""
+        except Exception as exc:  # credential store unavailable
+            from ..credentials import MemoryCredentialStore
+            self.registry = BotRegistry(cfg, MemoryCredentialStore(), save=lambda: cfg.save(cfg_path), queue=self.queue)
+            self.registry_error = sanitize(str(exc))
+        self.factory = ClientFactory(cfg.telegram, self.registry.token_for)
+        self.registry.listeners.append(lambda action, bot_id: self.factory.invalidate(bot_id))
+        self._migration_notes = run_migrations(cfg, cfg_path, self.registry, self.queue)
 
         root.title(f"{SOURCE_LABEL} Monitor {__version__}")
-        root.geometry("1280x860")
+        root.geometry("1320x900")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._build()
+        for note in self._migration_notes:
+            self.log_line(note)
+        if self.registry_error:
+            self.log_line(f"WARNING: secure credential store unavailable ({self.registry_error}); bots cannot be saved")
         self.refresh_windows()
         self._restore_target()
         self.refresh_history()
+        self.refresh_bots()
         self.root.after(200, self._pump_events)
         self.root.after(500, self._refresh_preview)
+        if not any(b.enabled for b in self.registry.bots):
+            self.notebook.select(self.bots_tab)
+            self.log_line("Setup: add at least one Telegram bot in the Telegram Bots tab, then select the Studio "
+                          "window in the Monitor tab and start monitoring.")
         if autostart and self.cfg.target.is_set:
             self.root.after(1500, self.start)
 
     # -- layout -----------------------------------------------------------
     def _build(self) -> None:
-        outer = ttk.Frame(self.root, padding=6)
-        outer.pack(fill="both", expand=True)
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True)
+        self.monitor_tab = ttk.Frame(self.notebook, padding=6)
+        self.bots_tab = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(self.monitor_tab, text="  Monitor  ")
+        self.notebook.add(self.bots_tab, text="  Telegram Bots  ")
+        self._build_monitor_tab(self.monitor_tab)
+        self._build_bots_tab(self.bots_tab)
+
+    def _build_monitor_tab(self, outer) -> None:
         top = ttk.Panedwindow(outer, orient="horizontal")
         top.pack(fill="both", expand=True)
 
         left = ttk.Labelframe(top, text=f"1. Select your {SOURCE_LABEL} window", padding=6)
         top.add(left, weight=1)
         cols = ("title", "process", "pid", "size")
-        self.tree = ttk.Treeview(left, columns=cols, show="headings", height=12, selectmode="browse")
+        self.tree = ttk.Treeview(left, columns=cols, show="headings", height=10, selectmode="browse")
         for col, text, width in (("title", "Window title", 240), ("process", "Process", 140), ("pid", "PID", 60), ("size", "Size", 80)):
             self.tree.heading(col, text=text)
             self.tree.column(col, width=width, anchor="w")
@@ -211,7 +408,6 @@ class App:
         self.target_var = tk.StringVar(value="No target selected.")
         ttk.Label(left, textvariable=self.target_var, wraplength=360, justify="left").pack(fill="x")
 
-        # Studio activity panel
         actf = ttk.Labelframe(left, text="Studio activity", padding=6)
         actf.pack(fill="x", pady=(6, 0))
         self.act_vars: dict[str, tk.StringVar] = {}
@@ -231,7 +427,7 @@ class App:
 
         right = ttk.Labelframe(top, text="2. Live preview and regions (drag on the preview)", padding=6)
         top.add(right, weight=2)
-        self.canvas = tk.Canvas(right, bg="#202020", width=640, height=380, cursor="crosshair")
+        self.canvas = tk.Canvas(right, bg="#202020", width=640, height=360, cursor="crosshair")
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<ButtonPress-1>", self._drag_begin)
         self.canvas.bind("<B1-Motion>", self._drag_move)
@@ -244,12 +440,11 @@ class App:
         ttk.Radiobutton(rrow, text="Live-status region", variable=self.region_kind, value="live").pack(side="left", padx=6)
         ttk.Button(rrow, text="Remove selected", command=self.remove_region).pack(side="right")
         ttk.Button(rrow, text="Clear all", command=self.clear_regions).pack(side="right", padx=4)
-        self.region_list = tk.Listbox(right, height=4)
+        self.region_list = tk.Listbox(right, height=3)
         self.region_list.pack(fill="x")
         ttk.Label(right, foreground="#555", wraplength=700, justify="left",
                   text="No detection regions = scan the whole window for popups. No live-status regions = classify "
-                       "broadcast state from the whole window (less reliable; chat text can look like controls). "
-                       "Separate dialogs are always scanned whole.").pack(anchor="w")
+                       "broadcast state from the whole window (less reliable). Separate dialogs are always scanned whole.").pack(anchor="w")
 
         bottom = ttk.Labelframe(outer, text="3. Monitor", padding=6)
         bottom.pack(fill="both", expand=False, pady=(6, 0))
@@ -259,13 +454,12 @@ class App:
                                      font=("Segoe UI", 14, "bold"), width=12)
         self.status_label.pack(side="left", padx=(0, 8))
         self.reason_var = tk.StringVar(value="")
-        ttk.Label(srow, textvariable=self.reason_var, wraplength=520).pack(side="left", fill="x", expand=True)
+        ttk.Label(srow, textvariable=self.reason_var, wraplength=480).pack(side="left", fill="x", expand=True)
         self.start_btn = ttk.Button(srow, text="Start monitoring", command=self.start)
         self.start_btn.pack(side="right")
         self.stop_btn = ttk.Button(srow, text="Stop", command=self.stop, state="disabled")
         self.stop_btn.pack(side="right", padx=4)
         ttk.Button(srow, text="Settings", command=self.open_settings).pack(side="right", padx=4)
-        ttk.Button(srow, text="Test Telegram", command=self.test_telegram).pack(side="right", padx=4)
         ttk.Button(srow, text="Calibrate popups", command=self.calibrate).pack(side="right", padx=4)
         ttk.Button(srow, text="Calibrate live state", command=self.calibrate_live).pack(side="right", padx=4)
         self.queue_var = tk.StringVar(value="alert queue: -")
@@ -274,11 +468,11 @@ class App:
         lower = ttk.Panedwindow(bottom, orient="horizontal")
         lower.pack(fill="both", expand=True)
         logf = ttk.Frame(lower)
-        lower.add(logf, weight=3)
-        self.log = tk.Text(logf, height=8, state="disabled", wrap="word", font=("Consolas", 9))
+        lower.add(logf, weight=2)
+        self.log = tk.Text(logf, height=9, state="disabled", wrap="word", font=("Consolas", 9))
         self.log.pack(fill="both", expand=True)
-        histf = ttk.Labelframe(lower, text="History", padding=4)
-        lower.add(histf, weight=2)
+        histf = ttk.Labelframe(lower, text="History (events and per-bot delivery)", padding=4)
+        lower.add(histf, weight=3)
         hrow = ttk.Frame(histf)
         hrow.pack(fill="x")
         ttk.Label(hrow, text="Show:").pack(side="left")
@@ -286,13 +480,63 @@ class App:
             ttk.Radiobutton(hrow, text=label, variable=self._history_kind, value=value,
                             command=self.refresh_history).pack(side="left", padx=3)
         ttk.Button(hrow, text="Refresh", command=self.refresh_history).pack(side="right")
-        self.history = tk.Listbox(histf, height=8, font=("Consolas", 9))
-        self.history.pack(fill="both", expand=True)
+        self.retry_btn = ttk.Button(hrow, text="Retry selected delivery", command=self.retry_selected, state="disabled")
+        self.retry_btn.pack(side="right", padx=4)
+        self.history = tk.Listbox(histf, height=5, font=("Consolas", 9), exportselection=False)
+        self.history.pack(fill="x")
+        self.history.bind("<<ListboxSelect>>", lambda e: self._show_event_details())
+        self.details = ttk.Treeview(histf, columns=("bot", "dest", "status", "attempts", "msg", "error"),
+                                    show="headings", height=4, selectmode="browse")
+        for col, text, width in (("bot", "Bot", 110), ("dest", "Destination", 120), ("status", "Status", 70),
+                                 ("attempts", "Att.", 40), ("msg", "Msg id", 60), ("error", "Result", 260)):
+            self.details.heading(col, text=text)
+            self.details.column(col, width=width, anchor="w")
+        self.details.pack(fill="both", expand=True)
+        self.details.bind("<<TreeviewSelect>>", lambda e: self._update_retry_button())
+
+    def _build_bots_tab(self, outer) -> None:
+        head = ttk.Frame(outer)
+        head.pack(fill="x")
+        self.bots_count = tk.StringVar(value=f"Bots: 0 / {MAX_BOTS}")
+        ttk.Label(head, textvariable=self.bots_count, font=("Segoe UI", 12, "bold")).pack(side="left")
+        self.bots_limit_note = tk.StringVar(value="")
+        ttk.Label(head, textvariable=self.bots_limit_note, foreground="#c62828").pack(side="left", padx=12)
+        ttk.Label(outer, text=TOKEN_HELP, wraplength=900, justify="left", foreground="#444").pack(anchor="w", pady=(4, 6))
+
+        cols = ("name", "username", "chat", "enabled", "test", "delivery", "pending")
+        self.bots_tree = ttk.Treeview(outer, columns=cols, show="headings", height=11, selectmode="browse")
+        for col, text, width in (("name", "Name", 150), ("username", "Telegram bot", 140), ("chat", "Destination", 170),
+                                 ("enabled", "Status", 70), ("test", "Last test", 220), ("delivery", "Last delivery", 260),
+                                 ("pending", "Pending", 60)):
+            self.bots_tree.heading(col, text=text)
+            self.bots_tree.column(col, width=width, anchor="w")
+        self.bots_tree.pack(fill="both", expand=True)
+        self.bots_tree.bind("<<TreeviewSelect>>", lambda e: self._update_bot_buttons())
+        brow = ttk.Frame(outer)
+        brow.pack(fill="x", pady=6)
+        self.add_btn = ttk.Button(brow, text="Add", command=self.add_bot)
+        self.add_btn.pack(side="left")
+        self.bot_btns = {}
+        for text, cmd in (("Edit", self.edit_bot), ("Remove", self.remove_bot), ("Enable/Disable", self.toggle_bot),
+                          ("Validate Bot", self.validate_selected_bot), ("Send Test", self.test_selected_bot)):
+            b = ttk.Button(brow, text=text, command=cmd, state="disabled")
+            b.pack(side="left", padx=4)
+            self.bot_btns[text] = b
+        ttk.Button(brow, text="Refresh", command=self.refresh_bots).pack(side="right")
+        ttk.Label(outer, wraplength=900, justify="left", foreground="#555",
+                  text="Validate Bot calls getMe only (nothing is sent) and shows the bot's Telegram identity; it does not "
+                       "prove the bot may post to the destination. Send Test sends an explicit test message with a synthetic "
+                       "image to this bot's destination only; the desktop is never captured for a test. Tokens are stored in "
+                       "the Windows Credential Manager, never in settings, logs or history. Disabling or removing a bot "
+                       "cancels its pending deliveries; messages Telegram already accepted cannot be recalled. Delivery is "
+                       "at-least-once: after an ambiguous timeout a retry may send a message twice.").pack(anchor="w", pady=(4, 0))
+        self.bots_status = tk.StringVar(value="")
+        ttk.Label(outer, textvariable=self.bots_status, foreground="#1565c0", wraplength=900, justify="left").pack(anchor="w", pady=4)
 
     # -- helpers ----------------------------------------------------------
     def log_line(self, msg: str) -> None:
         self.log.configure(state="normal")
-        self.log.insert("end", f"{time.strftime('%H:%M:%S')}  {msg}\n")
+        self.log.insert("end", f"{time.strftime('%H:%M:%S')}  {sanitize(msg)}\n")
         self.log.see("end")
         self.log.configure(state="disabled")
 
@@ -324,29 +568,198 @@ class App:
             rem = format_duration(s.remaining_seconds)
         v["remaining"].set(rem)
         v["event"].set(s.last_event or "-")
-        d = s.delivery or {}
-        c = d.get("counts", {})
-        last = d.get("last")
-        text = f"pending {c.get('pending', 0)}, sent {c.get('sent', 0)}, failed {c.get('failed', 0)}"
+        self._show_delivery(s.delivery)
+
+    def _show_delivery(self, d: dict) -> None:
+        c = (d or {}).get("counts", {})
+        last = (d or {}).get("last")
+        text = (f"pending {c.get('pending', 0)}, sent {c.get('sent', 0)}, failed {c.get('failed', 0)}, "
+                f"dead {c.get('dead', 0)}")
         if last:
-            text += f"; last: {last['id']} {last['status']}" + (f" ({last['error'][:60]})" if last.get("error") else "")
-        v["delivery"].set(text)
+            text += f"; last: {last['id']} -> {last.get('bot', '?')} {last['status']}"
+            if last.get("error"):
+                text += f" ({last['error'][:60]})"
+        self.act_vars["delivery"].set(text)
         self.queue_var.set("alert queue: " + text)
 
+    # -- history ----------------------------------------------------------
     def refresh_history(self) -> None:
         try:
-            from ..queue import DeliveryQueue
-            q = self.monitor.queue if self.monitor else DeliveryQueue(self.cfg.db_path)
-            items = q.history(60, self._history_kind.get())
-            if not self.monitor:
-                q.close()
+            self._history_items = self.queue.history(80, self._history_kind.get())
         except Exception as exc:
             self.log_line(f"history unavailable: {exc}")
             return
         self.history.delete(0, "end")
-        for it in items:
+        for it in self._history_items:
             ts = datetime.fromtimestamp(it["ts"]).strftime("%m-%d %H:%M")
-            self.history.insert("end", f"{ts} [{it['kind']}] {it['label']}: {it['detail']}"[:140])
+            self.history.insert("end", f"{ts} [{it['kind']}] {it['label']}: {it['detail']}"[:160])
+        self.details.delete(*self.details.get_children())
+        self._detail_rows = []
+        self._update_retry_button()
+        self._show_delivery(self.queue.delivery_status())
+
+    def _show_event_details(self) -> None:
+        sel = self.history.curselection()
+        self.details.delete(*self.details.get_children())
+        self._detail_rows = []
+        if not sel:
+            return
+        item = self._history_items[sel[0]]
+        for d in self.queue.deliveries_for(item["id"]):
+            dest = d.chat_id + (f"/{d.thread_id}" if d.thread_id else "")
+            self.details.insert("", "end", iid=str(d.id), values=(d.bot_name, dest, d.status, d.attempts,
+                                                                 d.message_id or "-", d.last_error[:120]))
+            self._detail_rows.append(d)
+        self._update_retry_button()
+
+    def _update_retry_button(self) -> None:
+        sel = self.details.selection()
+        ok = False
+        if sel:
+            d = next((x for x in self._detail_rows if str(x.id) == sel[0]), None)
+            ok = d is not None and d.status in ("failed", "dead", "cancelled")
+        self.retry_btn.configure(state="normal" if ok else "disabled")
+
+    def retry_selected(self) -> None:
+        sel = self.details.selection()
+        if not sel:
+            return
+        if self.queue.retry_delivery(int(sel[0])):
+            self.log_line(f"delivery {sel[0]} re-queued (only this bot; successful bots are not resent)")
+            if self.monitor is not None:
+                self.monitor.worker and self.monitor.worker.kick()
+            else:
+                self._deliver_pending_once()
+        self._show_event_details()
+
+    def _deliver_pending_once(self) -> None:
+        """Without a running monitor, push due deliveries once in the background."""
+        worker = DeliveryWorker(self.queue, self._send_without_monitor, concurrency=self.cfg.telegram.delivery_concurrency,
+                                on_event=lambda m: self.events.put(("event", m)))
+        self.bg.run(lambda: worker.process_round(parallel=False), lambda r, e: self.refresh_history())
+
+    def _send_without_monitor(self, d):
+        from ..queue import DeliveryError
+        from ..telegram import deliver
+        client = self.factory.client(d.bot_id, d.chat_id, d.thread_id)
+        if client is None:
+            raise DeliveryError("bot token not available in the credential store", permanent=True)
+        result = deliver(client, d.payload, d.evidence_path)
+        return result.get("message_id") if isinstance(result, dict) else None
+
+    # -- bots tab ---------------------------------------------------------
+    def refresh_bots(self) -> None:
+        reg = self.registry
+        self.bots_count.set(f"Bots: {reg.count} / {MAX_BOTS}")
+        self.bots_tree.delete(*self.bots_tree.get_children())
+        for b in reg.bots:
+            st = self.queue.bot_stats(b.bot_id)
+            last = st["last_result"] or "-"
+            if st["blocked_until"] and st["blocked_until"] > time.time():
+                last = f"rate-limited until {_fmt_ts(st['blocked_until'])}; " + last
+            self.bots_tree.insert("", "end", iid=b.bot_id, values=(
+                b.name, ("@" + b.verified_username) if b.verified_username else "not validated", b.destination,
+                "enabled" if b.enabled else "disabled",
+                (b.last_test_result + (f" ({_fmt_ts_iso(b.last_test_utc)})" if b.last_test_utc else "")) if b.last_test_result else "-",
+                last[:120], st["pending"]))
+        if reg.can_add:
+            self.add_btn.configure(state="normal")
+            self.bots_limit_note.set("")
+        else:
+            self.add_btn.configure(state="disabled")
+            self.bots_limit_note.set(f"Limit reached: at most {MAX_BOTS} bots (disabled bots count). Remove one to add another.")
+        self._update_bot_buttons()
+
+    def _selected_bot(self):
+        sel = self.bots_tree.selection()
+        return self.registry.get(sel[0]) if sel else None
+
+    def _update_bot_buttons(self) -> None:
+        state = "normal" if self._selected_bot() else "disabled"
+        for b in self.bot_btns.values():
+            b.configure(state=state)
+
+    def add_bot(self) -> None:
+        if not self.registry.can_add:
+            messagebox.showinfo("Bots", f"At most {MAX_BOTS} bots can be saved (disabled bots count).")
+            return
+        dlg = BotDialog(self.root, self.registry, self.factory, self.bg)
+        if dlg.result is not None:
+            self.log_line(f"bot '{dlg.result.name}' added -> {dlg.result.destination}")
+        self.refresh_bots()
+
+    def edit_bot(self) -> None:
+        bot = self._selected_bot()
+        if bot is None:
+            return
+        dlg = BotDialog(self.root, self.registry, self.factory, self.bg, bot=bot)
+        if dlg.result is not None:
+            self.log_line(f"bot '{bot.name}' updated (destination changes apply to future events only)")
+        self.refresh_bots()
+
+    def remove_bot(self) -> None:
+        bot = self._selected_bot()
+        if bot is None:
+            return
+        pend = self.queue.bot_stats(bot.bot_id)["pending"]
+        if not messagebox.askyesno("Remove bot", f"Remove '{bot.name}' ({bot.destination})?\n\nIts {pend} pending "
+                                                 f"delivery(ies) will be cancelled and its stored token deleted. "
+                                                 f"History is kept."):
+            return
+        try:
+            self.registry.remove(bot.bot_id)
+            self.log_line(f"bot '{bot.name}' removed")
+        except BotError as exc:
+            self.log_line(str(exc))
+        self.refresh_bots()
+        self.refresh_history()
+
+    def toggle_bot(self) -> None:
+        bot = self._selected_bot()
+        if bot is None:
+            return
+        try:
+            self.registry.set_enabled(bot.bot_id, not bot.enabled)
+            self.log_line(f"bot '{bot.name}' {'enabled' if bot.enabled else 'disabled (pending deliveries cancelled)'}")
+        except BotError as exc:
+            self.log_line(str(exc))
+        self.refresh_bots()
+        self.refresh_history()
+
+    def validate_selected_bot(self) -> None:
+        bot = self._selected_bot()
+        if bot is None:
+            return
+        self.bots_status.set(f"Validating '{bot.name}' with getMe… (nothing is sent)")
+
+        def done(info, exc):
+            if exc is not None:
+                self.bots_status.set(f"'{bot.name}': token validation failed: {sanitize(str(exc))}")
+                try:
+                    self.registry.record_test(bot.bot_id, f"validation failed: {sanitize(str(exc))}")
+                except BotError:
+                    pass
+            else:
+                self.bots_status.set(f"'{bot.name}' token is valid: @{info['username']} (id {info['id']}). "
+                                     "Use Send Test to check that it can post to the destination.")
+            self.refresh_bots()
+        self.bg.run(lambda: validate_bot(self.factory, self.registry, bot.bot_id), done)
+
+    def test_selected_bot(self) -> None:
+        bot = self._selected_bot()
+        if bot is None:
+            return
+        self.bots_status.set(f"Sending a synthetic test notification to '{bot.name}' ({bot.destination})…")
+
+        def work():
+            eid = enqueue_test(self.queue, self.registry, self.cfg, bot.bot_id)
+            return deliver_test_now(self.queue, self.registry, self.factory, eid)
+
+        def done(res, exc):
+            self.bots_status.set(f"'{bot.name}': {res if exc is None else sanitize(str(exc))}")
+            self.refresh_bots()
+            self.refresh_history()
+        self.bg.run(work, done)
 
     # -- target selection -------------------------------------------------
     def refresh_windows(self) -> None:
@@ -502,22 +915,24 @@ class App:
         if not self.cfg.target.is_set:
             messagebox.showinfo("Start", f"Select your {SOURCE_LABEL} window first.")
             return
-        if not (self.cfg.telegram.bot_token and self.cfg.telegram.chat_id):
-            if not messagebox.askyesno("Telegram not configured",
-                                       "Telegram is not configured; alerts will queue locally until it is. Start anyway?"):
+        if not any(b.enabled for b in self.registry.bots):
+            if not messagebox.askyesno("No Telegram bots",
+                                       "No enabled Telegram bot is configured; events will be recorded with no "
+                                       "deliveries. Start anyway?"):
                 return
         try:
             setup_logging(self.cfg)
             self.monitor = build_monitor(
-                self.cfg,
+                self.cfg, self.cfg_path, registry=self.registry, queue=self.queue,
                 on_event=lambda m: self.events.put(("event", m)),
                 on_status=lambda s: self.events.put(("status", s)),
                 on_capture=self._on_capture,
                 on_identity_change=lambda ident: self.events.put(("identity", ident)),
                 on_activity=lambda a: self.events.put(("activity", a)),
             )
+            self.monitor.client_factory = self.factory
         except Exception as exc:
-            messagebox.showerror("Start", f"Could not start monitoring:\n{exc}")
+            messagebox.showerror("Start", f"Could not start monitoring:\n{sanitize(str(exc))}")
             self.monitor = None
             return
         self.monitor_thread = self.monitor.start_background()
@@ -544,7 +959,7 @@ class App:
                 kind, payload = self.events.get_nowait()
                 if kind == "event":
                     self.log_line(payload)
-                    if "queued" in payload or "cancelled" in payload:
+                    if "queued" in payload or "cancelled" in payload or "delivered" in payload or "failed" in payload:
                         refresh_hist = True
                 elif kind == "status":
                     upd: StatusUpdate = payload
@@ -560,6 +975,7 @@ class App:
             pass
         if refresh_hist:
             self.refresh_history()
+            self.refresh_bots()
         self.root.after(200, self._pump_events)
 
     # -- misc actions -----------------------------------------------------
@@ -576,14 +992,6 @@ class App:
                 except Exception as exc:
                     self.log_line(f"could not update sign-in startup setting: {exc}")
             self.log_line("settings saved" + (" (restart monitoring to apply)" if self.monitor else ""))
-
-    def test_telegram(self) -> None:
-        from ..cli import _test_alert
-        import io, contextlib
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-            code = _test_alert(self.cfg)
-        self.log_line(("test alert sent: " if code == 0 else "test alert failed: ") + buf.getvalue().strip())
 
     def _pick_image(self, title: str) -> str:
         return filedialog.askopenfilename(title=title,
@@ -633,7 +1041,18 @@ class App:
     def on_close(self) -> None:
         self.stop()
         self.save()
+        try:
+            self.queue.close()
+        except Exception:
+            pass
         self.root.destroy()
+
+
+def _fmt_ts_iso(iso: str) -> str:
+    try:
+        return datetime.fromisoformat(iso).astimezone().strftime("%m-%d %H:%M")
+    except ValueError:
+        return iso
 
 
 def run_gui(cfg: AppConfig, cfg_path: Path, autostart: bool = False) -> int:

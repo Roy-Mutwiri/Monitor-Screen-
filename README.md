@@ -128,6 +128,67 @@ Settings → Studio activity → "Start Monitor Screen when I sign in to Windows
 GUI with `--autostart`, which begins monitoring the saved target. It runs in your interactive
 desktop session (required for capture); nothing runs or is observed before you sign in.
 
+## Telegram bots (up to 10)
+
+Alerts go to any number of Telegram bots (maximum 10 saved, disabled ones count). Manage them in the
+**Telegram Bots** tab or with `studio-monitor bots ...`.
+
+- A bot = **token** (the sender, from @BotFather; not your Telegram password or a developer API ID/hash)
+  + **destination** (chat ID: a user/group/channel id, negative for groups/channels, or a public
+  `@username`; optional forum topic id) + **event subscriptions**. Token and chat ID are both required.
+- Subscriptions: restriction/content warnings (incl. suspensions and LIVE interruptions), verification
+  puzzles, Studio opened, Studio closed, go-live reminders, monitoring health alerts. New bots get all.
+- **Tokens are stored in the Windows Credential Manager** under the bot's UUID
+  (`MonitorScreen/telegram-bot/<uuid>`). Settings and the SQLite database hold only a credential
+  reference and a salted, non-reversible fingerprint (used to reject duplicate tokens). Tokens never
+  appear in logs, errors, history, exports or the repository; Telegram URLs are redacted because they
+  contain the token. If the credential store is unavailable the bot cannot be saved; there is no
+  plaintext fallback.
+- **Validate Bot** calls `getMe` only (nothing is sent) and shows the bot's username/id. It proves the
+  token, not that the bot may post to the destination. **Send Test** sends an explicit test message with
+  a clearly labelled synthetic image to that bot's destination only; the desktop is never captured.
+- Editing: leaving the token blank keeps the current one. A new token is validated and must belong to
+  the same bot id as before (otherwise add it as a new bot). Destination edits apply to future events;
+  already queued deliveries keep their destination snapshot.
+- Disabling a bot excludes it from new events and cancels its pending deliveries (reason recorded).
+  Removing a bot asks for confirmation, cancels pending deliveries, deletes the credential and keeps
+  historical delivery rows (without the token). Messages Telegram already accepted cannot be recalled.
+
+### Delivery model
+
+Every notification is one **event** with one immutable redacted evidence file and one **delivery** per
+enabled, subscribed bot (unique per event/bot). Deliveries carry their own destination snapshot,
+attempts, next retry, Telegram message id, sanitized error and timestamps. The outbox worker serves
+bots in parallel (one in-flight delivery per bot, `delivery_concurrency` bots at once); a failing or
+rate-limited bot (Telegram `retry_after` is honoured per bot) never blocks the others.
+
+Delivery is at-least-once: after an ambiguous timeout Telegram may have accepted the message and the
+retry can send it again. Exactly-once delivery is not claimed.
+
+History shows event-level summaries ("Delivered to 7 of 10 bots — 2 retrying, 1 blocked"); selecting an
+event lists each bot's result, and a failed/dead/cancelled delivery can be retried on its own (bots that
+already succeeded are never resent). Evidence is kept while any delivery still needs it; a delivery still
+pending after `delivery_max_age_hours` (default 48) is dead-lettered with a visible status so a
+permanently blocked bot cannot retain screenshots forever, after which normal retention applies.
+
+### Migration from the single-bot setup
+
+On first start after upgrading, the old token/chat id become **Default Bot** (token moved into the
+credential store, removed from settings) and rows of the old outbox become events/deliveries for it:
+pending ones exactly once, delivered ones as history only. The migration is versioned, idempotent and
+safe to interrupt. `set-telegram` still works and creates/updates "Default Bot".
+
+```powershell
+studio-monitor bots list
+studio-monitor bots add --name "Alerts" --chat-id -1001234567890 --topic 12      # token prompted (hidden)
+studio-monitor bots edit "Alerts" --chat-id 42 --subscribe restrictions,verification
+studio-monitor bots edit "Alerts" --rotate-token
+studio-monitor bots validate "Alerts"      # getMe only
+studio-monitor bots test "Alerts"          # synthetic test notification
+studio-monitor bots disable|enable|remove "Alerts"
+studio-monitor history --expand
+```
+
 ## Telegram alert contents
 
 Every alert identifies the source as **TikTok LIVE Studio** and includes: category, detected text,
@@ -161,8 +222,8 @@ studio-monitor test-alert            # send a test alert through the queue
 studio-monitor queue --requeue-failed
 ```
 
-Secrets may also come from the environment: `STUDIO_MONITOR_TELEGRAM_TOKEN`,
-`STUDIO_MONITOR_TELEGRAM_CHAT_ID`, `STUDIO_MONITOR_MACHINE_LABEL`.
+`STUDIO_MONITOR_TELEGRAM_TOKEN` / `STUDIO_MONITOR_TELEGRAM_CHAT_ID` in the environment are migrated into
+"Default Bot" on start (the token is never written to settings); `STUDIO_MONITOR_MACHINE_LABEL` overrides the label.
 
 Config, log, queue database and screenshots live in `%LOCALAPPDATA%\TikTokLiveStudioMonitor`.
 
@@ -186,7 +247,7 @@ wording into the right category's `any` list in `rules/studio_rules.json` (or a 
 - `privacy.store_detected_text` — keep OCR text in the local incident history or not
 - `privacy.log_ocr_text` — OCR text is never logged unless this is on
 - `privacy.max_text_in_alert` — bound on detected text in alerts
-- the bot token is masked in all errors and logs
+- bot tokens live in the Windows Credential Manager and are redacted from all errors, logs and URLs
 
 ## Build the EXE
 
@@ -212,8 +273,11 @@ src/studio_monitor/
   broadcast.py  LIVE / NOT_LIVE / UNKNOWN engine
   reminders.py  offline episodes + not-live reminders
   startup.py    start at Windows sign-in (HKCU Run)
-  queue.py      persistent SQLite delivery queue + retry worker
-  telegram.py   stdlib Bot API client
+  bots.py       bot registry (max 10), subscriptions, fingerprints
+  credentials.py Windows Credential Manager token store
+  queue.py      SQLite outbox: events + per-bot deliveries, retry worker
+  telegram.py   stdlib Bot API client, token redaction
+  bot_tests.py  getMe validation + synthetic test notifications
   alerts.py     alert formatting
   monitor.py    the loop
   gui/app.py    Tkinter UI

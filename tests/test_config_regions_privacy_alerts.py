@@ -19,7 +19,10 @@ def test_config_roundtrip(tmp_path, cfg):
     back = AppConfig.load(p)
     assert back.target.exe_name == "TikTok LIVE Studio.exe"
     assert back.regions == cfg.regions
-    assert back.telegram.chat_id == "42" and back.machine_label == "test-pc"
+    assert back.machine_label == "test-pc" and back.telegram.fingerprint_salt == "test-salt"
+    cfg.telegram.bot_token = "123456789:AAFakeTokenForTests_abcdefghijklmnop"
+    cfg.save(p)
+    assert "AAFakeToken" not in p.read_text(encoding="utf-8")   # tokens are never written to settings
 
 
 def test_config_ignores_unknown_keys_and_env_overrides(tmp_path, monkeypatch):

@@ -6,23 +6,33 @@
     studio-monitor run                 headless monitoring with the stored target
     studio-monitor calibrate IMAGE     OCR a real Studio screenshot and show which popup rules fire
     studio-monitor calibrate-live IMAGE  classify a real Studio screenshot as LIVE / NOT_LIVE / UNKNOWN
-    studio-monitor history [--kind]    show restriction incidents and Studio activity events
+    studio-monitor history [--kind]    events with per-bot delivery summaries
+    studio-monitor bots list|add|edit|enable|disable|remove|validate|test
+    studio-monitor set-telegram        compatibility: create/update "Default Bot" (token prompted)
     studio-monitor autostart --enable|--disable|--status   start at Windows sign-in (HKCU Run key)
-    studio-monitor test-alert          send a test alert through the delivery queue
-    studio-monitor set-telegram        store bot token / chat id
-    studio-monitor queue               show delivery queue counts / requeue failures
+    studio-monitor queue               delivery counts / requeue failures
+
+Tokens are read with a masked prompt (or --token-stdin). Passing a token as a
+command-line argument is possible but discouraged: it lands in shell history
+and process listings.
 """
 from __future__ import annotations
 
 import argparse
+import getpass
 import logging
 import sys
-import time
 from pathlib import Path
 
 from . import SOURCE_LABEL, __version__
-from .app import build_monitor, load_config, load_ruleset, setup_logging
+from .app import (build_monitor, load_config, load_live_rules, load_ruleset, make_registry, open_queue,
+                  run_migrations, setup_logging)
+from .bots import EVENT_CATEGORIES, MAX_BOTS, BotError
 from .config import AppConfig
+from .telegram import sanitize
+
+TOKEN_HINT = ("Enter the bot token from @BotFather (looks like 123456789:ABC...). This is not your Telegram "
+              "account password or a Telegram developer API ID/API hash.")
 
 
 def _print_windows(cfg: AppConfig) -> None:
@@ -86,7 +96,6 @@ def _calibrate(cfg: AppConfig, image_path: str, backend: str) -> int:
 
 def _calibrate_live(cfg: AppConfig, image_path: str, backend: str) -> int:
     from PIL import Image
-    from .app import load_live_rules
     from .ocr import create_backend
     live_rules = load_live_rules(cfg)
     ocr = create_backend(backend or cfg.detection.ocr_backend, cfg.detection.ocr_language, cfg.detection.ocr_upscale)
@@ -106,12 +115,15 @@ def _calibrate_live(cfg: AppConfig, image_path: str, backend: str) -> int:
     return 0 if c.state.value != "UNKNOWN" else 1
 
 
-def _history(cfg: AppConfig, kind: str, limit: int) -> int:
+def _history(cfg: AppConfig, kind: str, limit: int, expand: bool) -> int:
     from datetime import datetime
-    from .queue import DeliveryQueue
-    q = DeliveryQueue(cfg.db_path)
+    q = open_queue(cfg)
     for it in q.history(limit, kind):
         print(f"{datetime.fromtimestamp(it['ts']):%Y-%m-%d %H:%M:%S} [{it['kind']}] {it['id']} {it['label']}: {it['detail']}")
+        if expand:
+            for d in q.deliveries_for(it["id"]):
+                print(f"    -> {d.bot_name:<20} {d.chat_id}{'/' + str(d.thread_id) if d.thread_id else ''}  "
+                      f"{d.status:<9} attempts={d.attempts} msg={d.message_id or '-'} {d.last_error}")
     print(q.delivery_status())
     return 0
 
@@ -151,9 +163,11 @@ def _run(cfg: AppConfig, cfg_path: Path, once: bool) -> int:
     def on_activity(a):
         log.debug("activity app=%s live=%s offline=%.0fs", a.app_state, a.live_state, a.offline_seconds)
 
-    monitor = build_monitor(cfg, on_event=log.info, on_status=on_status, on_identity_change=on_identity_change,
-                            on_activity=on_activity)
-    log.info("%s monitor %s; target %s (%s)", SOURCE_LABEL, __version__, cfg.target.title, cfg.target.exe_name)
+    monitor = build_monitor(cfg, cfg_path, on_event=log.info, on_status=on_status,
+                            on_identity_change=on_identity_change, on_activity=on_activity)
+    enabled = [b.name for b in cfg.bots if b.enabled]
+    log.info("%s monitor %s; target %s (%s); bots enabled: %s", SOURCE_LABEL, __version__, cfg.target.title,
+             cfg.target.exe_name, ", ".join(enabled) or "none (alerts will queue with no deliveries)")
     if once:
         dets = monitor.tick()
         st = monitor.tracker.state
@@ -171,25 +185,165 @@ def _run(cfg: AppConfig, cfg_path: Path, once: bool) -> int:
     return 0
 
 
-def _test_alert(cfg: AppConfig) -> int:
-    from .alerts import format_alert
-    from .incidents import Incident, new_incident_id
-    from .queue import DeliveryQueue, DeliveryWorker
-    from .telegram import TelegramClient, make_sender
-    client = TelegramClient(cfg.telegram)
-    if not client.configured:
-        print("Telegram is not configured (set-telegram or env vars)", file=sys.stderr)
+# ---------------------------------------------------------------- bots
+
+def _read_token(args) -> str:
+    if getattr(args, "token", None):
+        print("warning: a token passed as an argument is visible in shell history and process listings; "
+              "prefer the masked prompt or --token-stdin", file=sys.stderr)
+        return args.token.strip()
+    if getattr(args, "token_stdin", False):
+        return sys.stdin.readline().strip()
+    print(TOKEN_HINT)
+    return getpass.getpass("Bot token (input hidden): ").strip()
+
+
+def _registry(cfg, cfg_path):
+    queue = open_queue(cfg)
+    reg = make_registry(cfg, cfg_path, queue)
+    for note in run_migrations(cfg, cfg_path, reg, queue):
+        print(f"note: {note}")
+    return reg, queue
+
+
+def _find_bot(reg, ref: str):
+    bot = reg.get(ref) or reg.by_name(ref)
+    if bot is None:
+        raise BotError(f"no bot named or identified by {ref!r}; use `bots list`")
+    return bot
+
+
+def _subs(text: str | None) -> list[str] | None:
+    if text is None:
+        return None
+    if text.strip().lower() in ("all", "*"):
+        return list(EVENT_CATEGORIES)
+    return [s.strip() for s in text.split(",") if s.strip()]
+
+
+def _bots(cfg: AppConfig, cfg_path: Path, args) -> int:
+    from .bot_tests import deliver_test_now, enqueue_test, validate_bot, validate_token
+    from .telegram import ClientFactory
+    reg, queue = _registry(cfg, cfg_path)
+    factory = ClientFactory(cfg.telegram, reg.token_for)
+    sub = args.bots_cmd
+    try:
+        if sub == "list":
+            print(f"Bots: {reg.count} / {MAX_BOTS}")
+            for b in reg.bots:
+                st = queue.bot_stats(b.bot_id)
+                print(f"- {b.name}  [{'enabled' if b.enabled else 'disabled'}]  id={b.bot_id}")
+                print(f"    telegram: {('@' + b.verified_username) if b.verified_username else 'not validated'}"
+                      f"  destination: {b.destination}  subscriptions: {', '.join(b.subscriptions) or '-'}")
+                print(f"    last test: {b.last_test_result or '-'}  last delivery: {st['last_result'] or '-'}"
+                      f"  pending: {st['pending']}  credential: {b.credential_ref}")
+            if not reg.bots:
+                print("no bots configured. Add one with: studio-monitor bots add --name NAME --chat-id ID")
+            return 0
+        if sub == "add":
+            if not reg.can_add:
+                print(f"maximum of {MAX_BOTS} bots reached (disabled bots count); remove one first", file=sys.stderr)
+                return 2
+            token = _read_token(args)
+            verified = None
+            if not args.no_validate:
+                info = validate_token(factory, token)
+                verified = (info["id"], info["username"])
+                print(f"token valid: @{info['username']} (id {info['id']})")
+            bot = reg.add(args.name, token, args.chat_id, args.topic, not args.disabled, _subs(args.subscribe), verified)
+            print(f"added bot '{bot.name}' id={bot.bot_id} -> {bot.destination}; token stored at {bot.credential_ref}")
+            return 0
+        bot = _find_bot(reg, args.bot)
+        if sub == "edit":
+            kwargs = {}
+            if args.name:
+                kwargs["name"] = args.name
+            if args.chat_id:
+                kwargs["chat_id"] = args.chat_id
+            if args.topic is not None:
+                kwargs["thread_id"] = args.topic or None
+            if args.subscribe is not None:
+                kwargs["subscriptions"] = _subs(args.subscribe)
+            if args.rotate_token or args.token or args.token_stdin:
+                token = _read_token(args)
+                info = validate_token(factory, token)
+                kwargs["new_token"] = token
+                kwargs["new_token_identity"] = (info["id"], info["username"])
+            reg.update(bot.bot_id, **kwargs)
+            print(f"updated '{bot.name}' (destination changes apply to future events only)")
+            return 0
+        if sub in ("enable", "disable"):
+            reg.set_enabled(bot.bot_id, sub == "enable")
+            print(f"{bot.name}: {sub}d" + ("; pending deliveries cancelled" if sub == "disable" else ""))
+            return 0
+        if sub == "remove":
+            pend = queue.bot_stats(bot.bot_id)["pending"]
+            if not args.yes:
+                ans = input(f"Remove bot '{bot.name}' ({bot.destination})? Its {pend} pending delivery(ies) will be "
+                            f"cancelled and its stored token deleted. [y/N] ")
+                if ans.strip().lower() not in ("y", "yes"):
+                    print("cancelled")
+                    return 1
+            reg.remove(bot.bot_id)
+            print(f"removed '{bot.name}'; history kept, credential deleted")
+            return 0
+        if sub == "validate":
+            info = validate_bot(factory, reg, bot.bot_id)
+            print(f"token valid: @{info['username']} (id {info['id']}, {info['first_name']}). "
+                  "This checks the token only; whether the bot may post to the destination is tested by `bots test`.")
+            return 0
+        if sub == "test":
+            event_id = enqueue_test(queue, reg, cfg, bot.bot_id)
+            print(deliver_test_now(queue, reg, factory, event_id))
+            return 0
+    except BotError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
-    now = time.time()
-    inc = Incident(new_incident_id(), "test", "Test alert", "This is a test alert from the monitor.",
-                   "test", now, now, last_alerted=now, window_title="(test)")
-    payload = format_alert(inc, cfg.machine_label, screenshot_attached=False, reason="test alert")
-    queue = DeliveryQueue(cfg.db_path)
-    queue.enqueue(inc.incident_id, payload, "")
-    worker = DeliveryWorker(queue, make_sender(client), on_event=print)
-    worker.process_once()
-    print(queue.counts())
+    except Exception as exc:
+        print(f"error: {sanitize(str(exc))}", file=sys.stderr)
+        return 2
+    return 1
+
+
+def _set_telegram(cfg: AppConfig, cfg_path: Path, args) -> int:
+    """Compatibility path: creates or updates 'Default Bot'."""
+    reg, queue = _registry(cfg, cfg_path)
+    token = _read_token(args)
+    try:
+        bot = reg.by_name("Default Bot")
+        if bot is None:
+            bot = reg.add("Default Bot", token, args.chat_id)
+            print(f"created 'Default Bot' -> {bot.destination}")
+        else:
+            reg.update(bot.bot_id, chat_id=args.chat_id, new_token=token if not bot.verified_bot_id else None)
+            if bot.verified_bot_id:
+                print("Default Bot is validated; rotate its token with `bots edit \"Default Bot\" --rotate-token`")
+            print(f"updated 'Default Bot' -> {bot.destination}")
+    except BotError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print("note: set-telegram is kept for compatibility; manage bots with `studio-monitor bots ...`")
     return 0
+
+
+def _test_alert(cfg: AppConfig, cfg_path: Path | None = None) -> int:
+    """Send a test notification through every enabled bot (GUI 'Test Telegram')."""
+    from .bot_tests import deliver_test_now, enqueue_test
+    from .telegram import ClientFactory
+    from .config import default_config_path
+    reg, queue = _registry(cfg, cfg_path or default_config_path())
+    factory = ClientFactory(cfg.telegram, reg.token_for)
+    bots = [b for b in reg.bots if b.enabled]
+    if not bots:
+        print("no enabled bots configured (Telegram Bots tab / `bots add`)", file=sys.stderr)
+        return 2
+    rc = 0
+    for b in bots:
+        res = deliver_test_now(queue, reg, factory, enqueue_test(queue, reg, cfg, b.bot_id))
+        print(f"{b.name}: {res}")
+        if "failed" in res:
+            rc = 1
+    return rc
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -204,13 +358,31 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("calibrate"); p.add_argument("image"); p.add_argument("--backend", default="")
     p = sub.add_parser("calibrate-live"); p.add_argument("image"); p.add_argument("--backend", default="")
     p = sub.add_parser("history"); p.add_argument("--kind", choices=["all", "incident", "activity"], default="all")
-    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--limit", type=int, default=50); p.add_argument("--expand", action="store_true")
     p = sub.add_parser("autostart"); g = p.add_mutually_exclusive_group()
     g.add_argument("--enable", action="store_true"); g.add_argument("--disable", action="store_true")
     g.add_argument("--status", action="store_true")
     sub.add_parser("test-alert")
-    p = sub.add_parser("set-telegram"); p.add_argument("--token", required=True); p.add_argument("--chat-id", required=True)
+    p = sub.add_parser("set-telegram"); p.add_argument("--chat-id", required=True)
+    p.add_argument("--token", help="discouraged: visible in shell history"); p.add_argument("--token-stdin", action="store_true")
     p = sub.add_parser("queue"); p.add_argument("--requeue-failed", action="store_true")
+
+    bp = sub.add_parser("bots", help="manage Telegram bots")
+    bs = bp.add_subparsers(dest="bots_cmd", required=True)
+    bs.add_parser("list")
+    a = bs.add_parser("add"); a.add_argument("--name", required=True); a.add_argument("--chat-id", required=True)
+    a.add_argument("--topic", default=None, help="forum topic id (message_thread_id)")
+    a.add_argument("--subscribe", default=None, help="comma list or 'all' (default all): " + ",".join(EVENT_CATEGORIES))
+    a.add_argument("--disabled", action="store_true"); a.add_argument("--no-validate", action="store_true")
+    a.add_argument("--token", help="discouraged"); a.add_argument("--token-stdin", action="store_true")
+    for name in ("edit", "enable", "disable", "remove", "validate", "test"):
+        q = bs.add_parser(name); q.add_argument("bot", help="bot name or id")
+        if name == "edit":
+            q.add_argument("--name"); q.add_argument("--chat-id"); q.add_argument("--topic", default=None)
+            q.add_argument("--subscribe", default=None); q.add_argument("--rotate-token", action="store_true")
+            q.add_argument("--token", help="discouraged"); q.add_argument("--token-stdin", action="store_true")
+        if name == "remove":
+            q.add_argument("--yes", action="store_true")
     args = parser.parse_args(argv)
 
     cfg, cfg_path = load_config(args.config)
@@ -230,22 +402,19 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "calibrate-live":
         return _calibrate_live(cfg, args.image, args.backend)
     if cmd == "history":
-        return _history(cfg, args.kind, args.limit)
+        return _history(cfg, args.kind, args.limit, args.expand)
     if cmd == "autostart":
         return _autostart(cfg, cfg_path, args.enable, args.disable)
     if cmd == "test-alert":
-        return _test_alert(cfg)
+        return _test_alert(cfg, cfg_path)
     if cmd == "set-telegram":
-        cfg.telegram.bot_token = args.token
-        cfg.telegram.chat_id = args.chat_id
-        cfg.save(cfg_path)
-        print(f"saved to {cfg_path}")
-        return 0
+        return _set_telegram(cfg, cfg_path, args)
+    if cmd == "bots":
+        return _bots(cfg, cfg_path, args)
     if cmd == "queue":
-        from .queue import DeliveryQueue
-        q = DeliveryQueue(cfg.db_path)
+        q = open_queue(cfg)
         if args.requeue_failed:
-            print(f"requeued {q.requeue_failed()} failed alert(s)")
+            print(f"requeued {q.requeue_failed()} failed/dead delivery(ies)")
         print(q.counts())
         return 0
     parser.print_help()
