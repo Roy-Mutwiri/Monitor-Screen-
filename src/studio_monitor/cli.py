@@ -334,6 +334,46 @@ def _set_telegram(cfg: AppConfig, cfg_path: Path, args) -> int:
     return 0
 
 
+def _account(cfg: AppConfig, cfg_path: Path, action: str) -> int:
+    from .account import IdentityStore, AccountIdentity, LookupContext, Win32Interactor, perform_lookup
+    q = open_queue(cfg)
+    store = IdentityStore(q)
+    if action == "clear":
+        store.save(AccountIdentity())
+        print("stored account identity cleared")
+        return 0
+    if action == "test":
+        if not cfg.target.is_set:
+            print("select the Studio window first (list-windows / select)", file=sys.stderr)
+            return 2
+        from .win32.windows import Win32WindowSystem
+        from .win32.capture import CaptureService
+        from .ocr import create_backend
+        print("This opens the Studio profile menu once (guarded: Studio must be idle and in front). Reading...")
+        system = Win32WindowSystem()
+        svc = CaptureService(system, interval=0.3); svc.bind(cfg.target.hwnd)
+        import time as _t; _t.sleep(1.5)
+        ocr = create_backend(cfg.detection.ocr_backend, cfg.detection.ocr_language, cfg.detection.ocr_upscale)
+        a = cfg.account
+        ctx = LookupContext(system=system, interactor=Win32Interactor(system), identity=cfg.target,
+                            ocr=lambda img: ocr.recognize(img).text,
+                            fresh_frame=lambda: (f.image if (f := svc.frame(max_age=float("inf"))) else None),
+                            profile_region=cfg.profile_region, offset_right=a.profile_offset_right,
+                            offset_top=a.profile_offset_top, idle_required=a.idle_seconds, timeout=a.timeout_seconds,
+                            allow_physical=a.allow_physical_click, log=print)
+        res = perform_lookup(ctx)
+        svc.stop()
+        print(f"result: {res.status} username={('@' + res.username) if res.username else '-'} display={res.display_name or '-'} "
+              f"source={res.source or '-'} error={res.error or '-'} attempts={res.attempts}")
+        print("steps:", "; ".join(res.steps))
+        return 0 if res.status == "SUCCEEDED" else 1
+    ident = store.load()
+    print(f"status={ident.status} username={ident.handle or '-'} display_name={ident.display_name or '-'} "
+          f"source={ident.source or '-'} observed={ident.observed_utc or '-'} episode={ident.episode_id or '-'} "
+          f"attempts={ident.attempts} error={ident.error or '-'}")
+    return 0
+
+
 def _test_alert(cfg: AppConfig, cfg_path: Path | None = None) -> int:
     """Send a test notification through every enabled bot (GUI 'Test Telegram')."""
     from .bot_tests import deliver_test_now, enqueue_test
@@ -382,6 +422,8 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--enable", action="store_true"); g.add_argument("--disable", action="store_true")
     g.add_argument("--status", action="store_true")
     sub.add_parser("test-alert")
+    p = sub.add_parser("account", help="TikTok account discovery: status | test | clear")
+    p.add_argument("action", choices=["status", "test", "clear"], nargs="?", default="status")
     p = sub.add_parser("owner", help="show or set the PC owner name used in notification labels")
     p.add_argument("name", nargs="?", help="owner name (omit to show)")
     p.add_argument("--clear", action="store_true", help="clear the owner name (fall back to the machine label)")
@@ -427,6 +469,8 @@ def main(argv: list[str] | None = None) -> int:
         return _history(cfg, args.kind, args.limit, args.expand)
     if cmd == "autostart":
         return _autostart(cfg, cfg_path, args.enable, args.disable)
+    if cmd == "account":
+        return _account(cfg, cfg_path, args.action)
     if cmd == "owner":
         from .labels import OwnerNameError, validate_owner_name
         if args.clear:

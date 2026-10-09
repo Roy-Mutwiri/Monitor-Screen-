@@ -48,7 +48,7 @@ PAGES = [("monitor", "Monitor", "display"), ("bots", "Telegram Bots", "robot"), 
 STATUS_STYLE = {Status.STOPPED: "secondary", Status.RUNNING: "success", Status.DEGRADED: "warning", Status.LOST: "danger"}
 LIVE_STYLE = {"LIVE": "danger", "NOT_LIVE": "info", "UNKNOWN": "secondary"}
 HEALTH_STYLE = {"OK": "success", "DEGRADED": "warning", "NONE": "secondary"}
-REGION_COLORS = {"detect": "#ffcd39", "redact": "#e35d6a", "live": "#479f76"}
+REGION_COLORS = {"detect": "#ffcd39", "redact": "#e35d6a", "live": "#479f76", "profile": "#3dd5f3"}
 BACKEND_NAMES = {"wgc": "Windows Graphics Capture", "printwindow": "PrintWindow", "desktop-crop": "Desktop crop (fallback)"}
 TOKEN_HELP = ("Enter the bot token from @BotFather. This is not your Telegram account password or a Telegram "
               "developer API ID/API hash. The token identifies the sending bot; the chat ID identifies the recipient. "
@@ -403,6 +403,26 @@ class App:
                             "blank uses the machine label.")
         self._show_owner_label()
 
+        acct = tb.Frame(hdr)
+        acct.pack(side="left", padx=(28, 0))
+        tb.Label(acct, text="TikTok account", font=self.fonts["strong"]).grid(row=0, column=0, columnspan=2, sticky="w")
+        self.account_var = tk.StringVar(value="Not detected")
+        self.account_label = tb.Label(acct, textvariable=self.account_var, font=self.fonts["body"])
+        self.account_label.grid(row=1, column=0, sticky="w")
+        self.account_test_btn = tb.Button(acct, text="Detect now", command=self.test_account_lookup, bootstyle="secondary-outline",
+                                          image=ico("person-badge"), compound="left")
+        self.account_test_btn.grid(row=1, column=1, padx=(8, 0))
+        ToolTip(self.account_test_btn, text="Opens Studio’s profile menu once to read the account username.")
+        self.account_meta_var = tk.StringVar(value="")
+        tb.Label(acct, textvariable=self.account_meta_var, font=self.fonts["caption"], bootstyle="secondary", wraplength=360,
+                 justify="left").grid(row=2, column=0, columnspan=2, sticky="w")
+        self.detect_var = tk.BooleanVar(value=self.cfg.account.detect_on_broadcast)
+        chk = tb.Checkbutton(acct, text="Detect account when broadcast starts", variable=self.detect_var,
+                             bootstyle="round-toggle", command=self._toggle_detect)
+        chk.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ToolTip(chk, text="Opens Studio’s profile menu once per broadcast to read the account username.")
+        self._show_account(None)
+
         right = tb.Frame(hdr)
         right.pack(side="right")
         self.start_btn = tb.Button(right, text="Start monitoring", command=self.start, bootstyle="success",
@@ -500,7 +520,7 @@ class App:
         self.region_kind = tk.StringVar(value="detect")
         tb.Label(rrow, text="Draw:", font=self.fonts["strong"]).pack(side="left")
         for text, value, style in (("Popup detection", "detect", "warning"), ("Redaction (privacy)", "redact", "danger"),
-                                   ("Live-status", "live", "success")):
+                                   ("Live-status", "live", "success"), ("Profile control", "profile", "info")):
             tb.Radiobutton(rrow, text=text, variable=self.region_kind, value=value, bootstyle=f"{style}-outline-toolbutton",
                            padding=(8, 3)).pack(side="left", padx=3)
         self.region_clear_btn = tb.Button(rrow, text="Clear all", command=self.clear_regions, bootstyle="secondary-link")
@@ -513,7 +533,8 @@ class App:
         self.region_list.pack(fill="x")
         tb.Label(right, font=self.fonts["caption"], bootstyle="secondary", wraplength=720, justify="left",
                  text="Drag on the preview to add a region. No detection regions = scan the whole window; no live-status "
-                      "regions = classify from the whole window (less reliable). Dialogs are always scanned whole.").pack(anchor="w", pady=(4, 0))
+                      "regions = classify from the whole window (less reliable). Draw a small 'Profile control' box around "
+                      "Studio’s top-right avatar to calibrate account detection. Dialogs are always scanned whole.").pack(anchor="w", pady=(4, 0))
 
         tiles = tb.Frame(page)
         tiles.pack(fill="x", pady=(12, 0))
@@ -773,6 +794,93 @@ class App:
     def _show_owner_label(self) -> None:
         self.owner_label_var.set(f"Notifications: “{self.cfg.notification_label}”")
 
+    def _toggle_detect(self) -> None:
+        self.cfg.account.detect_on_broadcast = bool(self.detect_var.get())
+        self.save()
+        self.log_line("account detection on broadcast start " + ("enabled" if self.cfg.account.detect_on_broadcast else "disabled"))
+
+    def _show_account(self, snap: Optional[dict]) -> None:
+        if snap is None:
+            from ..account import IdentityStore
+            a = IdentityStore(self.queue).load()
+            snap = {"status": a.status, "username": a.username, "display_name": a.display_name, "source": a.source,
+                    "observed_utc": a.observed_utc, "error": a.error, "is_current": False, "in_progress": False}
+        handle = f"@{snap['username']}" if snap.get("username") else ""
+        if snap.get("in_progress"):
+            self.account_var.set("Looking up…")
+            self.account_label.configure(bootstyle="info")
+        elif handle and snap.get("is_current"):
+            self.account_var.set(handle)
+            self.account_label.configure(bootstyle="success")
+        elif handle:
+            self.account_var.set(f"Last detected: {handle}")
+            self.account_label.configure(bootstyle="secondary")
+        else:
+            self.account_var.set("Not detected")
+            self.account_label.configure(bootstyle="default")
+        meta = []
+        if snap.get("observed_utc"):
+            meta.append(f"detected {_local(snap['observed_utc'])}" + (f" via {snap['source']}" if snap.get("source") else ""))
+        st = snap.get("status", "")
+        if st == "FAILED":
+            meta.append(f"lookup failed: {snap.get('error') or 'unknown reason'}")
+        elif st == "IN_PROGRESS":
+            meta.append("lookup in progress")
+        elif st == "DISABLED":
+            meta.append("detection disabled")
+        if snap.get("display_name") and handle:
+            meta.append(f"display name “{snap['display_name']}” (not an identity)")
+        self.account_meta_var.set(" · ".join(meta) if meta else "Opens Studio’s profile menu once per broadcast to read the account username.")
+
+    def test_account_lookup(self) -> None:
+        """Explicit, user-initiated lookup (opens the profile menu once)."""
+        if not self.cfg.target.is_set:
+            messagebox.showinfo("TikTok account", f"Select your {SOURCE_LABEL} window first.")
+            return
+        if not messagebox.askyesno("Detect TikTok account",
+                                   "This opens Studio’s profile menu once (Studio must be idle and in front) and reads "
+                                   "the @username, then closes the menu. Continue?"):
+            return
+        if self.monitor is not None:
+            if self.monitor.request_account_lookup():
+                self.account_var.set("Looking up…")
+            else:
+                self.log_line("a lookup is already running")
+            return
+        from ..account import AccountIdentity, IdentityStore, LookupContext, Win32Interactor, perform_lookup
+        from ..ocr import create_backend
+        a = self.cfg.account
+        store = IdentityStore(self.queue)
+
+        def work():
+            ocr = create_backend(self.cfg.detection.ocr_backend, self.cfg.detection.ocr_language, self.cfg.detection.ocr_upscale)
+            ctx = LookupContext(system=self.system, interactor=Win32Interactor(self.system), identity=self.cfg.target,
+                                ocr=lambda img: ocr.recognize(img).text,
+                                fresh_frame=lambda: (f.image if (f := self.capture_service.frame(max_age=float("inf"))) else None),
+                                profile_region=self.cfg.profile_region, offset_right=a.profile_offset_right,
+                                offset_top=a.profile_offset_top, idle_required=a.idle_seconds, timeout=a.timeout_seconds,
+                                allow_physical=a.allow_physical_click)
+            return perform_lookup(ctx)
+
+        def done(res, exc):
+            if exc is not None:
+                self.log_line(f"account lookup error: {exc}")
+                return
+            ident = store.load()
+            ident.status = res.status if res.status == "SUCCEEDED" else "FAILED"
+            ident.username, ident.display_name, ident.source, ident.error = res.username, res.display_name, res.source, res.error
+            from datetime import timezone as _tz
+            ident.observed_utc = datetime.now(_tz.utc).isoformat(timespec="seconds")
+            ident.attempts += 1
+            store.save(ident)
+            self._show_account({"status": ident.status, "username": ident.username, "display_name": ident.display_name,
+                                "source": ident.source, "observed_utc": ident.observed_utc, "error": ident.error,
+                                "is_current": True, "in_progress": False})
+            self.log_line("account lookup: " + (f"@{res.username} via {res.source}" if res.username else f"failed ({res.error})")
+                          + "; steps: " + "; ".join(res.steps))
+        self.account_var.set("Looking up…")
+        self.bg.run(work, done)
+
     def save_owner(self) -> None:
         try:
             name = validate_owner_name(self.owner_var.get())
@@ -817,6 +925,8 @@ class App:
     def _show_activity(self, s: ActivitySnapshot) -> None:
         self._last_activity = s
         self._show_capture(s.capture, s.health.capture, s.health.capture_reason)
+        if s.account:
+            self._show_account(s.account)
         self.tile_studio.set(s.app_state.replace("_", " ").title(), f"session {s.session_id}" if s.session_id else "",
                              s.last_event or "", "success" if s.app_state == "RUNNING" else "secondary")
         verified = "" if s.live_rules_verified else "rules unverified · "

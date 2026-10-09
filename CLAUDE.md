@@ -31,6 +31,8 @@ src/studio_monitor/
   win32/{api,windows,capture}.py  ctypes bindings, enumeration, CaptureService (WGC > PrintWindow > verified desktop crop)
   health.py / broadcast_events.py debounced health alerts; broadcast episode dedup
   labels.py                       owner name -> notification label; every headline via alerts.headline()
+  account.py                      @username discovery: Interactor protocol (Win32Interactor real), perform_lookup,
+                                  IdentityStore; Monitor pauses the broadcast engine during the lookup
   target.py / tracker.py          identity validation, rediscovery, RUNNING/DEGRADED/LOST
   detection/{rules,detector}.py   popup keyword rules (rules/studio_rules.json)
   incidents.py                    popup confirmation + de-duplication
@@ -60,6 +62,9 @@ src/studio_monitor/
   Studio screenshots. `rules/live_state_rules.json` has `"verified": false`; flip it only after
   `calibrate-live` classifies real LIVE and NOT_LIVE screenshots correctly.
 - Everything in tests is synthetic/replay validation, not real-Studio validation.
+- Studio exposes NO accessibility tree (UIA/IAccessible children = 0); the profile menu is a separate popup HWND.
+  The real menu text was not inspected (interaction on the user's live session was declined), so account
+  OCR is unverified; the user verifies with the header 'Detect now' button / `account test`.
 - Real Telegram delivery was confirmed by the user (restriction screenshot delivered).
 - Broadcast-start detection is verified by synthetic replay only, not with a real broadcast.
 - WGC behaviour verified on this machine with self-owned windows (covered, moved/resized, minimized -> no frames).

@@ -153,12 +153,18 @@ class BroadcastStateEngine:
         self.state = ConfirmedState()
         self._last_obs_mono: Optional[float] = None
         self.last_classification: Optional[Classification] = None
+        self.paused = False   # identity lookup interval: the profile menu may hide live indicators
 
     def observe(self, classification: Optional[Classification]) -> ConfirmedState:
         """Feed one poll. ``None`` means no valid observation this poll
-        (degraded capture, popup on screen, Studio not running)."""
+        (degraded capture, popup on screen, Studio not running). While
+        ``paused`` the confirmed state is frozen: no transition, no fresh
+        confirmation, no streak change."""
         now = self.mono()
         st = self.state
+        if self.paused:
+            st.fresh = False
+            return st
         if classification is None:
             classification = Classification(LiveState.UNKNOWN, reason="no valid observation")
         self.last_classification = classification

@@ -66,7 +66,7 @@ def _finish(lines: list[str], ts: float) -> dict:
 
 def format_alert(incident: Incident, machine_label: str, max_text: int = 400,
                  screenshot_attached: bool = True, reason: str = "",
-                 capture_method: Optional[str] = None, label: str = "") -> dict:
+                 capture_method: Optional[str] = None, label: str = "", account: str = "") -> dict:
     """Return ``{"caption": html, "text": html}`` for a popup incident."""
     label = label or f"{machine_label}’s Live"
     icon, title = _INCIDENT_TITLES.get(incident.category, ("\U0001F6A8", "ALERT"))
@@ -79,6 +79,8 @@ def format_alert(incident: Incident, machine_label: str, max_text: int = 400,
     if incident.manual_attention:
         lines.append(f"{MANUAL_ATTENTION}. Studio is waiting for a human to complete this step; "
                      "the monitor does not interact with Studio.")
+    if account:
+        lines.append(f"TikTok account: {html.escape(account)}")
     lines += [
         f"<b>Reason:</b> <i>{detected}</i>",
         f"<b>Time:</b> {local_ts(ts)}",
@@ -174,15 +176,21 @@ def format_not_live_reminder(machine_label: str, ts: float, threshold_minutes: f
 
 def format_broadcast_started(machine_label: str, ts: float, account_label: str = "", after_gap: bool = False,
                              gap_seconds: float = 0.0, screenshot_attached: bool = True, rules_verified: bool = True,
-                             label: str = "") -> dict:
+                             label: str = "", account_line: str = "", account_note: str = "") -> dict:
     label = label or f"{machine_label}’s Live"
     lines = [
         headline("\U0001F534", label, "HAS GONE LIVE"),
         f"{html.escape(SOURCE_LABEL)} is broadcasting.",
+    ]
+    if account_line:
+        lines.append(f"TikTok account: {html.escape(account_line)}")
+    lines += [
         f"Detected at: {local_ts(ts)}",
         "Status: LIVE",
         f"PC: {html.escape(machine_label)}",
     ]
+    if account_note:
+        lines.append(f"<i>{html.escape(account_note)}</i>")
     if account_label:
         lines.append(f"Account: {html.escape(account_label)}")
     if after_gap:
@@ -196,16 +204,22 @@ def format_broadcast_started(machine_label: str, ts: float, account_label: str =
 
 
 def format_already_live(machine_label: str, ts: float, account_label: str = "", screenshot_attached: bool = True,
-                        rules_verified: bool = True, label: str = "") -> dict:
+                        rules_verified: bool = True, label: str = "", account_line: str = "", account_note: str = "") -> dict:
     label = label or f"{machine_label}’s Live"
     lines = [
         headline("\U0001F534", label, "ALREADY LIVE"),
         f"{html.escape(SOURCE_LABEL)} was already broadcasting when monitoring started "
         "(this is not a newly observed broadcast start).",
+    ]
+    if account_line:
+        lines.append(f"TikTok account: {html.escape(account_line)}")
+    lines += [
         f"Observed at: {local_ts(ts)}",
         "Status: LIVE",
         f"PC: {html.escape(machine_label)}",
     ]
+    if account_note:
+        lines.append(f"<i>{html.escape(account_note)}</i>")
     if account_label:
         lines.append(f"Account: {html.escape(account_label)}")
     if not screenshot_attached:

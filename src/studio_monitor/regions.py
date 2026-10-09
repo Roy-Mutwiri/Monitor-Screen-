@@ -14,7 +14,7 @@ class Region:
     y: float
     w: float
     h: float
-    kind: str = "detect"  # "detect" (popup OCR) | "redact" (privacy mask) | "live" (broadcast-state OCR)
+    kind: str = "detect"  # detect (popup OCR) | redact (privacy mask) | live (broadcast-state OCR) | profile (account control)
 
     def __post_init__(self) -> None:
         for field in ("x", "y", "w", "h"):
@@ -23,7 +23,7 @@ class Region:
                 raise ValueError(f"Region {self.name}: {field}={v} must be within 0..1")
         if self.w <= 0 or self.h <= 0:
             raise ValueError(f"Region {self.name}: width and height must be positive")
-        if self.kind not in ("detect", "redact", "live"):
+        if self.kind not in ("detect", "redact", "live", "profile"):
             raise ValueError(f"Region {self.name}: unknown kind {self.kind!r}")
 
     def to_box(self, width: int, height: int) -> tuple[int, int, int, int]:

@@ -5,3 +5,4 @@ pyinstaller>=6
 windows-capture>=2.0
 numpy>=1.26
 ttkbootstrap>=2.2
+uiautomation>=2.0

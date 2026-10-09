@@ -113,6 +113,39 @@ class HealthConfig:
 
 
 @dataclass
+class AccountConfig:
+    """Automatic TikTok @username discovery when a broadcast starts."""
+    detect_on_broadcast: bool = True
+    timeout_seconds: float = 10.0
+    idle_seconds: float = 1.5                 # user inactivity required before any physical interaction
+    allow_physical_click: bool = True         # UI Automation is tried first; Studio normally exposes no tree
+    profile_offset_right: int = 190           # default avatar position (px from the right edge / top) when no
+    profile_offset_top: int = 24              # 'profile' region has been calibrated on the preview
+
+
+@dataclass
+class AccountConfig:
+    """Automatic TikTok @username discovery when a broadcast starts."""
+    detect_on_broadcast: bool = True
+    timeout_seconds: float = 10.0
+    idle_seconds: float = 1.5                 # user inactivity required before any physical interaction
+    allow_physical_click: bool = True         # UI Automation is tried first; Studio normally exposes no tree
+    profile_offset_right: int = 190           # default avatar position (px from the right edge / top) when no
+    profile_offset_top: int = 24              # 'profile' region has been calibrated on the preview
+
+
+@dataclass
+class AccountConfig:
+    """Automatic TikTok @username discovery when a broadcast starts."""
+    detect_on_broadcast: bool = True
+    timeout_seconds: float = 10.0
+    idle_seconds: float = 1.5                 # user inactivity required before any physical interaction
+    allow_physical_click: bool = True         # UI Automation is tried first; Studio normally exposes no tree
+    profile_offset_right: int = 190           # default avatar position (px from the right edge / top) when no
+    profile_offset_top: int = 24              # 'profile' region has been calibrated on the preview
+
+
+@dataclass
 class UiConfig:
     theme: str = "bootstrap-dark"   # ttkbootstrap theme name (bootstrap-dark | bootstrap-light)
 
@@ -136,6 +169,7 @@ class AppConfig:
     account_label: str = ""                    # optional operator label shown in broadcast alerts
     owner_name: str = ""                       # "Whose PC?" -> notification label "<owner>'s Live"
     ui: UiConfig = field(default_factory=UiConfig)
+    account: AccountConfig = field(default_factory=AccountConfig)
     config_version: int = CONFIG_VERSION
 
     # -- serialisation ----------------------------------------------------
@@ -164,6 +198,9 @@ class AppConfig:
         cfg.capture = CaptureConfig(**_known(CaptureConfig, data.get("capture", {})))
         cfg.health = HealthConfig(**_known(HealthConfig, data.get("health", {})))
         cfg.ui = UiConfig(**_known(UiConfig, data.get("ui", {})))
+        cfg.account = AccountConfig(**_known(AccountConfig, data.get("account", {})))
+        cfg.account = AccountConfig(**_known(AccountConfig, data.get("account", {})))
+        cfg.account = AccountConfig(**_known(AccountConfig, data.get("account", {})))
         if cfg.ui.theme not in ("bootstrap-dark", "bootstrap-light"):
             cfg.ui.theme = "bootstrap-dark"
         cfg.account_label = str(data.get("account_label", "") or "")
@@ -186,6 +223,18 @@ class AppConfig:
     @property
     def live_regions(self) -> list[Region]:
         return [r for r in self.regions if r.kind == "live"]
+
+    @property
+    def profile_region(self) -> Optional[Region]:
+        return next((r for r in self.regions if r.kind == "profile"), None)
+
+    @property
+    def profile_region(self) -> Optional[Region]:
+        return next((r for r in self.regions if r.kind == "profile"), None)
+
+    @property
+    def profile_region(self) -> Optional[Region]:
+        return next((r for r in self.regions if r.kind == "profile"), None)
 
     @property
     def frame_cache_dir(self) -> Path:

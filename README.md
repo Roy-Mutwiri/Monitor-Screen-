@@ -87,6 +87,54 @@ supported the LIVE confirmation, "Detected at" time, optional `account_label`). 
 
 Existing enabled bots were migrated to receive this category; new bots get it by default.
 
+## TikTok account discovery
+
+When a broadcast start is confirmed (or monitoring attaches to an already-live Studio), the monitor
+reads the broadcasting account’s **@username** once per broadcast episode and includes it in the
+start alert:
+
+```
+🔴 Roy’s Live — HAS GONE LIVE
+TikTok LIVE Studio is broadcasting.
+TikTok account: @example_account          (or: unavailable — automatic lookup failed)
+Detected at: 2026-10-09 14:03:11 UTC+03:00
+```
+
+Flow (bounded to `account.timeout_seconds`, default 10 s): the confirming broadcast screenshot is
+saved first and is the image attached to the alert (never the menu). UI Automation is tried first;
+on the reference machine Studio’s Chromium accessibility tree is empty, so the monitor then performs a
+**guarded physical interaction**: wait for user inactivity (`account.idle_seconds`), revalidate the
+window identity (hwnd, pid, process creation time, executable), require Studio to be foreground (it
+is brought forward at most once), hit-test the click point, click the profile control, read the popup
+menu Studio opens as a separate window (OCR cross-checked over two frames), close only that popup
+(Escape while Studio is foreground, otherwise toggle) and restore the previous foreground window if
+the user did not switch. One bounded retry is allowed when no menu appeared.
+
+Rules: only an explicit `@handle` counts; a display name alone yields "unavailable". Nothing is
+inferred from chat, overlays or arbitrary text. Identity is persisted per broadcast episode (status
+NOT_ATTEMPTED / IN_PROGRESS / SUCCEEDED / FAILED, username, display name, source, time, attempts) so
+a monitor restart never re-opens the menu for the same broadcast; a new broadcast reads the account
+again, and the previous one is shown as "Last detected", never as current. While the menu is open the
+broadcast-state engine is paused (no false NOT_LIVE, no offline episode, no second broadcast episode);
+restriction detection, capture health and the alert outbox keep running. If the lookup fails or times
+out, the start alert is still sent with "unavailable — automatic lookup failed" and the reason.
+Subsequent alerts in the same broadcast episode carry the verified handle.
+
+The monitor never clicks Go LIVE / End LIVE, logout, account switching, settings or verification
+controls. Automation is limited to the validated Studio window, its profile control and the popup it
+opened.
+
+**Calibration:** draw a small *Profile control* region around Studio’s top-right avatar on the
+preview (the header is right-aligned and shifts with window width; the default is 190 px from the
+right edge, 24 px from the top). The header "Detect now" button and `studio-monitor account test`
+run one lookup on demand (they open the menu once); `studio-monitor account status|clear` show or
+reset the stored identity. The toggle "Detect account when broadcast starts" (default on) disables
+the whole feature.
+
+**Unverified on a real broadcast:** the exact text of Studio’s profile menu (whether it shows the
+`@username`) could not be inspected during development, so the OCR reading remains unverified until
+you run "Detect now" on your Studio.
+
 ## Health alerts (debounced)
 
 Application/session state, capture health, OCR health, broadcast state and Telegram delivery health

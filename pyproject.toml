@@ -12,6 +12,7 @@ dependencies = [
     "windows-capture>=2.0; sys_platform == 'win32'",
     "numpy>=1.26",
     "ttkbootstrap>=2.2",
+    "uiautomation>=2.0; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

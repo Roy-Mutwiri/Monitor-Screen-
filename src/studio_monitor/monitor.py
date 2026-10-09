@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+from .account import (DISABLED_STATUS, FAILED, IN_PROGRESS, NOT_ATTEMPTED, SUCCEEDED, AccountIdentity, AccountLookupJob,
+                      IdentityStore, Interactor, LookupContext, LookupResult, Win32Interactor)
 from .alerts import (format_alert, format_already_live, format_broadcast_started, format_health_alert,
                      format_not_live_reminder, format_studio_already_running, format_studio_closed,
                      format_studio_opened)
@@ -75,6 +77,7 @@ class ActivitySnapshot:
     reminders_sent: int = 0
     last_event: str = ""
     delivery: dict = field(default_factory=dict)
+    account: dict = field(default_factory=dict)
     health: HealthSnapshot = field(default_factory=HealthSnapshot)
     capture: CaptureStatus = field(default_factory=CaptureStatus)
     target_title: str = ""
@@ -103,7 +106,10 @@ class Monitor:
                  mono: Callable[[], float] = time.monotonic,
                  on_activity: Optional[Callable[[ActivitySnapshot], None]] = None,
                  frame_service: Optional[FrameService] = None,
-                 owns_frame_service: bool = False) -> None:
+                 owns_frame_service: bool = False,
+                 interactor: Optional[Interactor] = None,
+                 inline_lookup: bool = False,
+                 lookup_sleep: Callable[[float], None] = time.sleep) -> None:
         self.cfg = cfg
         self.system = system
         self.capturer = capturer                 # dialogs only (PrintWindow, no desktop fallback)
@@ -160,6 +166,17 @@ class Monitor:
         self._last_seq = -1
         self.last_detections: list[Detection] = []
         self.last_transition = ""
+        # automatic account (@username) discovery
+        self.identity_store = IdentityStore(queue)
+        self.account: AccountIdentity = self.identity_store.load()
+        self.interactor: Optional[Interactor] = interactor
+        if self.interactor is None and client_factory is not None:
+            self.interactor = Win32Interactor(system)
+        self._inline_lookup = inline_lookup
+        self._lookup_sleep = lookup_sleep
+        self._lookup: Optional[AccountLookupJob] = None
+        self._pending_broadcast: Optional[dict] = None
+        self._blocking_detection = False
         self.activity = ActivitySnapshot(live_rules_verified=self.live_rules.verified)
         if cfg.target.hwnd:
             self.frames.bind(cfg.target.hwnd)
@@ -275,6 +292,7 @@ class Monitor:
                     log.debug("detection %s suppressed: %s", det.category, decision.reason)
         self.incidents.tick()
         self.last_detections = detections
+        self._blocking_detection = bool(detections)
         if self._ocr_failures == 0:
             self.health.ocr, self.health.ocr_reason = "OK", ""
 
@@ -288,6 +306,7 @@ class Monitor:
         if screenshot_ok and fresh_frame and not popup_on_main and self.sessions.running:
             classification = self._classify_live(main_cap, main_full_text)
         self._update_broadcast_and_reminders(classification, main_cap if fresh_frame else None)
+        self._poll_lookup()
 
         self._update_health(state)
         self._emit_status(self.tracker.state.status, self.tracker.state.reason)
@@ -311,6 +330,7 @@ class Monitor:
             inc, self.cfg.machine_label, self.cfg.privacy.max_text_in_alert,
             screenshot_attached=attach, reason=reason if reason != "new incident" else "",
             capture_method=det.capture.method, label=self.cfg.notification_label,
+            account=self.current_account_handle(),
         )
         payload["created_at"] = self.clock()
         stored_text = inc.text if self.cfg.privacy.store_detected_text else ""
@@ -423,6 +443,22 @@ class Monitor:
         if out.due is not None:
             self._send_reminder(out.due)
 
+    # ---- broadcast-start alert + account discovery ----------------------
+    def current_account_handle(self) -> str:
+        """Verified @handle for the *current* broadcast episode, else ''."""
+        a = self.account
+        if a.status == SUCCEEDED and a.username and a.episode_id and a.episode_id == self.episodes.state.episode_id:
+            return a.handle
+        return ""
+
+    def account_snapshot(self) -> dict:
+        a = self.account
+        current = bool(a.episode_id) and a.episode_id == self.episodes.state.episode_id \
+            and self.sessions.state.session is not None and (not a.session_id or a.session_id == self.sessions.session_id)
+        return {"status": a.status, "username": a.username, "display_name": a.display_name, "source": a.source,
+                "observed_utc": a.observed_utc, "error": a.error, "episode_id": a.episode_id, "attempts": a.attempts,
+                "is_current": current, "in_progress": self._lookup is not None}
+
     def _handle_broadcast_event(self, bev, evidence_cap: Optional[Capture]) -> None:
         now = self.clock()
         if bev.kind == "ended":
@@ -431,22 +467,140 @@ class Monitor:
             self.on_event(f"broadcast episode {bev.episode_id} ended (confirmed NOT_LIVE)")
             return
         eid = _event_id("BCS", now)
-        # the exact frame that supported the LIVE confirmation (already redacted)
+        # preserve the exact frame that supported the LIVE confirmation *before* anything else happens
         shot = self._save_evidence(eid, evidence_cap.image if evidence_cap is not None else None)
+        pend = {"eid": eid, "bev": bev, "shot": shot, "ts": now}
+        act = self.cfg.account
+        if self.account.episode_id != bev.episode_id:
+            # a new broadcast: previous identity is history, never reused as verified
+            self.account = AccountIdentity(episode_id=bev.episode_id, session_id=self.sessions.session_id)
+            self.identity_store.save(self.account)
+        a = self.account
+        if not act.detect_on_broadcast:
+            a.status = DISABLED_STATUS
+            self.identity_store.save(a)
+            self._dispatch_broadcast(pend)
+            return
+        if a.status in (SUCCEEDED, FAILED, DISABLED_STATUS):
+            # already looked up for this episode (e.g. monitor restart while live): never open the menu again
+            self._dispatch_broadcast(pend)
+            return
+        if a.status == IN_PROGRESS:
+            a.status, a.error = FAILED, "lookup interrupted by a monitor restart"
+            self.identity_store.save(a)
+            self._dispatch_broadcast(pend)
+            return
+        if self.interactor is None:
+            a.status, a.error = FAILED, "no interaction backend available"
+            self.identity_store.save(a)
+            self._dispatch_broadcast(pend)
+            return
+        a.status, a.attempts = IN_PROGRESS, a.attempts + 1
+        self.identity_store.save(a)
+        self._pending_broadcast = pend
+        self.broadcast.paused = True
+        ctx = LookupContext(
+            system=self.system, interactor=self.interactor, identity=self.tracker.identity,
+            ocr=self.detector.ocr_text, fresh_frame=self._fresh_image, profile_region=self.cfg.profile_region,
+            offset_right=act.profile_offset_right, offset_top=act.profile_offset_top, idle_required=act.idle_seconds,
+            timeout=act.timeout_seconds, blocked=lambda: self._blocking_detection, allow_physical=act.allow_physical_click,
+            clock=self.clock, mono=self.mono, sleep=self._lookup_sleep, log=self.on_event,
+        )
+        self._lookup = AccountLookupJob(ctx, bev.episode_id, self.mono())
+        self.on_event(f"account lookup started for broadcast {bev.episode_id} (opens the profile menu once, "
+                      f"{act.timeout_seconds:g} s budget); broadcast alert waits for the result")
+        if self._inline_lookup:
+            self._lookup._run()
+        else:
+            self._lookup.start()
+
+    def _fresh_image(self):
+        f = self.frames.frame()
+        return f.image if f is not None else None
+
+    def _poll_lookup(self) -> None:
+        job = self._lookup
+        if job is None:
+            return
+        studio_gone = self.sessions.state.session is None
+        if not (job.done or job.expired(self.mono()) or studio_gone):
+            return
+        res = job.result
+        if res is None:
+            res = LookupResult(status=FAILED, error=("target exited during lookup" if studio_gone else
+                                                     f"lookup timed out after {job.ctx.timeout:g} s"))
+        a = self.account
+        a.status = SUCCEEDED if res.status == SUCCEEDED else FAILED
+        a.username, a.display_name, a.source, a.error = res.username, res.display_name, res.source, res.error
+        a.attempts = max(a.attempts, res.attempts)
+        a.observed_utc = _utc(res.observed_at or self.clock())
+        self.identity_store.save(a)
+        self.broadcast.paused = False
+        self._lookup = None
+        if res.steps:
+            self.on_event("account lookup steps: " + "; ".join(res.steps))
+        if a.status == SUCCEEDED:
+            self.on_event(f"account detected: @{a.username} (source {a.source})")
+        else:
+            self.on_event(f"account lookup failed: {a.error or 'unknown reason'}")
+        if not res.closed_menu:
+            self.on_event("WARNING: the Studio profile menu may still be open")
+        pend, self._pending_broadcast = self._pending_broadcast, None
+        if pend is not None:
+            self._dispatch_broadcast(pend)
+
+    def _dispatch_broadcast(self, pend: dict) -> None:
+        bev, eid, shot, now = pend["bev"], pend["eid"], pend["shot"], pend["ts"]
+        a = self.account
+        account_line = a.account_line()
+        note = ""
+        if a.status == FAILED and a.error:
+            note = f"Account lookup: {a.error}"
         if bev.kind == "already_live":
             payload = format_already_live(self.cfg.machine_label, now, self.cfg.account_label, bool(shot),
-                                          self.live_rules.verified, label=self.cfg.notification_label)
+                                          self.live_rules.verified, label=self.cfg.notification_label,
+                                          account_line=account_line, account_note=note)
             summary, etype = "Studio is already LIVE (monitoring started)", EVT_ALREADY_LIVE
         else:
             payload = format_broadcast_started(self.cfg.machine_label, now, self.cfg.account_label,
                                                bev.kind == "started_after_gap", bev.gap_seconds, bool(shot),
-                                               self.live_rules.verified, label=self.cfg.notification_label)
-            summary, etype = ("Studio has gone LIVE" + (" (observed after a gap)" if bev.kind == "started_after_gap" else ""),
-                              EVT_BROADCAST_STARTED)
+                                               self.live_rules.verified, label=self.cfg.notification_label,
+                                               account_line=account_line, account_note=note)
+            summary = "Studio has gone LIVE" + (" (observed after a gap)" if bev.kind == "started_after_gap" else "")
+            etype = EVT_BROADCAST_STARTED
         n = self.dispatch(eid, KIND_ACTIVITY, CAT_BROADCAST, payload, shot, label=summary)
         self.queue.record_event(eid, etype, _utc(now), {"summary": summary, "screenshot": bool(shot), "bots": n,
-                                                        "kind": bev.kind}, episode_id=bev.episode_id, screenshot_path=shot)
-        self.on_event(f"{summary} -> {eid} queued for {n} bot(s){'' if shot else ' (text only)'}")
+                                                        "kind": bev.kind, "account": a.handle or account_line,
+                                                        "account_status": a.status, "account_source": a.source},
+                                episode_id=bev.episode_id, screenshot_path=shot)
+        self.on_event(f"{summary} -> {eid} queued for {n} bot(s){'' if shot else ' (text only)'}; TikTok account: {account_line}")
+
+    def request_account_lookup(self) -> bool:
+        """Explicit on-demand lookup (GUI/CLI button). Runs outside a broadcast
+        event; results are stored but no broadcast alert is sent."""
+        if self._lookup is not None or self.interactor is None:
+            return False
+        act = self.cfg.account
+        a = self.account
+        a.status, a.attempts, a.error = IN_PROGRESS, a.attempts + 1, ""
+        a.episode_id = self.episodes.state.episode_id or a.episode_id
+        a.session_id = self.sessions.session_id
+        self.identity_store.save(a)
+        self.broadcast.paused = True
+        ctx = LookupContext(
+            system=self.system, interactor=self.interactor, identity=self.tracker.identity,
+            ocr=self.detector.ocr_text, fresh_frame=self._fresh_image, profile_region=self.cfg.profile_region,
+            offset_right=act.profile_offset_right, offset_top=act.profile_offset_top, idle_required=act.idle_seconds,
+            timeout=act.timeout_seconds, blocked=lambda: self._blocking_detection, allow_physical=act.allow_physical_click,
+            clock=self.clock, mono=self.mono, sleep=self._lookup_sleep, log=self.on_event,
+        )
+        self._lookup = AccountLookupJob(ctx, a.episode_id, self.mono())
+        self.on_event("manual account lookup started (opens the Studio profile menu once)")
+        if self._inline_lookup:
+            self._lookup._run()
+        else:
+            self._lookup.start()
+        return True
 
     def _send_reminder(self, due: ReminderDue) -> None:
         act = self.cfg.activity
@@ -516,6 +670,7 @@ class Monitor:
             offline_seconds=rs.accumulated_seconds, remaining_seconds=self.reminders.remaining_seconds(),
             accumulating=self.reminders.accumulating, episode_id=rs.episode_id, reminders_sent=rs.reminders_sent,
             last_event=st.last_event, delivery=self.queue.delivery_status(), health=HealthSnapshot(**self.health.__dict__),
+            account=self.account_snapshot(),
             capture=self.frames.status(), target_title=self.tracker.identity.title, target_hwnd=self.tracker.identity.hwnd,
         )
         self.on_activity(self.activity)
