@@ -54,6 +54,7 @@ class Incident:
     is_dialog: bool = False
     screenshot_path: str = ""
     manual_attention: bool = False
+    gone_reported: bool = False   # popup not seen for resolve_after -> reported once to the incident engine
 
 
 @dataclass
@@ -82,6 +83,7 @@ class IncidentTracker:
         self.active: dict[str, Incident] = {}
         self._pending: dict[str, _Pending] = {}
         self.history: list[Incident] = []
+        self.newly_gone: list[Incident] = []
 
     # ------------------------------------------------------------------
     def _find_similar(self, category: str, text: str) -> Optional[Incident]:
@@ -101,6 +103,7 @@ class IncidentTracker:
         if inc is not None:
             gone_for = now - inc.last_seen
             inc.last_seen = now
+            inc.gone_reported = False
             if gone_for >= self.resolve_after:
                 # It went away and came back: a fresh occurrence.
                 return self._alert(inc, now, "popup reappeared after being resolved", renew_id=True)
@@ -139,11 +142,18 @@ class IncidentTracker:
 
     def tick(self) -> list[Incident]:
         """Call every poll (even with no detections). Expires stale pendings and
-        returns incidents that have resolved (not seen for resolve_after)."""
+        returns incidents that have fully expired from dedup memory. Incidents
+        whose popup has not been seen for ``resolve_after`` are listed once in
+        :attr:`newly_gone` (the durable incident engine resolves on that)."""
         now = self.clock()
         for fp, pend in list(self._pending.items()):
             if now - pend.last_seen > self.resolve_after:
                 del self._pending[fp]
+        self.newly_gone = []
+        for inc in self.active.values():
+            if not inc.gone_reported and inc.alerts_sent and now - inc.last_seen >= self.resolve_after:
+                inc.gone_reported = True
+                self.newly_gone.append(inc)
         resolved = []
         for fp, inc in list(self.active.items()):
             if now - inc.last_seen >= self.resolve_after * 4 + self.cooldown:

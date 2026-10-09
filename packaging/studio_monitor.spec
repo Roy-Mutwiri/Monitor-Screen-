@@ -14,8 +14,9 @@ SRC = os.path.join(ROOT, "src")
 
 hidden = ["studio_monitor.gui.app", "PIL.ImageTk"]
 datas = [(os.path.join(ROOT, "rules", name), "rules") for name in ("studio_rules.json", "live_state_rules.json")]
+datas += [(os.path.join(ROOT, "models", "face_detection_yunet_2023mar.onnx"), "models")]
 binaries = []
-for pkg in ("winrt", "winocr", "windows_capture", "numpy", "ttkbootstrap", "uiautomation", "comtypes"):
+for pkg in ("winrt", "winocr", "windows_capture", "numpy", "ttkbootstrap", "uiautomation", "comtypes", "tzdata", "cv2", "psutil"):
     try:
         hidden += collect_submodules(pkg)
         datas += collect_data_files(pkg)

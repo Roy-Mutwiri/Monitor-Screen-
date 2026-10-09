@@ -135,6 +135,33 @@ the whole feature.
 `@username`) could not be inspected during development, so the OCR reading remains unverified until
 you run "Detect now" on your Studio.
 
+## Incidents, acknowledgement, escalation, maintenance, schedules
+
+Every popup detection opens one **durable incident** per device / session / category / problem
+episode (`incident_engine.py`, SQLite). Lifecycle (OPEN → RESOLVED) is separate from
+acknowledgement: `/ack` or `studio-monitor incidents ack ID` pauses escalation but does not resolve
+the fault. Severity defaults: verification, suspension, LIVE interruption and restriction notices are
+URGENT (reminder after 5 min, every 5 min, max 3); content warnings are WARNING (30 min, max 2).
+Reminders and the resolution notice reply to the incident's root Telegram message, tracked per bot
+and destination; if the root is unknown a labelled continuation is sent. Resolution wording follows the
+evidence: "no longer visible in Studio (this does not confirm the restriction was lifted)". Frequent
+repeats are coalesced into the timeline (`incidents timeline ID`).
+
+**Maintenance / break mode** (`studio-monitor maintenance enter MINUTES [--categories ...]`): selected
+expected conditions are recorded but not delivered until the explicit end; restrictions and
+verification stay enabled unless deliberately included. Snoozes work per incident, device or category.
+
+**Schedules** (Settings → Device & schedule, or `studio-monitor schedule --enable --tz Africa/Nairobi
+--days mon,tue --start 20:00 --end 23:00 --grace 15`): per-device IANA timezone with DST-safe,
+overnight-capable windows. Ordinary go-live reminders run only inside scheduled hours; a confirmed
+NOT_LIVE past start + grace sends one "scheduled start missed" notice per window. UNKNOWN never counts.
+
+**Device identity**: each installation has a stable `device.device_id` UUID (generated on first save),
+a display name, an optional expected TikTok account (compared with the verified observed account),
+and a mode: `standalone` (local Telegram delivery) or `managed` (a hub owns delivery; events are
+recorded locally and delivered by the hub, so there are no duplicate notifications). Local bot
+settings are kept in both modes.
+
 ## Health alerts (debounced)
 
 Application/session state, capture health, OCR health, broadcast state and Telegram delivery health

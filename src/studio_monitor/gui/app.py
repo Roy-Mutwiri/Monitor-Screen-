@@ -76,6 +76,12 @@ def _fmt_ts(ts) -> str:
     return datetime.fromtimestamp(float(ts)).strftime("%m-%d %H:%M:%S") if ts else "-"
 
 
+def _sched_set(cfg: AppConfig, key: str, value) -> None:
+    s = cfg.schedule
+    setattr(s, key, value)
+    cfg.device.schedule = s.to_dict()
+
+
 def _fmt_ts_iso(iso: str) -> str:
     try:
         return datetime.fromisoformat(iso).astimezone().strftime("%m-%d %H:%M")
@@ -727,6 +733,19 @@ class App:
                  lambda v: setattr(c.telegram, "delivery_max_age_hours", max(1.0, v)), ""),
                 ("concurrency", "Bots delivered in parallel", "int", lambda: c.telegram.delivery_concurrency,
                  lambda v: setattr(c.telegram, "delivery_concurrency", max(1, min(10, v))), ""),
+            ]),
+            ("Device & schedule", [
+                ("device_name", "Device display name", "str", lambda: c.device.device_name, lambda v: setattr(c.device, "device_name", v),
+                 "Shown in the fleet hub. The device id is a stable installation UUID."),
+                ("expected_account", "Expected TikTok account (optional)", "str", lambda: c.device.expected_account,
+                 lambda v: setattr(c.device, "expected_account", v.strip().lstrip("@")), "Warns when the verified observed account differs."),
+                ("sched_enabled", "Streaming schedule enabled", "bool", lambda: c.schedule.enabled, lambda v: _sched_set(c, "enabled", v), ""),
+                ("sched_tz", "Schedule timezone (IANA)", "str", lambda: c.schedule.timezone, lambda v: _sched_set(c, "timezone", v or "UTC"), "e.g. Africa/Nairobi"),
+                ("sched_days", "Weekdays", "str", lambda: ",".join(c.schedule.weekdays),
+                 lambda v: _sched_set(c, "weekdays", [d.strip().lower()[:3] for d in v.split(",") if d.strip()]), "mon,tue,...,sun"),
+                ("sched_start", "Start (HH:MM)", "str", lambda: c.schedule.start, lambda v: _sched_set(c, "start", v or "20:00"), ""),
+                ("sched_end", "End (HH:MM)", "str", lambda: c.schedule.end, lambda v: _sched_set(c, "end", v or "23:00"), "end before start = overnight"),
+                ("sched_grace", "Missed-start grace (minutes)", "int", lambda: c.schedule.grace_minutes, lambda v: _sched_set(c, "grace_minutes", max(0, v)), ""),
             ]),
             ("Startup", [
                 ("signin", "Start Monitor Screen when I sign in to Windows", "bool", lambda: c.activity.start_at_signin,

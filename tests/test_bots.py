@@ -224,7 +224,8 @@ def test_subscriptions_route_categories(cfg, rules, clock, tmp_path):
     clock.advance(700)
     ocr.default = POPUP
     mon.tick()
-    assert sorted(d["bot_name"] for d in all_deliveries(queue)) == ["Puzzles", "Restrictions"]
+    alerts = [d for d in all_deliveries(queue) if d["event_id"].count("-") == 3]   # exclude -RES / -E1 follow-ups
+    assert sorted(d["bot_name"] for d in alerts) == ["Puzzles", "Restrictions"]
 
 
 def test_one_failing_bot_and_independent_rate_limits_in_monitor(cfg, rules, clock, tmp_path):

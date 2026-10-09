@@ -32,6 +32,8 @@ from .detection.rules import RuleSet
 from .framecache import FrameCache
 from .health import HealthAlertPolicy, HealthSnapshot
 from .incidents import Incident, IncidentTracker
+from .incident_engine import IncidentEngine
+from .contracts.events import Severity
 from .ocr.base import OcrBackend, OcrError
 from .privacy import purge_old_screenshots, redact
 from .queue import KIND_ACTIVITY, KIND_INCIDENT, KIND_STATUS, Delivery, DeliveryError, DeliveryQueue, DeliveryWorker
@@ -90,6 +92,13 @@ def _event_id(prefix: str, ts: float) -> str:
 
 def incident_category(popup_category: str) -> str:
     return CAT_VERIFICATION if popup_category == "verification_puzzle" else CAT_RESTRICTIONS
+
+
+def incident_severity(popup_category: str) -> str:
+    """Configurable defaults: verification and hard restrictions are urgent."""
+    if popup_category in ("verification_puzzle", "account_suspension", "live_interruption", "restriction_notice"):
+        return Severity.URGENT
+    return Severity.WARNING
 
 
 class Monitor:
@@ -155,6 +164,11 @@ class Monitor:
                                                recover_after=cfg.health.recover_after_seconds, clock=clock, mono=mono)
         self.health = HealthSnapshot()
         self._ocr_failures = 0
+        # durable incident engine (lifecycle / ack / snooze / maintenance / escalation) on the same SQLite file
+        cfg.ensure_device_id()
+        self.device_id = cfg.device.device_id
+        self.incident_engine = IncidentEngine(queue._conn, queue._lock, clock)
+        self._missed_start_window: Optional[str] = None
         self.worker: Optional[DeliveryWorker] = None
         if client_factory is not None:
             self.worker = DeliveryWorker(queue, self.send_delivery, cfg.telegram.delivery_concurrency,
@@ -199,15 +213,27 @@ class Monitor:
         client = self.client_factory.client(d.bot_id, d.chat_id, d.thread_id)
         if client is None:
             raise DeliveryError("bot token not available in the credential store", permanent=True)
-        result = deliver(client, d.payload, d.evidence_path, self.clock)
-        return result.get("message_id") if isinstance(result, dict) else None
+        thread_of = d.payload.get("thread_of") or ""
+        reply_to = self.incident_engine.root_message(thread_of, d.bot_id, d.chat_id) if thread_of else None
+        result = deliver(client, d.payload, d.evidence_path, self.clock, reply_to=reply_to)
+        message_id = result.get("message_id") if isinstance(result, dict) else None
+        if message_id and not thread_of and d.event_id.startswith("INC-"):
+            # first message of an incident: remember the root per bot/destination for threaded follow-ups
+            self.incident_engine.set_root_message(d.event_id, d.bot_id, d.chat_id, d.thread_id, int(message_id))
+        return message_id
 
     def dispatch(self, event_id: str, kind: str, category: str, payload: dict, evidence_path: str,
-                 label: str = "") -> int:
-        """Create one event + one delivery per enabled subscribed bot."""
-        targets = self.registry.targets(category)
+                 label: str = "", incident_id: str = "") -> int:
+        """Create one event + one delivery per enabled subscribed bot. Deliveries
+        are withheld (the event is still recorded) while the category is
+        suppressed by maintenance or a snooze, or when a hub owns delivery."""
+        suppressed = self.incident_engine.is_suppressed(self.device_id, category, incident_id)
+        managed = self.cfg.device.mode == "managed"
+        targets = [] if (suppressed or managed) else self.registry.targets(category)
         n = self.queue.create_event(event_id, kind, category, payload, evidence_path, targets, label,
                                     owner_label=self.cfg.notification_label)
+        if suppressed:
+            self.on_event(f"{label or event_id}: recorded but not delivered (maintenance/snooze active for {category})")
         self._kick()
         return n
 
@@ -291,6 +317,9 @@ class Monitor:
                 else:
                     log.debug("detection %s suppressed: %s", det.category, decision.reason)
         self.incidents.tick()
+        for gone in self.incidents.newly_gone:
+            self._resolve_popup_incident(gone)
+        self._escalate_due()
         self.last_detections = detections
         self._blocking_detection = bool(detections)
         if self._ocr_failures == 0:
@@ -337,12 +366,68 @@ class Monitor:
         self.queue.record_incident(inc.incident_id, inc.category, inc.label, stored_text,
                                    inc.window_title, inc.is_dialog, inc.screenshot_path)
         event_id = inc.incident_id if inc.alerts_sent <= 1 else f"{inc.incident_id}-R{inc.alerts_sent}"
-        n = self.dispatch(event_id, KIND_INCIDENT, incident_category(inc.category), payload,
-                          inc.screenshot_path if attach else "", label=inc.label)
+        category = incident_category(inc.category)
+        change = self.incident_engine.open_or_update(
+            self.device_id, category, inc.category, incident_severity(inc.category), inc.label + ": " + inc.text[:200],
+            session_id=self.sessions.session_id, evidence_path=inc.screenshot_path, account=self.current_account_handle(),
+            owner_label=self.cfg.notification_label, incident_id=inc.incident_id)
+        if inc.alerts_sent > 1:
+            payload["thread_of"] = change.incident.incident_id
+        n = self.dispatch(event_id, KIND_INCIDENT, category, payload, inc.screenshot_path if attach else "",
+                          label=inc.label, incident_id=change.incident.incident_id)
         self.on_event(
             f"{'MANUAL ATTENTION: ' if inc.manual_attention else ''}{inc.label} detected in "
             f"{'dialog' if inc.is_dialog else 'main window'} -> {event_id} queued for {n} bot(s) ({reason})"
         )
+
+    def _resolve_popup_incident(self, inc: Incident) -> None:
+        """The popup is no longer visible. That is all the evidence says."""
+        eng_inc = self.incident_engine.get(inc.incident_id)
+        if eng_inc is None or not eng_inc.is_open:
+            return
+        text = f"{inc.label} no longer visible in Studio (this does not confirm the restriction was lifted)"
+        self.incident_engine.resolve(inc.incident_id, text, observed_utc=_utc(self.clock()))
+        payload = {"text": f"\u2705 <b>{self.cfg.notification_label} \u2014 RESOLVED</b>\n{text}\nIncident <code>{inc.incident_id}</code>\n"
+                           f"Time: {datetime.fromtimestamp(self.clock()):%Y-%m-%d %H:%M:%S}", "created_at": self.clock(),
+                   "thread_of": inc.incident_id}
+        payload["caption"] = payload["text"]
+        self.dispatch(f"{inc.incident_id}-RES", KIND_INCIDENT, incident_category(inc.category), payload, "",
+                      label=f"{inc.label} resolved", incident_id=inc.incident_id)
+        self.on_event(f"incident {inc.incident_id} resolved: {text}")
+
+    def _escalate_due(self) -> None:
+        for due in self.incident_engine.escalations_due():
+            claimed = self.incident_engine.claim_escalation(due.incident.incident_id, due.claim_seq)
+            if claimed is None:
+                continue
+            inc = claimed
+            text = (f"\u23F0 <b>{self.cfg.notification_label} \u2014 STILL OPEN</b>\n{inc.summary}\n"
+                    f"Reminder {inc.reminders_sent}; open since {inc.opened_utc}. Reply /ack {inc.incident_id} when handled.")
+            payload = {"text": text, "caption": text, "created_at": self.clock(), "thread_of": inc.incident_id}
+            self.dispatch(f"{inc.incident_id}-E{inc.reminders_sent}", KIND_INCIDENT, inc.category, payload, inc.evidence_path,
+                          label=f"Escalation {inc.reminders_sent}", incident_id=inc.incident_id)
+            self.on_event(f"escalation reminder {inc.reminders_sent} for {inc.incident_id} queued")
+
+    def _check_schedule(self, confirmed: LiveState) -> None:
+        sched = self.cfg.schedule
+        from datetime import datetime as _dt, timezone as _tz
+        now = _dt.fromtimestamp(self.clock(), tz=_tz.utc)
+        self.reminders.enabled = self.cfg.activity.reminders_enabled and sched.reminders_allowed(now)
+        if not sched.enabled or self.sessions.state.session is None:
+            return
+        win = sched.window_at(now)
+        key = win[0].isoformat() if win else None
+        if key is None:
+            self._missed_start_window = None
+            return
+        if sched.missed_start(now, confirmed.value) and self._missed_start_window != key:
+            self._missed_start_window = key
+            text = (f"\u23F0 <b>{self.cfg.notification_label} \u2014 SCHEDULED START MISSED</b>\n"
+                    f"Scheduled window started {win[0].astimezone().strftime('%H:%M')} ({sched.describe()}); Studio is confirmed not live "
+                    f"{sched.grace_minutes} minutes after the start.")
+            self.dispatch(_event_id("SCH", self.clock()), KIND_ACTIVITY, CAT_REMINDERS,
+                          {"text": text, "caption": text, "created_at": self.clock()}, "", label="Scheduled start missed")
+            self.on_event("scheduled start missed (confirmed NOT_LIVE inside the scheduled window)")
 
     # ---- sessions ----------------------------------------------------
     def _update_sessions(self, window_present: bool, screenshot_ok: bool) -> None:
@@ -421,6 +506,7 @@ class Monitor:
     def _update_broadcast_and_reminders(self, classification: Optional[Classification],
                                         evidence_cap: Optional[Capture]) -> None:
         cs = self.broadcast.observe(classification)
+        self._check_schedule(cs.state)
         for old, new, why in self.broadcast.drain_transitions():
             self.last_transition = f"{old.value} -> {new.value} at {datetime.fromtimestamp(self.clock()):%H:%M:%S}"
             self.on_event(f"broadcast state {old.value} -> {new.value} ({why})")

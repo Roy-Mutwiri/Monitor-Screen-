@@ -31,6 +31,10 @@ src/studio_monitor/
   win32/{api,windows,capture}.py  ctypes bindings, enumeration, CaptureService (WGC > PrintWindow > verified desktop crop)
   health.py / broadcast_events.py debounced health alerts; broadcast episode dedup
   labels.py                       owner name -> notification label; every headline via alerts.headline()
+  contracts/events.py             Event contract (schema v1) shared with the hub
+  incident_engine.py              durable incidents: OPEN/RESOLVED, ack, snooze, maintenance, escalation claims,
+                                  per-destination root message ids (Monitor.dispatch honours suppression + managed mode)
+  schedules.py                    IANA-timezone streaming schedule, DST/overnight, missed start
   account.py                      @username discovery: Interactor protocol (Win32Interactor real), perform_lookup,
                                   IdentityStore; Monitor pauses the broadcast engine during the lookup
   target.py / tracker.py          identity validation, rediscovery, RUNNING/DEGRADED/LOST

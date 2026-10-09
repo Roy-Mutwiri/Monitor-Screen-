@@ -99,7 +99,7 @@ def test_queued_events_keep_their_original_label(cfg, rules, clock):
     h.ocr.default = PUZZLE
     clock.advance(700)
     h.run(4)
-    ds = [d for d in all_deliveries(h.queue) if d["kind"] == "incident"]
+    ds = [d for d in all_deliveries(h.queue) if d["kind"] == "incident" and d["event_id"].count("-") == 3]
     assert len(ds) == 2
     assert "Roy’s Live" in ds[0]["payload"]["caption"] and ds[0]["status"] == "pending"
     assert "Ann’s Live — VERIFICATION REQUIRED" in ds[1]["payload"]["caption"]

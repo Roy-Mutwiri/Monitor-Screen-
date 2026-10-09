@@ -334,6 +334,71 @@ def _set_telegram(cfg: AppConfig, cfg_path: Path, args) -> int:
     return 0
 
 
+def _engine(cfg: AppConfig):
+    from .incident_engine import IncidentEngine
+    q = open_queue(cfg)
+    cfg.ensure_device_id()
+    return q, IncidentEngine(q._conn, q._lock)
+
+
+def _maintenance(cfg: AppConfig, cfg_path: Path, args) -> int:
+    q, eng = _engine(cfg)
+    dev = cfg.device.device_id
+    if args.action == "enter":
+        if not args.minutes:
+            print("minutes required", file=sys.stderr); return 2
+        cats = [c.strip() for c in args.categories.split(",") if c.strip()]
+        until = eng.enter_maintenance(dev, args.minutes * 60, cats, args.reason)
+        from datetime import datetime
+        print(f"maintenance until {datetime.fromtimestamp(until):%H:%M:%S}; suppressed: {', '.join(eng.maintenance(dev)['categories'])} "
+              "(restrictions and verification stay enabled)")
+        return 0
+    if args.action == "exit":
+        print("maintenance ended" if eng.exit_maintenance(dev) else "no maintenance active"); return 0
+    m = eng.maintenance(dev)
+    print("maintenance:", f"{m['remaining_seconds']/60:.0f} min left, suppressing {m['categories']}" if m else "not active")
+    return 0
+
+
+def _incidents(cfg: AppConfig, args) -> int:
+    q, eng = _engine(cfg)
+    a = args.args
+    if args.action == "list":
+        for inc in eng.list(limit=50):
+            print(f"{inc.incident_id} {inc.status:<8} {inc.severity:<7} ack={'y' if inc.acknowledged else 'n'} x{inc.occurrences} "
+                  f"{inc.category}/{inc.problem_key} {inc.opened_utc} {inc.summary[:70]}")
+        return 0
+    if not a:
+        print("incident id required", file=sys.stderr); return 2
+    if args.action == "ack":
+        inc = eng.acknowledge(a[0], actor="cli", note=" ".join(a[1:])); print("acknowledged" if inc and inc.acknowledged else "not found"); return 0
+    if args.action == "resolve":
+        inc = eng.resolve(a[0], " ".join(a[1:]) or "resolved by operator", actor="cli"); print(inc.status if inc else "not found"); return 0
+    if args.action == "snooze":
+        until = eng.snooze("incident", a[0], float(a[1]) * 60 if len(a) > 1 else 1800, actor="cli"); print(f"snoozed until {until:.0f}"); return 0
+    for t in eng.timeline(a[0]):
+        print(f"{t['ts_utc']} {t['kind']:<12} x{t['coalesced']} {t['text'][:100]} {t['actor']}")
+    return 0
+
+
+def _schedule(cfg: AppConfig, cfg_path: Path, args) -> int:
+    from .schedules import Schedule
+    s = cfg.schedule
+    if args.enable: s.enabled = True
+    if args.disable: s.enabled = False
+    if args.tz: s.timezone = args.tz
+    if args.days: s.weekdays = [d.strip().lower()[:3] for d in args.days.split(",")]
+    if args.start: s.start = args.start
+    if args.end: s.end = args.end
+    if args.grace is not None: s.grace_minutes = args.grace
+    errs = s.validate()
+    if errs:
+        print("invalid schedule: " + "; ".join(errs), file=sys.stderr); return 2
+    cfg.device.schedule = s.to_dict(); cfg.save(cfg_path)
+    print("schedule:", s.describe())
+    return 0
+
+
 def _account(cfg: AppConfig, cfg_path: Path, action: str) -> int:
     from .account import IdentityStore, AccountIdentity, LookupContext, Win32Interactor, perform_lookup
     q = open_queue(cfg)
@@ -422,6 +487,15 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--enable", action="store_true"); g.add_argument("--disable", action="store_true")
     g.add_argument("--status", action="store_true")
     sub.add_parser("test-alert")
+    p = sub.add_parser("maintenance", help="break/maintenance mode: enter MINUTES [--categories a,b] | exit | status")
+    p.add_argument("action", choices=["enter", "exit", "status"]); p.add_argument("minutes", nargs="?", type=float)
+    p.add_argument("--categories", default="face,audio,source,reminders,studio_opened,studio_closed,health")
+    p.add_argument("--reason", default="")
+    p = sub.add_parser("incidents", help="durable incidents: list | ack ID | resolve ID TEXT | snooze ID MINUTES | timeline ID")
+    p.add_argument("action", choices=["list", "ack", "resolve", "snooze", "timeline"]); p.add_argument("args", nargs="*")
+    p = sub.add_parser("schedule", help="show or set the streaming schedule")
+    p.add_argument("--enable", action="store_true"); p.add_argument("--disable", action="store_true")
+    p.add_argument("--tz"); p.add_argument("--days"); p.add_argument("--start"); p.add_argument("--end"); p.add_argument("--grace", type=int)
     p = sub.add_parser("account", help="TikTok account discovery: status | test | clear")
     p.add_argument("action", choices=["status", "test", "clear"], nargs="?", default="status")
     p = sub.add_parser("owner", help="show or set the PC owner name used in notification labels")
@@ -469,6 +543,12 @@ def main(argv: list[str] | None = None) -> int:
         return _history(cfg, args.kind, args.limit, args.expand)
     if cmd == "autostart":
         return _autostart(cfg, cfg_path, args.enable, args.disable)
+    if cmd == "maintenance":
+        return _maintenance(cfg, cfg_path, args)
+    if cmd == "incidents":
+        return _incidents(cfg, args)
+    if cmd == "schedule":
+        return _schedule(cfg, cfg_path, args)
     if cmd == "account":
         return _account(cfg, cfg_path, args.action)
     if cmd == "owner":

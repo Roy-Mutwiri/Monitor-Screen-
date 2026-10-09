@@ -146,6 +146,26 @@ class AccountConfig:
 
 
 @dataclass
+class DeviceConfig:
+    """Stable installation identity and fleet settings (used standalone and when managed by a hub)."""
+    device_id: str = ""                 # uuid4, generated on first save; a copied install enrolls as a new device
+    device_name: str = ""               # display name shown in the hub
+    expected_account: str = ""          # configured expectation; observed account is tracked separately
+    mode: str = "standalone"            # standalone | managed (hub owns Telegram delivery)
+    schedule: dict = field(default_factory=dict)   # schedules.Schedule.to_dict()
+
+
+@dataclass
+class DeviceConfig:
+    """Stable installation identity and fleet settings (used standalone and when managed by a hub)."""
+    device_id: str = ""                 # uuid4, generated on first save; a copied install enrolls as a new device
+    device_name: str = ""               # display name shown in the hub
+    expected_account: str = ""          # configured expectation; observed account is tracked separately
+    mode: str = "standalone"            # standalone | managed (hub owns Telegram delivery)
+    schedule: dict = field(default_factory=dict)   # schedules.Schedule.to_dict()
+
+
+@dataclass
 class UiConfig:
     theme: str = "bootstrap-dark"   # ttkbootstrap theme name (bootstrap-dark | bootstrap-light)
 
@@ -170,6 +190,7 @@ class AppConfig:
     owner_name: str = ""                       # "Whose PC?" -> notification label "<owner>'s Live"
     ui: UiConfig = field(default_factory=UiConfig)
     account: AccountConfig = field(default_factory=AccountConfig)
+    device: DeviceConfig = field(default_factory=DeviceConfig)
     config_version: int = CONFIG_VERSION
 
     # -- serialisation ----------------------------------------------------
@@ -199,6 +220,12 @@ class AppConfig:
         cfg.health = HealthConfig(**_known(HealthConfig, data.get("health", {})))
         cfg.ui = UiConfig(**_known(UiConfig, data.get("ui", {})))
         cfg.account = AccountConfig(**_known(AccountConfig, data.get("account", {})))
+        cfg.device = DeviceConfig(**_known(DeviceConfig, data.get("device", {})))
+        if cfg.device.mode not in ("standalone", "managed"):
+            cfg.device.mode = "standalone"
+        cfg.device = DeviceConfig(**_known(DeviceConfig, data.get("device", {})))
+        if cfg.device.mode not in ("standalone", "managed"):
+            cfg.device.mode = "standalone"
         cfg.account = AccountConfig(**_known(AccountConfig, data.get("account", {})))
         cfg.account = AccountConfig(**_known(AccountConfig, data.get("account", {})))
         if cfg.ui.theme not in ("bootstrap-dark", "bootstrap-light"):
@@ -244,7 +271,21 @@ class AppConfig:
     def activity_screenshots_dir(self) -> Path:
         return self.data_path / "activity_screenshots"
 
+    def ensure_device_id(self) -> str:
+        if not self.device.device_id:
+            import uuid
+            self.device.device_id = str(uuid.uuid4())
+        if not self.device.device_name:
+            self.device.device_name = self.machine_label
+        return self.device.device_id
+
+    @property
+    def schedule(self):
+        from .schedules import Schedule
+        return Schedule.from_dict(self.device.schedule)
+
     def save(self, path: Path) -> None:
+        self.ensure_device_id()
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")

@@ -51,7 +51,8 @@ class Harness:
             self.clock.advance(step)
 
     def alerts(self, kind):
-        return [a for a in self._all_alerts() if a["kind"] == kind]
+        # primary alerts only: follow-ups (-RES resolution, -E<n> escalation) have a fourth dash
+        return [a for a in self._all_alerts() if a["kind"] == kind and not (kind == "incident" and a["event_id"].count("-") > 3)]
 
     def _all_alerts(self):
         return all_deliveries(self.queue)

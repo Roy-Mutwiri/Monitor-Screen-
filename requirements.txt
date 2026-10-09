@@ -6,3 +6,6 @@ windows-capture>=2.0
 numpy>=1.26
 ttkbootstrap>=2.2
 uiautomation>=2.0
+tzdata>=2024.1
+opencv-python-headless>=4.10
+psutil>=6

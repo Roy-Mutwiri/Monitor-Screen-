@@ -150,16 +150,21 @@ class TelegramClient:
             fields["message_thread_id"] = str(self.thread_id)
         return fields
 
-    def send_message(self, text: str, parse_mode: str = "HTML") -> dict:
-        return self._call("sendMessage", self._dest({
-            "text": text, "parse_mode": parse_mode, "disable_web_page_preview": "true",
-        }))
+    def send_message(self, text: str, parse_mode: str = "HTML", reply_to: Optional[int] = None) -> dict:
+        fields = self._dest({"text": text, "parse_mode": parse_mode, "disable_web_page_preview": "true"})
+        if reply_to:
+            fields["reply_to_message_id"] = str(reply_to)
+            fields["allow_sending_without_reply"] = "true"
+        return self._call("sendMessage", fields)
 
-    def send_photo(self, photo_path: str, caption: str, parse_mode: str = "HTML") -> dict:
+    def send_photo(self, photo_path: str, caption: str, parse_mode: str = "HTML", reply_to: Optional[int] = None) -> dict:
         path = Path(photo_path)
         content = path.read_bytes()
-        return self._call("sendPhoto", self._dest({"caption": caption[:1024], "parse_mode": parse_mode}),
-                          files={"photo": (path.name, content)})
+        fields = self._dest({"caption": caption[:1024], "parse_mode": parse_mode})
+        if reply_to:
+            fields["reply_to_message_id"] = str(reply_to)
+            fields["allow_sending_without_reply"] = "true"
+        return self._call("sendPhoto", fields, files={"photo": (path.name, content)})
 
 
 LATE_AFTER_SECONDS = 120.0
@@ -175,23 +180,29 @@ def late_delivery_note(payload: dict, now: float) -> str:
     return f"\n<i>Delayed delivery: sent {local_ts(now)}, generated {local_ts(float(created))}.</i>"
 
 
-def deliver(client: TelegramClient, payload: dict, screenshot_path: str, clock: Callable[[], float] = time.time) -> dict:
+def deliver(client: TelegramClient, payload: dict, screenshot_path: str, clock: Callable[[], float] = time.time,
+            reply_to: Optional[int] = None) -> dict:
     """Send one payload (photo with caption when the evidence file exists,
-    otherwise text). Returns the Telegram result (has ``message_id``)."""
+    otherwise text). ``reply_to`` threads the message under an incident's root
+    message; when the root is unknown the payload may carry a continuation
+    label. Returns the Telegram result (has ``message_id``)."""
     note = late_delivery_note(payload, clock())
-    caption = (payload.get("caption") or payload.get("text") or "") + note
+    prefix = ""
+    if payload.get("thread_of") and not reply_to:
+        prefix = f"<i>Continuation of incident {payload['thread_of']}</i>\n"
+    caption = prefix + (payload.get("caption") or payload.get("text") or "") + note
     if screenshot_path and Path(screenshot_path).exists():
         try:
-            return client.send_photo(screenshot_path, caption[:1024])
+            return client.send_photo(screenshot_path, caption[:1024], reply_to=reply_to)
         except DeliveryError as exc:
             msg = str(exc)
             if exc.permanent or "network" in msg or "rate limited" in msg or "server" in msg or "timeout" in msg:
                 raise
             log.warning("sendPhoto rejected (%s); falling back to text", msg)
-    text = (payload.get("text") or payload.get("caption") or "") + note
+    text = prefix + (payload.get("text") or payload.get("caption") or "") + note
     if screenshot_path and not Path(screenshot_path).exists():
         text += "\n(screenshot no longer available locally)"
-    return client.send_message(text)
+    return client.send_message(text, reply_to=reply_to)
 
 
 class ClientFactory:
