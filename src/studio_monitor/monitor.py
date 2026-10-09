@@ -8,6 +8,7 @@ evidence and one delivery per enabled, subscribed bot (see :mod:`queue`).
 """
 from __future__ import annotations
 
+import json
 import logging
 import secrets
 import threading
@@ -874,9 +875,31 @@ class Monitor:
                                     "popups": [p.popup_type for p in fa.popups], "live": fa.live.state.value if fa.live else "",
                                     "capture_to_analysis_ms": round((fa.analysis_done_mono - fa.captured_mono) * 1000, 1)})
         self.frame_analyses = self.frame_analyses[-200:]
+        self._trace_frame(fa)
         end = fa.popup_of_type(END_CONFIRMATION)
         self._last_end_popup = end if end is not None else self._last_end_popup
         return fa
+
+    def _trace_frame(self, fa: FrameAnalysis) -> None:
+        """Append one line per analysed frame to <data_dir>/frame_trace.jsonl (text evidence only, never images):
+        live state + scores + evidence, control label, popups, timings. Rotated at ~6000 lines. This is what makes a
+        false transition on a real session explainable after the fact."""
+        try:
+            path = self.cfg.data_path / "frame_trace.jsonl"
+            rec = {"t": round(fa.captured_at, 3), "ts": datetime.fromtimestamp(fa.captured_at).strftime("%H:%M:%S"), "frame": fa.frame_id,
+                   "live": fa.live.state.value if fa.live else "", "ls": fa.live.live_score if fa.live else 0,
+                   "nls": fa.live.not_live_score if fa.live else 0, "reason": (fa.live.reason if fa.live else "")[:80],
+                   "ev": [e.detail[:60] for e in (fa.live.evidence if fa.live else [])], "control": fa.control_label[:40],
+                   "popups": [(p.popup_type, p.title[:40]) for p in fa.popups], "obscured": len(fa.obscured),
+                   "geometry": fa.has_geometry, "ms": round(fa.analysis_ms, 1), "confirmed": self.broadcast.state.state.value}
+            self._trace_lines = getattr(self, "_trace_lines", 0) + 1
+            if self._trace_lines % 500 == 0 and path.exists() and path.stat().st_size > 2_000_000:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-3000:]
+                path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as exc:  # pragma: no cover - diagnostics must never break the loop
+            log.debug("frame trace failed: %s", exc)
 
     def _apply_popups(self, fa: FrameAnalysis, cap: Capture, detections: list) -> list:
         """With OCR geometry, restriction detections come from credible popup blocks only (chat/video text is a
@@ -1495,6 +1518,12 @@ class Monitor:
         for old, new, why in self.broadcast.drain_transitions():
             self.last_transition = f"{old.value} -> {new.value} at {datetime.fromtimestamp(self.clock()):%H:%M:%S}"
             self.on_event(f"broadcast state {old.value} -> {new.value} ({why})")
+            try:
+                # the exact (redacted) frame behind a confirmed transition, for post-mortems of real sessions
+                if evidence_cap is not None and evidence_cap.image is not None:
+                    self._save_evidence(f"BCT-{datetime.fromtimestamp(self.clock()):%Y%m%d-%H%M%S}-{old.value[:1]}{new.value[:1]}", evidence_cap.image)
+            except Exception as exc:  # pragma: no cover
+                log.debug("transition frame not saved: %s", exc)
         if classification is None:
             self.episodes.note_gap()
         bev = self.episodes.observe(cs.state, cs.fresh)

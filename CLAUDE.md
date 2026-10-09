@@ -121,6 +121,9 @@ src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy
   app's surface colour (PopupClassifier._on_ui_surface: ad cards in the video preview are not UI), layout located;
   one alert per review cooldown, one-shot (never an incident). Sign-in page = sign_in_screen, LIVE settings sheet /
   go-LIVE setup page (or 3+ blocks spread over >50% of the window) = studio_screen; neither is alerted.
+- Post-mortem of a real session: <data_dir>/frame_trace.jsonl has one line per analysed frame (state, scores, evidence,
+  control label, popups; never images) and activity_screenshots/BCT-*.png is the redacted frame behind every confirmed
+  broadcast transition. Read these before changing any rule after a false transition.
 - tests/test_gui.py must run in its own pytest process: in the same process as the rest of the suite a later hub
   dashboard test dies with Windows fatal exception 0x80000003 (Tk + Jinja/starlette interaction; gui+hub alone pass).
 - Real Studio while LIVE (2026-10-09): the red 'Go LIVE' button is replaced by the elapsed timer; no 'End LIVE' label.
