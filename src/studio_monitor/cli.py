@@ -4,7 +4,10 @@
     studio-monitor list-windows        enumerate selectable windows
     studio-monitor select HWND         store a window as the Studio target
     studio-monitor run                 headless monitoring with the stored target
-    studio-monitor calibrate IMAGE     OCR a real Studio screenshot and show which rules fire
+    studio-monitor calibrate IMAGE     OCR a real Studio screenshot and show which popup rules fire
+    studio-monitor calibrate-live IMAGE  classify a real Studio screenshot as LIVE / NOT_LIVE / UNKNOWN
+    studio-monitor history [--kind]    show restriction incidents and Studio activity events
+    studio-monitor autostart --enable|--disable|--status   start at Windows sign-in (HKCU Run key)
     studio-monitor test-alert          send a test alert through the delivery queue
     studio-monitor set-telegram        store bot token / chat id
     studio-monitor queue               show delivery queue counts / requeue failures
@@ -81,6 +84,54 @@ def _calibrate(cfg: AppConfig, image_path: str, backend: str) -> int:
     return exit_code
 
 
+def _calibrate_live(cfg: AppConfig, image_path: str, backend: str) -> int:
+    from PIL import Image
+    from .app import load_live_rules
+    from .ocr import create_backend
+    live_rules = load_live_rules(cfg)
+    ocr = create_backend(backend or cfg.detection.ocr_backend, cfg.detection.ocr_language, cfg.detection.ocr_upscale)
+    img = Image.open(image_path)
+    regions = cfg.live_regions
+    if regions:
+        text = "\n".join(ocr.recognize(r.crop(img)).text for r in regions)
+        print(f"OCR over {len(regions)} live-status region(s):")
+    else:
+        text = ocr.recognize(img).text
+        print("OCR over the full image (no live-status regions configured):")
+    print(text.strip() or "(no text recognised)")
+    c = live_rules.classify(text)
+    print(f"\nRESULT: {c.summary()}   (live score {c.live_score}, not-live score {c.not_live_score})")
+    print("rules: " + ("verified" if live_rules.verified else "UNVERIFIED seed - set \"verified\": true in the rules "
+                                                              "file once real LIVE and NOT_LIVE screenshots classify correctly"))
+    return 0 if c.state.value != "UNKNOWN" else 1
+
+
+def _history(cfg: AppConfig, kind: str, limit: int) -> int:
+    from datetime import datetime
+    from .queue import DeliveryQueue
+    q = DeliveryQueue(cfg.db_path)
+    for it in q.history(limit, kind):
+        print(f"{datetime.fromtimestamp(it['ts']):%Y-%m-%d %H:%M:%S} [{it['kind']}] {it['id']} {it['label']}: {it['detail']}")
+    print(q.delivery_status())
+    return 0
+
+
+def _autostart(cfg: AppConfig, cfg_path: Path, enable_: bool, disable_: bool) -> int:
+    from . import startup
+    if enable_:
+        cmd = startup.enable()
+        cfg.activity.start_at_signin = True
+        cfg.save(cfg_path)
+        print(f"enabled: {cmd}")
+    elif disable_:
+        startup.disable()
+        cfg.activity.start_at_signin = False
+        cfg.save(cfg_path)
+        print("disabled")
+    print("start at sign-in:", "enabled" if startup.is_enabled() else "disabled")
+    return 0
+
+
 def _run(cfg: AppConfig, cfg_path: Path, once: bool) -> int:
     if not cfg.target.is_set:
         print("no target selected; run `studio-monitor list-windows` then `select HWND`", file=sys.stderr)
@@ -97,12 +148,19 @@ def _run(cfg: AppConfig, cfg_path: Path, once: bool) -> int:
     def on_status(update):
         log.debug("status %s %s", update.status.value, update.reason)
 
-    monitor = build_monitor(cfg, on_event=log.info, on_status=on_status, on_identity_change=on_identity_change)
+    def on_activity(a):
+        log.debug("activity app=%s live=%s offline=%.0fs", a.app_state, a.live_state, a.offline_seconds)
+
+    monitor = build_monitor(cfg, on_event=log.info, on_status=on_status, on_identity_change=on_identity_change,
+                            on_activity=on_activity)
     log.info("%s monitor %s; target %s (%s)", SOURCE_LABEL, __version__, cfg.target.title, cfg.target.exe_name)
     if once:
         dets = monitor.tick()
         st = monitor.tracker.state
         print(f"status: {st.status.value} {st.reason}")
+        a = monitor.activity
+        print(f"studio: {a.app_state}  broadcast: {a.live_state} ({a.last_observation or '-'})"
+              f"{'' if a.live_rules_verified else '  [live rules unverified]'}")
         for d in dets:
             print(f"detection: {d.category} in {'dialog' if d.is_dialog else 'main'}: {d.ocr_text[:120]!r}")
         return 0
@@ -139,11 +197,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, help="config file path")
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="cmd")
-    sub.add_parser("gui")
+    p = sub.add_parser("gui"); p.add_argument("--autostart", action="store_true", help="begin monitoring the saved target")
     sub.add_parser("list-windows")
     p = sub.add_parser("select"); p.add_argument("hwnd")
     p = sub.add_parser("run"); p.add_argument("--once", action="store_true")
     p = sub.add_parser("calibrate"); p.add_argument("image"); p.add_argument("--backend", default="")
+    p = sub.add_parser("calibrate-live"); p.add_argument("image"); p.add_argument("--backend", default="")
+    p = sub.add_parser("history"); p.add_argument("--kind", choices=["all", "incident", "activity"], default="all")
+    p.add_argument("--limit", type=int, default=50)
+    p = sub.add_parser("autostart"); g = p.add_mutually_exclusive_group()
+    g.add_argument("--enable", action="store_true"); g.add_argument("--disable", action="store_true")
+    g.add_argument("--status", action="store_true")
     sub.add_parser("test-alert")
     p = sub.add_parser("set-telegram"); p.add_argument("--token", required=True); p.add_argument("--chat-id", required=True)
     p = sub.add_parser("queue"); p.add_argument("--requeue-failed", action="store_true")
@@ -153,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     cmd = args.cmd or "gui"
     if cmd == "gui":
         from .gui.app import run_gui
-        return run_gui(cfg, cfg_path)
+        return run_gui(cfg, cfg_path, autostart=getattr(args, "autostart", False))
     if cmd == "list-windows":
         _print_windows(cfg)
         return 0
@@ -163,6 +227,12 @@ def main(argv: list[str] | None = None) -> int:
         return _run(cfg, cfg_path, args.once)
     if cmd == "calibrate":
         return _calibrate(cfg, args.image, args.backend)
+    if cmd == "calibrate-live":
+        return _calibrate_live(cfg, args.image, args.backend)
+    if cmd == "history":
+        return _history(cfg, args.kind, args.limit)
+    if cmd == "autostart":
+        return _autostart(cfg, cfg_path, args.enable, args.disable)
     if cmd == "test-alert":
         return _test_alert(cfg)
     if cmd == "set-telegram":

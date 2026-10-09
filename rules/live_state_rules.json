@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "Broadcast-state evidence rules for TikTok LIVE Studio. UNVERIFIED SEED: these phrases were",
+    "written from typical Studio wording and have NOT been calibrated against real screenshots.",
+    "Set `verified` to true only after `studio-monitor calibrate-live <screenshot>` classifies real",
+    "LIVE and NOT_LIVE screenshots correctly. Until then the GUI labels the rules 'unverified'.",
+    "",
+    "Classification per observation (one OCR pass over the live-status regions, or the whole",
+    "window when no live regions are configured):",
+    "  - any `unknown.any` phrase present              -> UNKNOWN (loading / sign-in / reconnecting)",
+    "  - live score >= live.min_score and not_live score < not_live.min_score  -> LIVE",
+    "  - not_live score >= not_live.min_score and live score < live.min_score  -> NOT_LIVE",
+    "  - anything else (no evidence, or contradictory evidence)              -> UNKNOWN",
+    "Evidence items: `any` phrases (normalized, case-insensitive), optional `regex`,",
+    "`requires_timer` (an HH:MM:SS / MM:SS elapsed timer must also be present), `score`.",
+    "A bare 'LIVE' word scores nothing on its own: it must come with a timer."
+  ],
+  "verified": false,
+  "timer_regex": "\\b\\d{1,2}:\\d{2}(?::\\d{2})?\\b",
+  "live": {
+    "min_score": 2,
+    "evidence": [
+      {"name": "end_live_control", "any": ["end live", "end broadcast", "end stream", "stop live", "stop streaming"], "score": 2},
+      {"name": "live_badge_with_timer", "any": ["live"], "requires_timer": true, "score": 1},
+      {"name": "viewer_count", "regex": "\\b\\d[\\d,.]*[km]?\\s*(viewers|watching|viewer)\\b", "score": 1},
+      {"name": "streaming_status", "any": ["you're live", "you are live", "now live", "streaming live", "live now"], "score": 1}
+    ]
+  },
+  "not_live": {
+    "min_score": 2,
+    "evidence": [
+      {"name": "go_live_control", "any": ["go live", "start live", "start broadcast", "start stream", "start streaming"], "score": 2},
+      {"name": "preview_label", "any": ["preview", "not live yet", "offline", "stream preview"], "score": 1},
+      {"name": "setup_hint", "any": ["add a title", "live title", "select a topic", "choose a topic", "live goal", "set up your live"], "score": 1}
+    ]
+  },
+  "unknown": {
+    "any": ["loading", "connecting", "reconnecting", "sign in", "log in", "login", "update available", "updating", "please wait", "checking network"]
+  }
+}

@@ -65,6 +65,93 @@ def format_alert(incident: Incident, machine_label: str, max_text: int = 400,
     return {"caption": caption, "text": text}
 
 
+def local_ts(ts: float) -> str:
+    """Local time with explicit UTC offset, e.g. ``2026-10-09 14:03:11 UTC+03:00``."""
+    try:
+        dt = datetime.fromtimestamp(ts).astimezone()
+    except (OSError, OverflowError, ValueError):
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    off = dt.strftime("%z")
+    off = f"UTC{off[:3]}:{off[3:]}" if off else "UTC"
+    return f"{dt:%Y-%m-%d %H:%M:%S} {off}"
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, m = divmod(seconds // 60, 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m {seconds % 60:02d}s"
+
+
+def _finish(lines: list[str], ts: float) -> dict:
+    text = "\n".join(lines)
+    caption = text if len(text) <= 1024 else text[:1020] + "…"
+    return {"caption": caption, "text": text, "created_at": ts}
+
+
+def format_studio_opened(machine_label: str, ts: float, screenshot_attached: bool,
+                         timeout_seconds: float = 0.0) -> dict:
+    lines = [
+        "<b>TIKTOK LIVE STUDIO OPENED</b>",
+        f"PC: {html.escape(machine_label)}",
+        f"Time: {local_ts(ts)}",
+        f"{html.escape(SOURCE_LABEL)} is now running.",
+    ]
+    if not screenshot_attached:
+        lines.append(f"<i>Screenshot unavailable: no usable capture of the Studio window within "
+                     f"{int(timeout_seconds)} s.</i>")
+    return _finish(lines, ts)
+
+
+def format_studio_already_running(machine_label: str, ts: float, screenshot_attached: bool) -> dict:
+    lines = [
+        "<b>TIKTOK LIVE STUDIO ALREADY RUNNING</b>",
+        f"PC: {html.escape(machine_label)}",
+        f"Time: {local_ts(ts)}",
+        "Studio already running — monitoring started.",
+    ]
+    if not screenshot_attached:
+        lines.append("<i>Screenshot unavailable at monitor start.</i>")
+    return _finish(lines, ts)
+
+
+def format_studio_closed(machine_label: str, ts: float, screenshot_captured_at: Optional[float]) -> dict:
+    lines = [
+        "<b>TIKTOK LIVE STUDIO CLOSED</b>",
+        f"PC: {html.escape(machine_label)}",
+        f"Time: {local_ts(ts)}",
+        f"{html.escape(SOURCE_LABEL)} has closed.",
+    ]
+    if screenshot_captured_at is not None:
+        lines.append("Image: last available screenshot before closure.")
+        lines.append(f"Screenshot captured: {local_ts(screenshot_captured_at)}")
+    else:
+        lines.append("<i>No screenshot available from before closure.</i>")
+    return _finish(lines, ts)
+
+
+def format_not_live_reminder(machine_label: str, ts: float, threshold_minutes: float, offline_seconds: float,
+                             episode_id: str, sequence: int = 1, max_count: int = 1,
+                             screenshot_attached: bool = True, rules_verified: bool = True) -> dict:
+    hours = threshold_minutes / 60.0
+    period = f"{int(hours)} hour{'s' if int(hours) != 1 else ''}" if hours >= 1 and hours == int(hours) \
+        else f"{int(threshold_minutes)} minutes"
+    lines = [
+        "<b>TIME TO GO LIVE</b>",
+        f"PC: {html.escape(machine_label)}",
+        f"{html.escape(SOURCE_LABEL)} has been confirmed not live for at least {period}.",
+        "Open your broadcast setup and go live when ready.",
+        f"Confirmed offline time: {format_duration(offline_seconds)} (episode <code>{html.escape(episode_id)}</code>)",
+        f"Generated: {local_ts(ts)}",
+    ]
+    if sequence > 1:
+        lines.append(f"Repeat reminder {sequence} of up to {max_count + 1}.")
+    if not screenshot_attached:
+        lines.append("<i>Screenshot unavailable: no fresh capture of the Studio window.</i>")
+    if not rules_verified:
+        lines.append("<i>Live-state rules are unverified (not yet calibrated on real Studio screenshots).</i>")
+    return _finish(lines, ts)
+
+
 def format_status_alert(status: str, reason: str, machine_label: str, ts: float) -> str:
     return "\n".join([
         f"ℹ️ <b>{html.escape(SOURCE_LABEL)}</b> monitor status: <b>{html.escape(status)}</b>",

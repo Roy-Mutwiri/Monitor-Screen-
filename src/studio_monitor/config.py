@@ -71,6 +71,29 @@ class DetectionConfig:
 
 
 @dataclass
+class ActivityConfig:
+    """Studio opened/closed notifications and the not-live reminder."""
+    notify_opened: bool = True
+    notify_closed: bool = True
+    notify_already_running: bool = True
+    open_screenshot_timeout_seconds: float = 30.0   # then send the OPENED notice as text
+    close_debounce_seconds: float = 10.0            # process must be gone this long
+    reminders_enabled: bool = True
+    offline_threshold_minutes: float = 60.0
+    repeat_enabled: bool = False
+    repeat_interval_minutes: float = 60.0
+    repeat_max_count: int = 3
+    max_observation_gap_seconds: float = 30.0       # larger gaps never count as offline time
+    confirm_observations: int = 3                   # consecutive observations to confirm a state
+    fresh_screenshot_max_age_seconds: float = 15.0  # "fresh" frame for reminder/opened notices
+    live_rules_file: str = ""                       # empty -> bundled rules/live_state_rules.json
+    start_at_signin: bool = False
+
+
+CONFIG_VERSION = 2
+
+
+@dataclass
 class AppConfig:
     machine_label: str = field(default_factory=socket.gethostname)
     data_dir: str = field(default_factory=lambda: str(default_data_dir()))
@@ -79,15 +102,20 @@ class AppConfig:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     privacy: PrivacyConfig = field(default_factory=PrivacyConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
+    activity: ActivityConfig = field(default_factory=ActivityConfig)
+    config_version: int = CONFIG_VERSION
 
     # -- serialisation ----------------------------------------------------
     def to_dict(self) -> dict:
         d = asdict(self)
         d["regions"] = [r.to_dict() for r in self.regions]
+        d["config_version"] = CONFIG_VERSION
         return d
 
     @classmethod
     def from_dict(cls, data: dict) -> "AppConfig":
+        """Tolerant loader: unknown keys are ignored and missing sections get
+        defaults, so configs written by older versions load unchanged."""
         cfg = cls()
         cfg.machine_label = str(data.get("machine_label") or cfg.machine_label)
         cfg.data_dir = str(data.get("data_dir") or cfg.data_dir)
@@ -96,7 +124,21 @@ class AppConfig:
         cfg.telegram = TelegramConfig(**_known(TelegramConfig, data.get("telegram", {})))
         cfg.privacy = PrivacyConfig(**_known(PrivacyConfig, data.get("privacy", {})))
         cfg.detection = DetectionConfig(**_known(DetectionConfig, data.get("detection", {})))
+        cfg.activity = ActivityConfig(**_known(ActivityConfig, data.get("activity", {})))
+        cfg.config_version = int(data.get("config_version", 1))
         return cfg
+
+    @property
+    def live_regions(self) -> list[Region]:
+        return [r for r in self.regions if r.kind == "live"]
+
+    @property
+    def frame_cache_dir(self) -> Path:
+        return self.data_path / "latest_frame"
+
+    @property
+    def activity_screenshots_dir(self) -> Path:
+        return self.data_path / "activity_screenshots"
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -150,8 +192,14 @@ def rules_path(cfg: Optional[AppConfig] = None) -> Path:
     return bundled_rules_path()
 
 
-def bundled_rules_path() -> Path:
+def bundled_rules_path(name: str = "studio_rules.json") -> Path:
     import sys
     if getattr(sys, "frozen", False):  # PyInstaller bundle
-        return Path(getattr(sys, "_MEIPASS", ".")) / "rules" / "studio_rules.json"
-    return Path(__file__).resolve().parents[2] / "rules" / "studio_rules.json"
+        return Path(getattr(sys, "_MEIPASS", ".")) / "rules" / name
+    return Path(__file__).resolve().parents[2] / "rules" / name
+
+
+def live_rules_path(cfg: Optional[AppConfig] = None) -> Path:
+    if cfg and cfg.activity.live_rules_file:
+        return Path(cfg.activity.live_rules_file)
+    return bundled_rules_path("live_state_rules.json")

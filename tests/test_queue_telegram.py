@@ -58,7 +58,7 @@ def test_successful_delivery_marks_sent(tmp_path, clock):
     events = []
     w = DeliveryWorker(q, lambda p, s: None, on_event=events.append)
     assert w.process_once()
-    assert q.counts() == {"pending": 0, "sent": 1, "failed": 0}
+    assert q.counts() == {"pending": 0, "sent": 1, "failed": 0, "cancelled": 0}
     assert "delivered" in events[0]
 
 

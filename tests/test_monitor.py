@@ -49,7 +49,7 @@ def test_duplicate_popup_not_requeued(cfg, rules, clock):
     for _ in range(5):
         mon.tick()
         clock.advance(2)
-    assert queue.counts()["pending"] == 1
+    assert queue.counts_by_kind().get("incident", 0) == 1
 
 
 def test_verification_puzzle_in_separate_dialog(cfg, rules, clock):
@@ -108,7 +108,7 @@ def test_lost_then_rediscovered_window(cfg, rules, clock):
     mon.tick()
     assert statuses[-1].status == Status.RUNNING and saved[-1].hwnd == 0x4444
     assert cfg.target.hwnd == 0x4444
-    assert queue.counts()["pending"] == 1
+    assert queue.counts_by_kind().get("incident", 0) == 1
 
 
 def test_degraded_when_minimized_skips_ocr(cfg, rules, clock):
@@ -127,7 +127,7 @@ def test_status_change_notification_optional(cfg, rules, clock):
     mon.tick()
     texts = []
     while (item := queue.next_due()) is not None:
-        assert item.incident_id == "STATUS"
-        texts.append(item.payload["text"])
+        if item.kind == "status":
+            texts.append(item.payload["text"])
         queue.mark_sent(item.id)
     assert any("RUNNING" in t for t in texts) and any("LOST" in t for t in texts)

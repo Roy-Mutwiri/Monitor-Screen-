@@ -6,7 +6,8 @@ import logging.handlers
 from pathlib import Path
 from typing import Optional
 
-from .config import AppConfig, default_config_path, rules_path
+from .broadcast import LiveRules
+from .config import AppConfig, default_config_path, live_rules_path, rules_path
 from .detection.rules import RuleSet, load_rules
 from .monitor import Monitor, ensure_dirs
 from .ocr import create_backend
@@ -37,6 +38,10 @@ def load_ruleset(cfg: AppConfig) -> RuleSet:
     return load_rules(rules_path(cfg))
 
 
+def load_live_rules(cfg: AppConfig) -> LiveRules:
+    return LiveRules.load(live_rules_path(cfg))
+
+
 def build_monitor(cfg: AppConfig, **callbacks) -> Monitor:
     from .win32.capture import Win32Capturer
     from .win32.windows import Win32WindowSystem
@@ -49,4 +54,4 @@ def build_monitor(cfg: AppConfig, **callbacks) -> Monitor:
     queue = DeliveryQueue(cfg.db_path, cfg.telegram.max_attempts,
                           cfg.telegram.backoff_base_seconds, cfg.telegram.backoff_max_seconds)
     sender = make_sender(TelegramClient(cfg.telegram))
-    return Monitor(cfg, system, capturer, ocr, rules, queue, sender, **callbacks)
+    return Monitor(cfg, system, capturer, ocr, rules, queue, sender, live_rules=load_live_rules(cfg), **callbacks)

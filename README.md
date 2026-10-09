@@ -48,6 +48,86 @@ The monitor is strictly passive: it never focuses, restores, clicks or dismisses
      fallback was possible while another window is in front
    - `LOST`     window/process gone; waiting for it to reappear
 
+## Studio activity notifications
+
+Besides popup alerts, the monitor reports what the Studio *application* is doing. These features
+work **only while the monitor is running**: nothing is observed, inferred or reported for periods
+when the monitor was stopped (the GUI shows "monitor stopped (not observing)").
+
+| Event | When | Message |
+|-------|------|---------|
+| Studio opened | A new Studio process is detected and a usable screenshot exists (or the screenshot timeout passes) | `TIKTOK LIVE STUDIO OPENED / PC / Time / TikTok LIVE Studio is now running.` |
+| Already running | Monitoring starts while Studio is already running | `TIKTOK LIVE STUDIO ALREADY RUNNING ... Studio already running — monitoring started.` |
+| Studio closed | The Studio **process** is confirmed gone for `close_debounce_seconds` | `TIKTOK LIVE STUDIO CLOSED ... Image: last available screenshot before closure. Screenshot captured: <ts>` |
+| Not-live reminder | Confirmed NOT_LIVE for the threshold | `TIME TO GO LIVE ... confirmed not live for at least 1 hour.` |
+
+A *session* is one run of the Studio main process (keyed by its pid). Window moves, dialogs,
+minimizing, hidden/cloaked windows, capture failures, a locked desktop and window recreation by the
+same process never produce opened/closed events. A restart (new pid) is reported as closed, then
+opened. The closed notification attaches the latest valid redacted frame from the latest-frame
+cache (`latest_frame/`, separate from restriction evidence, cleaned by the retention setting) and
+labels it with its **original capture time**, never as a post-closure image.
+
+### Broadcast state (LIVE / NOT LIVE / UNKNOWN)
+
+Application running and broadcast live are different states. The broadcast state is derived from
+OCR evidence in the configured **live-status regions** (draw them on the preview; without regions
+the whole window is used, which is less reliable because chat text can look like controls).
+Rules live in `rules/live_state_rules.json`:
+
+- evidence for LIVE: an "End LIVE" control, a LIVE badge **with** an elapsed timer, a viewer count,
+  "you're live" status text (a bare "LIVE" word scores nothing);
+- evidence for NOT_LIVE: a "Go LIVE" control, preview/offline labels, setup hints;
+- transitional screens (loading, connecting, sign-in, updating) and polls where a restriction popup
+  is on the main window, capture is unreliable or Studio is not running are **UNKNOWN**;
+- contradictory or insufficient evidence is UNKNOWN.
+
+A state is *confirmed* only after `confirm_observations` (default 3) consecutive identical valid
+observations with no gap above `max_observation_gap_seconds` (default 30 s) between them.
+
+**The seeded rules are unverified.** They were written from expected Studio wording, not calibrated
+on real screenshots. The GUI and the reminder message say "rules unverified" until you set
+`"verified": true` in the rules file after calibration (below).
+
+### Reminder semantics (exact)
+
+- Threshold: `offline_threshold_minutes` (default 60) of **confirmed** NOT_LIVE time.
+- Scope: while a Studio session is active. Starting Studio in confirmed NOT_LIVE begins an
+  *offline episode*; a confirmed LIVE -> NOT_LIVE transition begins a new one.
+- Accumulation: time between two consecutive confirmed NOT_LIVE observations counts only if the gap
+  is at most `max_observation_gap_seconds` (default 30 s). This is the maximum observation gap that
+  can count toward confirmed offline duration. Larger gaps (sleep, lock, UNKNOWN, capture loss,
+  monitor downtime) add nothing, and accumulation resumes only after the next fresh NOT_LIVE
+  confirmation (`confirm_observations` observations). UNKNOWN never counts.
+- One reminder per episode by default. Optional repeats (`repeat_enabled`, off) fire every
+  `repeat_interval_minutes` of *additional* confirmed offline time, at most `repeat_max_count` times.
+- The reminder is enqueued and marked queued in one SQLite transaction; episode id, accumulated
+  seconds, reminders sent and the pending alert id are persisted, so a monitor restart continues the
+  episode without counting downtime and without re-sending.
+- A confirmed LIVE state or Studio closure ends the episode; a reminder still pending in the outbox
+  is cancelled with the reason recorded (`NOT_LIVE_REMINDER_CANCELLED` in history).
+- Any alert delivered more than two minutes after it was generated (outage, retries) carries a
+  visible "Delayed delivery: sent …, generated …" line.
+- A fresh (≤ `fresh_screenshot_max_age_seconds`) redacted frame is attached when available,
+  otherwise the reminder is text-only. The monitor never starts or stops a broadcast.
+
+### Calibrating live-state detection on real screenshots
+
+1. Take screenshots of Studio while **not live** (setup screen) and while **live**.
+2. Optionally draw live-status regions in the GUI around the Go LIVE / End LIVE control, the
+   LIVE badge + timer and the viewer count.
+3. Run `studio-monitor calibrate-live not_live.png` and `studio-monitor calibrate-live live.png`
+   (or the "Calibrate live state" button). The output shows the OCR text, evidence and result.
+4. Adjust phrases/scores in `rules/live_state_rules.json` (or a copy pointed to by
+   `activity.live_rules_file`) until both classify correctly, then set `"verified": true`.
+
+### Start at Windows sign-in (optional, off by default)
+
+Settings → Studio activity → "Start Monitor Screen when I sign in to Windows", or
+`studio-monitor autostart --enable`. This writes a per-user `HKCU\...\Run` entry that launches the
+GUI with `--autostart`, which begins monitoring the saved target. It runs in your interactive
+desktop session (required for capture); nothing runs or is observed before you sign in.
+
 ## Telegram alert contents
 
 Every alert identifies the source as **TikTok LIVE Studio** and includes: category, detected text,
@@ -73,7 +153,10 @@ studio-monitor select 0x000A0B2C     # store a window as the target
 studio-monitor set-telegram --token 123:ABC --chat-id 42
 studio-monitor run                   # headless monitoring
 studio-monitor run --once            # one poll, print status/detections
-studio-monitor calibrate shot.png    # OCR a real Studio screenshot and show which rules fire
+studio-monitor calibrate shot.png    # OCR a real Studio screenshot and show which popup rules fire
+studio-monitor calibrate-live shot.png  # classify a real Studio screenshot as LIVE / NOT_LIVE / UNKNOWN
+studio-monitor history --kind activity  # restriction incidents and Studio activity events
+studio-monitor autostart --status       # start-at-sign-in setting
 studio-monitor test-alert            # send a test alert through the queue
 studio-monitor queue --requeue-failed
 ```
@@ -124,13 +207,18 @@ src/studio_monitor/
   ocr/          windows | tesseract | rapidocr backends
   detection/    rules + detector
   incidents.py  confirmation + de-duplication
+  sessions.py   Studio application session (opened / closed)
+  framecache.py latest valid redacted frame
+  broadcast.py  LIVE / NOT_LIVE / UNKNOWN engine
+  reminders.py  offline episodes + not-live reminders
+  startup.py    start at Windows sign-in (HKCU Run)
   queue.py      persistent SQLite delivery queue + retry worker
   telegram.py   stdlib Bot API client
   alerts.py     alert formatting
   monitor.py    the loop
   gui/app.py    Tkinter UI
   cli.py        command line
-rules/studio_rules.json
+rules/studio_rules.json, rules/live_state_rules.json
 tests/          pytest suite (fakes for Win32, capture, OCR, Telegram)
 packaging/      PyInstaller spec + build script
 ```

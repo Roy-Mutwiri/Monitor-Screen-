@@ -1,10 +1,13 @@
-"""Persistent (SQLite) delivery queue with retry/backoff.
+"""Persistent (SQLite) delivery outbox with retry/backoff, plus local history
+tables (restriction incidents, Studio activity events) and a small key/value
+state store that can be updated in the same transaction as an enqueue.
 
 Alerts are written here *before* any network call, so a crash, a reboot or a
 long Telegram outage never loses an alert. A worker thread drains the queue.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import sqlite3
@@ -12,9 +15,14 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 log = logging.getLogger(__name__)
+
+KIND_INCIDENT = "incident"
+KIND_ACTIVITY = "activity"
+KIND_REMINDER = "reminder"
+KIND_STATUS = "status"
 
 
 @dataclass
@@ -26,6 +34,7 @@ class QueuedAlert:
     attempts: int
     status: str
     last_error: str
+    kind: str = KIND_INCIDENT
 
 
 class DeliveryError(Exception):
@@ -61,6 +70,22 @@ CREATE TABLE IF NOT EXISTS incidents (
     screenshot_path TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS activity_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    episode_id TEXT NOT NULL DEFAULT '',
+    ts_utc TEXT NOT NULL,
+    details TEXT NOT NULL DEFAULT '{}',
+    screenshot_path TEXT NOT NULL DEFAULT '',
+    alert_id INTEGER,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kv_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 
@@ -77,12 +102,44 @@ class DeliveryQueue:
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(alerts)")}
+        if "kind" not in cols:
+            self._conn.execute(f"ALTER TABLE alerts ADD COLUMN kind TEXT NOT NULL DEFAULT '{KIND_INCIDENT}'")
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
 
-    # -- incidents (local history) --------------------------------------
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Group several writes atomically (e.g. enqueue + state update)."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._conn
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._conn.execute("COMMIT")
+
+    # -- key/value state --------------------------------------------------
+    def get_state(self, key: str, default=None):
+        with self._lock:
+            row = self._conn.execute("SELECT value FROM kv_state WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else default
+
+    def set_state(self, key: str, value) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO kv_state(key, value, updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                (key, json.dumps(value), self.clock()),
+            )
+
+    # -- incidents (restriction evidence history) -------------------------
     def record_incident(self, incident_id: str, category: str, label: str, text: str,
                         window_title: str, is_dialog: bool, screenshot_path: str) -> None:
         with self._lock:
@@ -101,24 +158,84 @@ class DeliveryQueue:
                 "screenshot_path", "created_at"]
         return [dict(zip(keys, r)) for r in rows]
 
+    # -- activity events (Studio opened/closed, reminders) ----------------
+    def record_event(self, event_id: str, event_type: str, ts_utc: str, details: Optional[dict] = None,
+                     session_id: str = "", episode_id: str = "", screenshot_path: str = "",
+                     alert_id: Optional[int] = None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO activity_events VALUES (?,?,?,?,?,?,?,?,?)",
+                (event_id, event_type, session_id, episode_id, ts_utc, json.dumps(details or {}),
+                 screenshot_path, alert_id, self.clock()),
+            )
+
+    def recent_events(self, limit: int = 50, event_types: Optional[list[str]] = None) -> list[dict]:
+        sql = ("SELECT event_id, event_type, session_id, episode_id, ts_utc, details, screenshot_path, "
+               "alert_id, created_at FROM activity_events")
+        params: list = []
+        if event_types:
+            sql += " WHERE event_type IN (%s)" % ",".join("?" * len(event_types))
+            params += event_types
+        sql += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        keys = ["event_id", "event_type", "session_id", "episode_id", "ts_utc", "details", "screenshot_path",
+                "alert_id", "created_at"]
+        out = []
+        for r in rows:
+            d = dict(zip(keys, r))
+            d["details"] = json.loads(d["details"] or "{}")
+            out.append(d)
+        return out
+
+    def history(self, limit: int = 50, kind: str = "all") -> list[dict]:
+        """Unified history for the GUI: kind = all | incident | activity."""
+        items = []
+        if kind in ("all", "incident"):
+            for i in self.recent_incidents(limit):
+                items.append({"ts": i["created_at"], "kind": KIND_INCIDENT, "id": i["incident_id"],
+                              "label": i["label"], "detail": i["detected_text"][:120]})
+        if kind in ("all", "activity"):
+            for e in self.recent_events(limit):
+                items.append({"ts": e["created_at"], "kind": KIND_ACTIVITY, "id": e["event_id"],
+                              "label": e["event_type"], "detail": e["details"].get("summary", "")})
+        items.sort(key=lambda x: x["ts"], reverse=True)
+        return items[:limit]
+
     # -- queue ----------------------------------------------------------
-    def enqueue(self, incident_id: str, payload: dict, screenshot_path: str = "") -> int:
+    def enqueue(self, incident_id: str, payload: dict, screenshot_path: str = "",
+                kind: str = KIND_INCIDENT) -> int:
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO alerts (incident_id, payload, screenshot_path, created_at) VALUES (?,?,?,?)",
-                (incident_id, json.dumps(payload), screenshot_path, self.clock()),
+                "INSERT INTO alerts (incident_id, payload, screenshot_path, created_at, kind) VALUES (?,?,?,?,?)",
+                (incident_id, json.dumps(payload), screenshot_path, self.clock(), kind),
             )
             return int(cur.lastrowid)
 
     def next_due(self) -> Optional[QueuedAlert]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, incident_id, payload, screenshot_path, attempts, status, last_error FROM alerts "
+                "SELECT id, incident_id, payload, screenshot_path, attempts, status, last_error, kind FROM alerts "
                 "WHERE status='pending' AND next_attempt_at <= ? ORDER BY id LIMIT 1", (self.clock(),)
             ).fetchone()
         if row is None:
             return None
-        return QueuedAlert(row[0], row[1], json.loads(row[2]), row[3], row[4], row[5], row[6])
+        return QueuedAlert(row[0], row[1], json.loads(row[2]), row[3], row[4], row[5], row[6], row[7])
+
+    def alert_status(self, alert_id: int) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute("SELECT status FROM alerts WHERE id=?", (alert_id,)).fetchone()
+        return row[0] if row else None
+
+    def cancel(self, alert_id: int, reason: str) -> bool:
+        """Cancel a still-pending alert (e.g. a reminder that became obsolete)."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE alerts SET status='cancelled', last_error=? WHERE id=? AND status='pending'",
+                (reason[:500], alert_id),
+            )
+            return cur.rowcount == 1
 
     def seconds_until_next(self) -> Optional[float]:
         with self._lock:
@@ -160,9 +277,28 @@ class DeliveryQueue:
     def counts(self) -> dict[str, int]:
         with self._lock:
             rows = self._conn.execute("SELECT status, COUNT(*) FROM alerts GROUP BY status").fetchall()
-        out = {"pending": 0, "sent": 0, "failed": 0}
+        out = {"pending": 0, "sent": 0, "failed": 0, "cancelled": 0}
         out.update({r[0]: r[1] for r in rows})
         return out
+
+    def counts_by_kind(self, status: str = "pending") -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT kind, COUNT(*) FROM alerts WHERE status=? GROUP BY kind", (status,)
+            ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def delivery_status(self) -> dict:
+        """Counts plus the most recent delivery outcome, for the GUI."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT incident_id, kind, status, sent_at, last_error, attempts FROM alerts "
+                "WHERE status IN ('sent','failed','cancelled') ORDER BY COALESCE(sent_at, created_at) DESC, id DESC LIMIT 1"
+            ).fetchone()
+        last = None
+        if row:
+            last = {"id": row[0], "kind": row[1], "status": row[2], "sent_at": row[3], "error": row[4], "attempts": row[5]}
+        return {"counts": self.counts(), "last": last}
 
     def requeue_failed(self) -> int:
         with self._lock:
@@ -174,7 +310,8 @@ class DeliveryQueue:
     def purge_sent(self, older_than_seconds: float) -> int:
         with self._lock:
             cur = self._conn.execute(
-                "DELETE FROM alerts WHERE status='sent' AND sent_at < ?", (self.clock() - older_than_seconds,)
+                "DELETE FROM alerts WHERE status IN ('sent','cancelled') AND COALESCE(sent_at, created_at) < ?",
+                (self.clock() - older_than_seconds,)
             )
             return cur.rowcount
 

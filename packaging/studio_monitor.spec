@@ -13,7 +13,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(SPEC), ".."))
 SRC = os.path.join(ROOT, "src")
 
 hidden = ["studio_monitor.gui.app", "PIL.ImageTk"]
-datas = [(os.path.join(ROOT, "rules", "studio_rules.json"), "rules")]
+datas = [(os.path.join(ROOT, "rules", name), "rules") for name in ("studio_rules.json", "live_state_rules.json")]
 binaries = []
 for pkg in ("winrt", "winocr"):
     try:

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import time
 import uuid
 import urllib.error
 import urllib.parse
@@ -117,20 +118,34 @@ class TelegramClient:
         }, files={"document": (path.name, path.read_bytes())})
 
 
-def make_sender(client: TelegramClient) -> Callable[[dict, str], None]:
+LATE_AFTER_SECONDS = 120.0
+
+
+def late_delivery_note(payload: dict, now: float) -> str:
+    """A visible stamp for alerts delivered well after they were generated
+    (outage, retries): the reader must not mistake them for current events."""
+    created = payload.get("created_at")
+    if not created or now - float(created) < LATE_AFTER_SECONDS:
+        return ""
+    from .alerts import local_ts
+    return f"\n<i>Delayed delivery: sent {local_ts(now)}, generated {local_ts(float(created))}.</i>"
+
+
+def make_sender(client: TelegramClient, clock: Callable[[], float] = time.time) -> Callable[[dict, str], None]:
     """Adapter for :class:`DeliveryWorker`: payload has ``caption``/``text`` keys."""
 
     def _send(payload: dict, screenshot_path: str) -> None:
-        caption = payload.get("caption") or payload.get("text") or ""
+        note = late_delivery_note(payload, clock())
+        caption = (payload.get("caption") or payload.get("text") or "") + note
         if screenshot_path and Path(screenshot_path).exists():
             try:
-                client.send_photo(screenshot_path, caption)
+                client.send_photo(screenshot_path, caption[:1024])
                 return
             except DeliveryError as exc:
                 if exc.permanent or "network" in str(exc) or "rate limited" in str(exc) or "server" in str(exc):
                     raise
                 log.warning("sendPhoto rejected (%s); falling back to text", exc)
-        text = payload.get("text") or caption
+        text = (payload.get("text") or payload.get("caption") or "") + note
         if screenshot_path and not Path(screenshot_path).exists():
             text += "\n(screenshot no longer available locally)"
         client.send_message(text)
