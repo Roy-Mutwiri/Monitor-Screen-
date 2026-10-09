@@ -183,9 +183,11 @@ class EndRequestTracker:
 
     # ------------------------------------------------------------------
     def observe(self, views: list[tuple[str, list[str]]], fresh: bool, live_state: str, live_fresh: bool,
-                studio_running: bool, broadcast_episode: str = "", session_id: str = "") -> list[EndRequestEvent]:
+                studio_running: bool, broadcast_episode: str = "", session_id: str = "", strong: bool = False) -> list[EndRequestEvent]:
         """One poll. ``views`` are (text, lines) of every OCR'd capture this poll; ``fresh`` says whether they are
-        fresh valid frames. ``live_state``/``live_fresh`` come from the live-state engine after this poll."""
+        fresh valid frames. ``live_state``/``live_fresh`` come from the live-state engine after this poll.
+        ``strong``: the dialog was read with geometry as a credible panel (heading + End now + Cancel): one frame
+        confirms it, because the operator can dismiss the dialog within a second (real sessions 2026-10-09)."""
         now = self.clock()
         events: list[EndRequestEvent] = []
         matched_idx = -1
@@ -206,7 +208,7 @@ class EndRequestTracker:
                 if self._pending == 0:
                     self._pending_since = now
                 self._pending += 1
-                if self._pending >= self.rules.confirm_frames:
+                if self._pending >= (1 if strong else self.rules.confirm_frames):
                     ep = EndRequestEpisode(episode_id=f"END-{datetime.fromtimestamp(now):%Y%m%d-%H%M%S}-{secrets.token_hex(2).upper()}",
                                            broadcast_episode=broadcast_episode, session_id=session_id,
                                            opened_at=self._pending_since, opened_utc=_utc(self._pending_since), last_seen_at=now,

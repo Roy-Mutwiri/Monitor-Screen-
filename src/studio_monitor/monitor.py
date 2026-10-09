@@ -1114,11 +1114,22 @@ class Monitor:
         if self.perception is not None and self.perception.layout is not None and fresh:
             for t in self.perception.layout.transient:      # spatially grouped dialog/banner blocks
                 views.append((t.detail, t.detail.splitlines()))
+        strong = False
+        fa = self.last_analysis
+        if fresh and fa is not None and fa.has_geometry:
+            # the typed popup result of THIS frame (panel rescan recovers the white-on-red 'End now' that full-frame
+            # OCR drops): its lines are a view of their own, and a credible dialog confirms in one frame
+            for p in fa.popups:
+                if p.popup_type == END_CONFIRMATION:
+                    lines = [x for x in [p.title, p.body] + list(p.button_labels) if x]
+                    views.append((chr(10).join(lines), lines))
+                    btn = {b.strip().lower() for b in p.button_labels}
+                    strong = strong or (p.confidence >= 0.9 and any("end now" in b for b in btn) and any("cancel" in b for b in btn))
         events = self.end_requests.observe(views, fresh, bs.state.value, bool(bs.fresh), self.sessions.running,
-                                           self.episodes.state.episode_id, self.sessions.session_id)
+                                           self.episodes.state.episode_id, self.sessions.session_id, strong=strong)
         for ev in events:
             if ev.kind == "opened":
-                cap = ocr_views[ev.view_index][0] if 0 <= ev.view_index < len(ocr_views) else None
+                cap = ocr_views[ev.view_index][0] if 0 <= ev.view_index < len(ocr_views) else (ocr_views[0][0] if ocr_views else None)
                 self._alert_end_requested(ev, cap)
             else:
                 self._end_request_outcome(ev)

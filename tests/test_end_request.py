@@ -300,3 +300,16 @@ def hubfx_factory(tmp_path, clock):
     yield make
     for fx in created:
         fx.tc.__exit__(None, None, None)
+
+
+def test_strong_geometry_dialog_confirms_in_one_frame(rules_end):
+    """Full-frame OCR often drops the white-on-red 'End now'; the typed popup (panel rescan) is a view of its own and,
+    when credible, confirms the end request on the first frame (operators dismiss the dialog within a second)."""
+    from studio_monitor.end_request import EndRequestTracker
+    kv = {}
+    t = EndRequestTracker(rules_end, kv.get, kv.__setitem__, lambda: 1000.0)
+    ev = t.observe([(chr(10).join(DIALOG_LINES), DIALOG_LINES)], True, "LIVE", True, True, strong=True)
+    assert [e.kind for e in ev] == ["opened"] and t.dialog_open
+    kv2 = {}
+    t2 = EndRequestTracker(rules_end, kv2.get, kv2.__setitem__, lambda: 1000.0)
+    assert t2.observe([(chr(10).join(DIALOG_LINES), DIALOG_LINES)], True, "LIVE", True, True) == []      # weak: still 2 frames
