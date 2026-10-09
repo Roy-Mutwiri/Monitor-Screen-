@@ -199,10 +199,10 @@ def test_settings_save_validates_and_persists_and_switches_theme(ui):
     app.set_vars["poll"].set("abc")
     app.settings_save_btn.invoke()
     assert any(c[0] == "showerror" and "Poll interval" in c[2] for c in answers.calls)
-    assert app.cfg.detection.poll_interval_seconds == 2.0
+    assert app.cfg.detection.poll_interval_seconds == 1.0
     app.set_vars["poll"].set("9")
     app.settings_revert_btn.invoke()
-    assert app.set_vars["poll"].get() == "2.0"
+    assert app.set_vars["poll"].get() == "1.0"
 
 
 def test_start_and_stop_buttons(ui):

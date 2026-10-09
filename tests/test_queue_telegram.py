@@ -232,7 +232,7 @@ def test_late_delivery_note_added():
     import time
     c, t = _client([(200, {"ok": True, "result": {}})])
     deliver(c, {"text": "old", "created_at": time.time() - 3600}, "")
-    assert b"Delayed+delivery" in t.requests[0][1]
+    assert b"delivery+delayed+by" in t.requests[0][1]
 
 
 def test_client_factory_caches_and_invalidates():

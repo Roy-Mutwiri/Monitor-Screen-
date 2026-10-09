@@ -1462,6 +1462,12 @@ class App:
                       f"last_error={hb.get('last_error') or '-'}"]
         elif self.cfg.hub.url:
             lines += ["", "[hub]", f"url={self.cfg.hub.url} enrolled={self.cfg.hub.enrolled} (sync starts with monitoring)"]
+        try:
+            lat = self.monitor.latency_report() if self.monitor is not None else self.queue.latency_stats()
+            lines += ["", "[latency]", f"pending={lat.get('pending')} detection->persist={lat.get('detection_to_persist')} "
+                      f"queue_delay={lat.get('queue_delay')} telegram_api={lat.get('telegram_api')} capture->analysis_ms={lat.get('capture_to_analysis_ms', '-')}"]
+        except Exception:
+            pass
         counts = self.queue.counts()
         lines += ["", "[outbox]", " ".join(f"{k}={v}" for k, v in counts.items()),
                   f"bots={self.registry.count} enabled={sum(1 for b in self.registry.bots if b.enabled)} "

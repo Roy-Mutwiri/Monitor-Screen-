@@ -155,6 +155,11 @@ class DeliveryQueue:
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        for col, typ in (("request_started_at", "REAL"), ("request_started_mono", "REAL"), ("completed_mono", "REAL")):
+            try:
+                self._conn.execute(f"ALTER TABLE deliveries ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError:
+                pass                                   # column already present
         self._migrate_schema()
 
     def _migrate_schema(self) -> None:
@@ -242,15 +247,16 @@ class DeliveryQueue:
                         r[12], r[13], r[14], r[15])
 
     def due_deliveries(self, exclude_bots: Optional[set] = None) -> list[Delivery]:
-        """One due delivery per bot (oldest first), skipping bots that are
-        rate-limited (``bot_state.blocked_until``) or currently in flight."""
+        """One due delivery per bot, urgent kinds (incidents / popups) first, then oldest first; bots that are
+        rate-limited (``bot_state.blocked_until``) or currently in flight are skipped so one slow bot never
+        delays another."""
         now = self.clock()
         with self._lock:
             rows = self._conn.execute(
                 self._DELIVERY_SQL +
                 "LEFT JOIN bot_state b ON b.bot_id = d.bot_id "
                 "WHERE d.status='pending' AND d.next_attempt_at <= ? AND COALESCE(b.blocked_until, 0) <= ? "
-                "ORDER BY d.id", (now, now)).fetchall()
+                "ORDER BY CASE e.kind WHEN 'incident' THEN 0 WHEN 'popup' THEN 0 ELSE 1 END, d.id", (now, now)).fetchall()
         seen: set[str] = set(exclude_bots or ())
         out = []
         for r in rows:
@@ -269,13 +275,52 @@ class DeliveryQueue:
             return None
         return max(0.0, row[0] - self.clock())
 
+    def mark_request_started(self, delivery_id: int) -> None:
+        """Instrumentation: when the Telegram request for this delivery was started (monotonic + wall clock)."""
+        with self._lock:
+            self._conn.execute("UPDATE deliveries SET request_started_at=?, request_started_mono=? WHERE id=?",
+                               (self.clock(), time.monotonic(), delivery_id))
+            self._conn.commit()
+
+    def latency_stats(self, limit: int = 200) -> dict:
+        """Median / p95 of queue delay (event persisted -> request started) and Telegram response time
+        (request started -> completed) over the last ``limit`` completed deliveries, plus current queue depth.
+        Durations are computed from monotonic stamps recorded in this process; wall-clock fallback is marked."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT e.payload, d.created_at, d.request_started_at, d.request_started_mono, d.completed_at, d.completed_mono, e.created_at "
+                "FROM deliveries d JOIN events e ON e.event_id=d.event_id WHERE d.status='sent' ORDER BY d.id DESC LIMIT ?", (limit,)).fetchall()
+            pending = self._conn.execute("SELECT COUNT(*) FROM deliveries WHERE status='pending'").fetchone()[0]
+        queue_delay, api_time, detect = [], [], []
+        for payload, d_created, req_at, req_mono, done, done_mono, e_created in rows:
+            try:
+                p = json.loads(payload)
+            except (TypeError, ValueError):
+                p = {}
+            t = p.get("timing") or {}
+            if req_at and d_created:
+                queue_delay.append(max(0.0, req_at - d_created))
+            if req_mono and done_mono:
+                api_time.append(max(0.0, done_mono - req_mono))
+            elif req_at and done:
+                api_time.append(max(0.0, done - req_at))
+            if t.get("captured_at") and t.get("persisted_at"):
+                detect.append(max(0.0, float(t["persisted_at"]) - float(t["captured_at"])))
+
+        def stats(vals):
+            if not vals:
+                return {"n": 0, "median_s": None, "p95_s": None}
+            v = sorted(vals)
+            return {"n": len(v), "median_s": round(v[len(v) // 2], 3), "p95_s": round(v[min(len(v) - 1, int(len(v) * 0.95))], 3)}
+        return {"pending": pending, "detection_to_persist": stats(detect), "queue_delay": stats(queue_delay), "telegram_api": stats(api_time)}
+
     def mark_sent(self, delivery_id: int, message_id: Optional[int] = None) -> None:
         now = self.clock()
         with self._lock:
             row = self._conn.execute("SELECT bot_id FROM deliveries WHERE id=?", (delivery_id,)).fetchone()
             self._conn.execute(
-                "UPDATE deliveries SET status='sent', completed_at=?, attempts=attempts+1, message_id=?, last_error='' "
-                "WHERE id=?", (now, message_id, delivery_id))
+                "UPDATE deliveries SET status='sent', completed_at=?, completed_mono=?, attempts=attempts+1, message_id=?, last_error='' "
+                "WHERE id=?", (now, time.monotonic(), message_id, delivery_id))
             if row:
                 self._bot_result(row[0], "sent", now, 0)
 
@@ -625,6 +670,7 @@ class DeliveryWorker(threading.Thread):
     def _deliver(self, d: Delivery) -> None:
         try:
             try:
+                self.queue.mark_request_started(d.id)
                 message_id = self.send(d)
             except DeliveryError as exc:
                 status = self.queue.mark_failed(d.id, str(exc), exc.retry_after, exc.permanent)

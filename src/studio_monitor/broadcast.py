@@ -107,6 +107,94 @@ class LiveRules:
     def load(cls, path: Path) -> "LiveRules":
         return cls(json.loads(Path(path).read_text(encoding="utf-8")))
 
+    CONTROL_RULES = ("end_live_control", "go_live_control")
+
+    def classify_frame(self, text: str, boxes=None, exclude_boxes=None, control_label: str = "") -> Classification:
+        """Origin-aware classification of one frame.
+
+        * ``boxes`` (OCR line boxes) + ``exclude_boxes`` (popups, chat panel, title bar, side panels): only text
+          outside the excluded regions is evidence, so "Go LIVE" in a chat message, "Lets Go LIVE!" in the title
+          chip or "End LIVE?" inside a dialog never count.
+        * ``control_label``: the label of the located Go/End LIVE *control* (red button). When known, it is the
+          only control evidence; phrase-based control rules are skipped.
+        Without geometry this is the plain ``classify``.
+        """
+        if boxes:
+            ex = list(exclude_boxes or [])
+
+            def inside(b) -> bool:
+                return any(x <= b.cx <= x2 and y <= b.cy <= y2 for x, y, x2, y2 in ex)
+            kept = [b for b in boxes if not inside(b)]
+            text = "\n".join(b.text for b in kept)
+        norm = normalize_text(text)
+        if not norm and not control_label:
+            return Classification(LiveState.UNKNOWN, reason="no text")
+        for p in self.unknown_phrases:
+            if phrase_in(p, norm):
+                return Classification(LiveState.UNKNOWN, reason=f"transitional screen: '{p}'")
+        has_timer = self.timer_regex.search(text) is not None
+        skip = set(self.CONTROL_RULES) if control_label else set()
+        live_ev = [e for e in (r.check(norm, has_timer) for r in self.live_rules if r.name not in skip) if e]
+        not_live_ev = [e for e in (r.check(norm, has_timer) for r in self.not_live_rules if r.name not in skip) if e]
+        if control_label:
+            lab = normalize_text(control_label)
+            if any(phrase_in(p, lab) for p in ("end live", "end broadcast", "end stream", "stop live", "stop streaming")):
+                live_ev.append(Evidence("live_control", 2, f"control reads '{control_label}'"))
+            elif any(phrase_in(p, lab) for p in ("go live", "start live", "start broadcast", "start stream", "start streaming")):
+                not_live_ev.append(Evidence("live_control", 2, f"control reads '{control_label}'"))
+        ls, nls = sum(e.score for e in live_ev), sum(e.score for e in not_live_ev)
+        ev = live_ev + not_live_ev
+        if ls >= self.live_min and nls < self.not_live_min:
+            return Classification(LiveState.LIVE, ls, nls, ev)
+        if nls >= self.not_live_min and ls < self.live_min:
+            return Classification(LiveState.NOT_LIVE, ls, nls, ev)
+        reason = "contradictory evidence" if (ls >= self.live_min and nls >= self.not_live_min) else "insufficient evidence"
+        return Classification(LiveState.UNKNOWN, ls, nls, ev, reason)
+
+    CONTROL_RULES = ("end_live_control", "go_live_control")
+
+    def classify_frame(self, text: str, boxes=None, exclude_boxes=None, control_label: str = "") -> Classification:
+        """Origin-aware classification of one frame.
+
+        * ``boxes`` (OCR line boxes) + ``exclude_boxes`` (popups, chat panel, title bar, side panels): only text
+          outside the excluded regions is evidence, so "Go LIVE" in a chat message, "Lets Go LIVE!" in the title
+          chip or "End LIVE?" inside a dialog never count.
+        * ``control_label``: the label of the located Go/End LIVE *control* (red button). When known, it is the
+          only control evidence; phrase-based control rules are skipped.
+        Without geometry this is the plain ``classify``.
+        """
+        if boxes:
+            ex = list(exclude_boxes or [])
+
+            def inside(b) -> bool:
+                return any(x <= b.cx <= x2 and y <= b.cy <= y2 for x, y, x2, y2 in ex)
+            kept = [b for b in boxes if not inside(b)]
+            text = "\n".join(b.text for b in kept)
+        norm = normalize_text(text)
+        if not norm and not control_label:
+            return Classification(LiveState.UNKNOWN, reason="no text")
+        for p in self.unknown_phrases:
+            if phrase_in(p, norm):
+                return Classification(LiveState.UNKNOWN, reason=f"transitional screen: '{p}'")
+        has_timer = self.timer_regex.search(text) is not None
+        skip = set(self.CONTROL_RULES) if control_label else set()
+        live_ev = [e for e in (r.check(norm, has_timer) for r in self.live_rules if r.name not in skip) if e]
+        not_live_ev = [e for e in (r.check(norm, has_timer) for r in self.not_live_rules if r.name not in skip) if e]
+        if control_label:
+            lab = normalize_text(control_label)
+            if any(phrase_in(p, lab) for p in ("end live", "end broadcast", "end stream", "stop live", "stop streaming")):
+                live_ev.append(Evidence("live_control", 2, f"control reads '{control_label}'"))
+            elif any(phrase_in(p, lab) for p in ("go live", "start live", "start broadcast", "start stream", "start streaming")):
+                not_live_ev.append(Evidence("live_control", 2, f"control reads '{control_label}'"))
+        ls, nls = sum(e.score for e in live_ev), sum(e.score for e in not_live_ev)
+        ev = live_ev + not_live_ev
+        if ls >= self.live_min and nls < self.not_live_min:
+            return Classification(LiveState.LIVE, ls, nls, ev)
+        if nls >= self.not_live_min and ls < self.live_min:
+            return Classification(LiveState.NOT_LIVE, ls, nls, ev)
+        reason = "contradictory evidence" if (ls >= self.live_min and nls >= self.not_live_min) else "insufficient evidence"
+        return Classification(LiveState.UNKNOWN, ls, nls, ev, reason)
+
     def classify(self, text: str) -> Classification:
         """Classify one OCR observation. Never trusts a bare 'LIVE' word."""
         norm = normalize_text(text)

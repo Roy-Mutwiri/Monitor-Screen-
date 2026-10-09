@@ -65,9 +65,11 @@ class PrivacyConfig:
 
 @dataclass
 class DetectionConfig:
-    poll_interval_seconds: float = 2.0
-    confirm_polls: int = 2            # popup must be seen in N consecutive polls
+    poll_interval_seconds: float = 1.0
+    confirm_polls: int = 2            # popup must be seen in N consecutive polls (strong evidence confirms at once)
+    immediate_strong_evidence: bool = True   # credible dialog + known category -> alert on the first poll
     dedup_cooldown_seconds: float = 600.0
+    review_cooldown_seconds: float = 300.0   # unrecognised-popup review alerts: at most one per this window
     resolve_after_seconds: float = 30.0
     rules_file: str = ""              # empty -> bundled rules/studio_rules.json
     ocr_backend: str = "auto"
@@ -313,7 +315,7 @@ class UiConfig:
     theme: str = "bootstrap-dark"   # ttkbootstrap theme name (bootstrap-dark | bootstrap-light)
 
 
-CONFIG_VERSION = 5
+CONFIG_VERSION = 6
 
 
 @dataclass

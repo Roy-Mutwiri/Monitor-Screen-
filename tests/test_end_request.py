@@ -120,8 +120,8 @@ def test_one_alert_for_persistent_dialog_with_labels_and_masked_screenshot(cfg, 
     alerts = end_alerts(h)
     assert len(alerts) == 1
     text = alerts[0]["payload"]["text"]
-    assert "Roy’s Live — LIVE IS BEING ENDED" in text and "TikTok account: unavailable" in text
-    assert "Ending has not yet been confirmed" in text and "Detected at:" in text
+    assert "Roy’s Live — END-LIVE CONFIRMATION OPENED" in text and "TikTok account: unavailable" in text
+    assert "not yet been confirmed ended" in text and "Observed:" in text
     shot = alerts[0]["screenshot_path"]
     assert shot and Path(shot).exists()
     img = Image.open(shot).convert("RGB")

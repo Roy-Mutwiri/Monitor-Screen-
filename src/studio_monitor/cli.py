@@ -726,6 +726,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("supervise", help="run the monitor under a restarting supervisor (watchdog): supervise [--gui]")
     p.add_argument("--gui", action="store_true", help="supervise the GUI with --autostart instead of the headless runner")
     sub.add_parser("doctor", help="environment checks (credential store, OCR, capture, model, disk, target, bots, hub)")
+    sub.add_parser("latency", help="measured delivery latency from the local outbox (median / p95; monotonic within this process)")
     p = sub.add_parser("memory", help="Supermemory: set-key | clear-key | status | search QUERY")
     p.add_argument("action", choices=["set-key", "clear-key", "status", "search"]); p.add_argument("query", nargs="?", default="")
     p = sub.add_parser("smtp", help="e-mail backup route: set-password | status | test")
@@ -790,6 +791,11 @@ def main(argv: list[str] | None = None) -> int:
         return _perception(cfg, args.action, args.overlay)
     if args.cmd == "audio":
         return _audio(cfg, args.action)
+    if args.cmd == "latency":
+        from .app import open_queue
+        import json as _json
+        print(_json.dumps(open_queue(cfg).latency_stats(), indent=1))
+        return 0
     if args.cmd == "doctor":
         from .app import doctor
         worst = 0

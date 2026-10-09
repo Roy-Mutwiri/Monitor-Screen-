@@ -38,6 +38,8 @@ class Detector:
         self.log_text = log_text
         self.last_full_text: Optional[str] = None  # whole-image OCR text of the last scan, if one was done
         self.last_full_lines: list[str] = []
+        self.last_full_boxes: list = []
+        self.last_full_boxes: list = []
 
     def ocr_text(self, image: Image.Image) -> str:
         try:
@@ -59,6 +61,7 @@ class Detector:
         results = []
         self.last_full_text = None
         self.last_full_lines = []
+        self.last_full_boxes = []
         for region in regions or [FULL_WINDOW]:
             if region.kind != "detect":
                 continue
@@ -74,6 +77,8 @@ class Detector:
             if region is FULL_WINDOW:
                 self.last_full_text = text
                 self.last_full_lines = list(getattr(res, "lines", []) or [])
+                self.last_full_boxes = list(getattr(res, "boxes", []) or [])
+                self.last_full_boxes = list(getattr(res, "boxes", []) or [])
             results.append((region, text, self.rules.match(text)))
         return results
 

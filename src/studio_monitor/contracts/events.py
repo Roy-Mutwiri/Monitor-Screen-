@@ -67,6 +67,7 @@ EVENT_TYPES: dict[str, str] = {
     "INCIDENT_SNOOZED": Severity.INFO,
     "SCREENSHOT": Severity.INFO,
     "SESSION_REPORT": Severity.INFO,
+    "UNKNOWN_POPUP": Severity.WARNING,
     "TEST": Severity.INFO,
 }
 

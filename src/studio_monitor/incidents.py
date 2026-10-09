@@ -93,7 +93,7 @@ class IncidentTracker:
         return None
 
     def observe(self, category: str, label: str, text: str, *, manual_attention: bool = False,
-                window_title: str = "", is_dialog: bool = False) -> DedupDecision:
+                window_title: str = "", is_dialog: bool = False, strong: bool = False) -> DedupDecision:
         """Record a positive detection for this poll and decide whether to alert."""
         now = self.clock()
         fp = fingerprint(category, text)
@@ -119,7 +119,7 @@ class IncidentTracker:
         else:
             pend.count += 1
             pend.last_seen = now
-        if pend.count < self.confirm_polls:
+        if pend.count < self.confirm_polls and not strong:
             return DedupDecision(False, None, f"awaiting confirmation ({pend.count}/{self.confirm_polls})")
 
         del self._pending[fp]

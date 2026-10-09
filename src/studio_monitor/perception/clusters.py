@@ -13,7 +13,17 @@ from typing import Iterable, Optional
 from .ocr_boxes import OcrBox
 
 BUTTON_WORDS = {"ok", "cancel", "close", "end now", "check", "retry", "got it", "continue", "confirm", "dismiss", "later",
-                "verify", "start", "reconnect", "yes", "no", "done", "learn more", "end live", "go live"}
+                "verify", "start", "reconnect", "yes", "no", "done", "learn more", "end live", "go live", "good", "neutral", "poor",
+                "allow", "deny", "accept", "decline", "skip", "next", "back", "submit", "send", "review"}
+
+
+def is_button_box(b: "OcrBox") -> bool:
+    """A button label: a known button word, or a short label (<= 2 words, <= 14 chars, no sentence punctuation)."""
+    t = b.text.strip()
+    low = t.lower().rstrip("?.!")
+    if low in BUTTON_WORDS:
+        return True
+    return 0 < len(t) <= 14 and len(t.split()) <= 2 and not t.endswith((".", "?", "!", ":")) and not any(ch.isdigit() for ch in t)
 
 
 @dataclass
@@ -42,15 +52,14 @@ class TextBlock:
 
     @property
     def buttons(self) -> list[OcrBox]:
-        return [b for b in self.lines if b.text.strip().lower().rstrip("?.!") in BUTTON_WORDS or
-                (len(b.text) <= 12 and b.text.strip().lower() in BUTTON_WORDS)]
+        return [b for b in self.lines if is_button_box(b)]
 
     @property
     def line_height(self) -> float:
         return sum(b.h for b in self.lines) / len(self.lines)
 
 
-def group_blocks(boxes: Iterable[OcrBox], v_gap: float = 1.6, h_slack: float = 1.5) -> list[TextBlock]:
+def group_blocks(boxes: Iterable[OcrBox], v_gap: float = 2.5, h_slack: float = 1.5) -> list[TextBlock]:
     """Greedy top-down grouping: a line joins a block when its vertical distance to the block's last line is
     below ``v_gap`` line heights and the horizontal extents overlap (with ``h_slack`` line heights of slack)."""
     lines = sorted(boxes, key=lambda b: (b.y, b.x))

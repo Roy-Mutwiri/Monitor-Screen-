@@ -149,4 +149,4 @@ def test_late_delivery_note():
     assert late_delivery_note({"created_at": now - 10}, now) == ""
     assert late_delivery_note({}, now) == ""
     note = late_delivery_note({"created_at": now - 3600}, now)
-    assert "Delayed delivery" in note and "generated" in note
+    assert "delivery delayed by" in note and "not the current status" in note

@@ -31,6 +31,7 @@ CAT_REMINDERS = "reminders"
 CAT_BROADCAST = "broadcast_started"
 CAT_HEALTH = "health"
 CAT_STREAM = "stream_health"
+CAT_POPUPS = "popups"
 CAT_TEST = "test"   # internal: explicit test notifications; not subscribable
 
 EVENT_CATEGORIES: dict[str, str] = {
@@ -42,6 +43,7 @@ EVENT_CATEGORIES: dict[str, str] = {
     CAT_BROADCAST: "Broadcast started / already live (with screenshot)",
     CAT_HEALTH: "Monitoring health alerts (LOST / DEGRADED / RUNNING)",
     CAT_STREAM: "Stream health while LIVE (connection, missing source, black/frozen preview, presenter, audio meter)",
+    CAT_POPUPS: "Unrecognised Studio popups (reported for review, never interpreted)",
 }
 
 TOKEN_RE = re.compile(r"^\d{6,}:[A-Za-z0-9_-]{30,}$")

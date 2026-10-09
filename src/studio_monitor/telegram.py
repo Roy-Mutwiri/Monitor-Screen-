@@ -214,7 +214,10 @@ def late_delivery_note(payload: dict, now: float) -> str:
     if not created or now - float(created) < LATE_AFTER_SECONDS:
         return ""
     from .alerts import local_ts
-    return f"\n<i>Delayed delivery: sent {local_ts(now)}, generated {local_ts(float(created))}.</i>"
+    delay = now - float(created)
+    mins = int(delay // 60)
+    human = f"{mins} min {int(delay % 60)} s" if mins else f"{int(delay)} s"
+    return f"\n<i>Observed at {local_ts(float(created))}; delivery delayed by {human}. This is not the current status.</i>"
 
 
 def deliver(client: TelegramClient, payload: dict, screenshot_path: str, clock: Callable[[], float] = time.time,

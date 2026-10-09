@@ -315,15 +315,44 @@ def format_pc_health_alert(kind: str, condition: str, text: str, machine_label: 
 
 # ---------------------------------------------------------------- end-LIVE confirmation dialog
 
-def format_end_requested(machine_label: str, ts: float, account_line: str, label: str = "", screenshot_attached: bool = True) -> dict:
+def format_end_requested(machine_label: str, ts: float, account_line: str, label: str = "", screenshot_attached: bool = True,
+                         title: str = "End streaming?", body: str = "End LIVE? Share your LIVE for more viewers.",
+                         buttons: str = "End now / Cancel") -> dict:
     label = label or f"{machine_label}\u2019s Live"
-    lines = [headline("\U0001F7E0", label, "LIVE IS BEING ENDED"),
+    lines = [headline("\U0001F7E0", label, "END-LIVE CONFIRMATION OPENED"),
              f"TikTok account: {html.escape(account_line or 'unavailable')}",
-             "The \u201cEnd streaming?\u201d confirmation dialog is open.",
-             "Ending has not yet been confirmed.",
-             f"Detected at: {local_ts(ts)}",
-             f"PC: {html.escape(machine_label)}",
-             "Screenshot attached." if screenshot_attached else "No screenshot attached."]
+             f"Title: {html.escape(title)}",
+             f"Message: {html.escape(body)}",
+             f"Buttons: {html.escape(buttons)}",
+             "The broadcast has not yet been confirmed ended.",
+             f"Observed: {local_ts(ts)}",
+             f"PC: {html.escape(machine_label)}"]
+    if not screenshot_attached:
+        lines.append("No screenshot attached.")
+    return _finish(lines, ts)
+
+
+def format_unknown_popup(machine_label: str, ts: float, title: str, body: str, buttons: list[str], label: str = "",
+                         account_line: str = "", readable: bool = True, screenshot_attached: bool = True,
+                         more: list[tuple[str, str, list[str]]] | None = None, suppressed: int = 0) -> dict:
+    """``more``: further unreadable-category blocks seen on the same frame (title, body, buttons) -> one alert per frame;
+    ``suppressed``: distinct unknown popups seen since the last review alert but held back by the review cooldown."""
+    label = label or f"{machine_label}\u2019s Live"
+    lines = [headline("\U0001F4AC", label, "NEW STUDIO POPUP \u2014 NEEDS REVIEW"),
+             "A Studio dialog appeared that the monitor does not recognise. It is reported as seen, not interpreted."]
+    if readable:
+        lines += [f"Title: {html.escape(title or '(none)')}", f"Message: {html.escape(body or '(none)')}",
+                  f"Buttons: {html.escape(' / '.join(buttons) or '(none read)')}"]
+    else:
+        lines.append("The popup text could not be read.")
+    for i, (t2, b2, btn2) in enumerate(more or [], start=2):
+        lines.append(f"Block {i}: {html.escape(t2 or '(none)')} \u2014 {html.escape((b2 or '')[:120])} [{html.escape(' / '.join(btn2) or 'no buttons')}]")
+    if suppressed:
+        lines.append(f"{suppressed} further unrecognised popup(s) since the last review alert were logged, not sent (review cooldown).")
+    if account_line:
+        lines.append(f"TikTok account: {html.escape(account_line)}")
+    lines += [f"Observed: {local_ts(ts)}", f"PC: {html.escape(machine_label)}",
+              "Screenshot attached." if screenshot_attached else "No screenshot attached."]
     return _finish(lines, ts)
 
 

@@ -49,6 +49,12 @@ from .watchdog import StallDetector
 from .alerts import format_pc_health_alert, format_end_requested, format_end_outcome
 from .end_request import EndDialogRules, EndRequestEvent, EndRequestTracker
 from .perception.tracker import LayoutTracker
+from .popups import ALERTING_TYPES, END_CONFIRMATION, INFORMATIONAL, POST_LIVE_SUMMARY, UNKNOWN as POPUP_UNKNOWN, PopupClassifier, PopupObservation
+from .frame_analysis import FrameAnalysis, analyze_frame
+from .alerts import format_unknown_popup
+from .bots import CAT_POPUPS
+from .detection.detector import Detection as _Detection
+from .regions import FULL_WINDOW
 from .audio.worker import AudioWorker
 from .session_report import build_report
 from .ocr.base import OcrBackend, OcrError
@@ -258,6 +264,15 @@ class Monitor:
         self._derived_masks: list = []
         self._audio_incidents: dict[str, dict] = {}
         self.perception_notes: dict[str, str] = {}
+        # per-frame analysis: popups first, then broadcast evidence from unobscured text
+        self._frame_counter = 0
+        self.last_analysis: Optional[FrameAnalysis] = None
+        self._popup_classifier_obj: Optional[PopupClassifier] = None
+        self._review_seen: dict[str, dict] = {}
+        self._review_last_alert = 0.0                   # one review alert per review cooldown, whatever the wording
+        self._review_suppressed = 0
+        self._last_end_popup: Optional[PopupObservation] = None
+        self.frame_analyses: list[dict] = []            # recent timing records for diagnostics
         self._stalled = False
         self._watchdog_thread: Optional[threading.Thread] = None
         self._stream_episode_counts: dict[str, int] = {}
@@ -307,6 +322,13 @@ class Monitor:
         suppressed = self.incident_engine.is_suppressed(self.device_id, category, incident_id)
         managed = self.cfg.device.mode == "managed"
         targets = [] if (suppressed or managed) else self.registry.targets(category)
+        if "timing" not in payload and self.last_analysis is not None:
+            a = self.last_analysis
+            payload["timing"] = {"frame_id": a.frame_id, "captured_at": a.captured_at, "captured_mono": a.captured_mono,
+                                 "analysis_ms": round(a.analysis_ms, 1)}
+        payload.setdefault("timing", {})
+        payload["timing"]["persisted_at"] = self.clock()
+        payload["timing"]["persisted_mono"] = self.mono()
         n = self.queue.create_event(event_id, kind, category, payload, evidence_path, targets, label,
                                     owner_label=self.cfg.notification_label)
         if suppressed:
@@ -417,7 +439,10 @@ class Monitor:
         detections: list[Detection] = []
         main_cap: Optional[Capture] = None
         main_full_text: Optional[str] = None
+        main_lines: list = []
+        main_boxes: list = []
         ocr_views: list = []
+        analysis: Optional[FrameAnalysis] = None
         fresh_frame = False
         if state.status in (Status.RUNNING, Status.DEGRADED) and state.window is not None:
             main = state.window
@@ -458,6 +483,7 @@ class Monitor:
                         det = None
                     if c is main_cap:
                         main_full_text = self.detector.last_full_text
+                        main_lines, main_boxes = list(self.detector.last_full_lines), list(self.detector.last_full_boxes)
                     view_text, view_lines = self.detector.last_full_text, self.detector.last_full_lines
                     if view_text is None and self.broadcast.state.state == LiveState.LIVE:
                         # detect regions configured: one extra whole-frame pass, only while LIVE, for end-dialog evidence
@@ -473,12 +499,17 @@ class Monitor:
             if main_cap is not None and self.perception is not None:
                 self.perception.observe(main_cap.image, main_cap.captured_at, fresh_frame, self.tracker.identity.pid)
                 self._refresh_derived_masks()
+            if main_cap is not None and fresh_frame and main_full_text is not None:
+                analysis = self._analyze(main_cap, main_full_text, main_lines, main_boxes)
+                detections = self._apply_popups(analysis, main_cap, detections)
 
+            strong_ids = {id(d) for d in detections if getattr(d, "strong", False)}
             for det in detections:
                 decision = self.incidents.observe(
                     det.category, det.match.label, det.ocr_text,
                     manual_attention=det.match.manual_attention,
                     window_title=det.capture.window.title, is_dialog=det.is_dialog,
+                    strong=id(det) in strong_ids and self.cfg.detection.immediate_strong_evidence,
                 )
                 if decision.alert and decision.incident is not None:
                     self._raise_alert(det, decision.incident, decision.reason)
@@ -502,8 +533,15 @@ class Monitor:
         self._update_sessions(window_present, screenshot_ok)
         popup_on_main = any(not d.is_dialog for d in detections)
         classification: Optional[Classification] = None
-        if screenshot_ok and fresh_frame and not popup_on_main and self.sessions.running:
-            classification = self._classify_live(main_cap, main_full_text)
+        if screenshot_ok and fresh_frame and self.sessions.running:
+            if analysis is not None and not self.cfg.live_regions:
+                # popups were classified first; only unobscured, origin-aware evidence reaches the engine
+                classification = analysis.live if analysis.live_valid else None
+                self._last_live_text = analysis.text
+            elif analysis is not None and analysis.popup_of_type(END_CONFIRMATION) is not None:
+                classification = None                   # manual live regions, but the end dialog is open: no observation
+            elif not popup_on_main:
+                classification = self._classify_live(main_cap, main_full_text)
         self._update_broadcast_and_reminders(classification, main_cap if fresh_frame else None)
         self._observe_end_dialog(ocr_views, fresh_frame and screenshot_ok)
         self._poll_lookup()
@@ -802,6 +840,115 @@ class Monitor:
         hits = self.memory.search(query, {"device_id": self.device_id}, self.cfg.memory.retrieval_limit)
         return format_hits(hits, "Similar past incidents / sessions")
 
+    # ---- per-frame analysis: popups first, then broadcast evidence --------------
+    def _retire_review_incidents(self) -> None:
+        """Review notices opened as incidents by earlier builds keep sending 'STILL OPEN' reminders: resolve them."""
+        try:
+            rows = self.incident_engine.conn.execute(
+                "SELECT incident_id FROM incidents_v2 WHERE problem_key='unknown_popup' AND status='OPEN'").fetchall()
+            for (iid,) in rows:
+                self.incident_engine.resolve(iid, "review notice retired: unrecognised popups are one-shot observations", actor="system")
+            if rows:
+                self.on_event(f"retired {len(rows)} open popup-review incident(s); reminders stop")
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("retire review incidents failed: %s", exc)
+
+    def _popup_classifier(self) -> PopupClassifier:
+        if self._popup_classifier_obj is None:
+            self._retire_review_incidents()
+            conn = self.detectors.rules if self.detectors is not None else None
+            ocr = self.detector.ocr
+            reocr = None
+            if getattr(ocr, "name", "") == "windows" and hasattr(ocr, "recognize_boxes"):
+                reocr = lambda img: list(getattr(ocr.recognize_boxes(img), "boxes", []) or [])     # panel rescan (same backend)
+            self._popup_classifier_obj = PopupClassifier(self.detector.rules, self.end_rules, conn, reocr=reocr)
+        return self._popup_classifier_obj
+
+    def _analyze(self, cap: Capture, text: str, lines: list, boxes: list) -> FrameAnalysis:
+        self._frame_counter += 1
+        layout = self.perception.layout if (self.perception is not None and self.cfg.perception.enabled) else None
+        fa = analyze_frame(cap.image, self._frame_counter, cap.captured_at, cap.captured_mono, text, lines, boxes,
+                           self._popup_classifier(), self.live_rules, layout, self.mono)
+        self.last_analysis = fa
+        self.frame_analyses.append({"frame_id": fa.frame_id, "captured_at": fa.captured_at, "analysis_ms": round(fa.analysis_ms, 1),
+                                    "popups": [p.popup_type for p in fa.popups], "live": fa.live.state.value if fa.live else "",
+                                    "capture_to_analysis_ms": round((fa.analysis_done_mono - fa.captured_mono) * 1000, 1)})
+        self.frame_analyses = self.frame_analyses[-200:]
+        end = fa.popup_of_type(END_CONFIRMATION)
+        self._last_end_popup = end if end is not None else self._last_end_popup
+        return fa
+
+    def _apply_popups(self, fa: FrameAnalysis, cap: Capture, detections: list) -> list:
+        """With OCR geometry, restriction detections come from credible popup blocks only (chat/video text is a
+        negative example); without geometry the whole-frame rule match stays. Unknown dialogs go to review."""
+        if not fa.has_geometry:
+            return detections
+        out = [d for d in detections if d.is_dialog]           # separate dialog windows keep their own path
+        unknown: list[PopupObservation] = []
+        for p in fa.popups:
+            if p.rule_category:
+                match = self.detector.rules.match(p.text)
+                if match is None:
+                    continue
+                det = _Detection(match, cap, FULL_WINDOW, p.text)
+                det.strong = p.confidence >= 0.8 and p.kind == "dialog"
+                det.popup = p
+                out.append(det)
+            elif p.popup_type == POPUP_UNKNOWN:
+                unknown.append(p)
+        if unknown:
+            if self.cfg.perception.enabled and (self.perception is None or self.perception.layout is None):
+                self.on_event("unrecognised block ignored: layout not located yet (main UI panels are not dialogs)")
+            else:
+                self._review_popup(unknown, cap)
+        return out
+
+    def _review_popup(self, popups: list[PopupObservation], cap: Capture) -> None:
+        """All unrecognised blocks of one frame -> at most one review alert; a block must persist ``confirm_polls``
+        frames; the same wording is not re-sent within the dedup cooldown; and whatever the wording, review alerts
+        are sent at most once per review cooldown (further distinct ones are logged and counted into the next alert)."""
+        now = self.clock()
+        due: list[PopupObservation] = []
+        for p in popups:
+            rec = self._review_seen.setdefault(p.fingerprint(), {"count": 0, "first": now, "alerted": 0.0})
+            rec["count"] += 1
+            rec["last"] = now
+            if rec["count"] >= self.cfg.detection.confirm_polls and now - rec["alerted"] >= self.cfg.detection.dedup_cooldown_seconds:
+                due.append(p)
+        if not due:
+            return
+        cooldown = float(getattr(self.cfg.detection, "review_cooldown_seconds", 300.0))
+        if now - self._review_last_alert < cooldown:
+            for p in due:
+                self._review_seen[p.fingerprint()]["alerted"] = now
+            self._review_suppressed += len(due)
+            self.on_event(f"unrecognised Studio popup held (review cooldown): {due[0].title or due[0].body or '(unreadable)'}"[:160])
+            return
+        for p in due:
+            self._review_seen[p.fingerprint()]["alerted"] = now
+        self._review_last_alert = now
+        p = due[0]
+        eid = _event_id("POP", now)
+        shot = self._save_evidence(eid, cap.image)
+        readable = bool((p.title or p.body).strip())
+        payload = format_unknown_popup(self.cfg.machine_label, p.observed_at, p.title, p.body, p.button_labels, label=self.cfg.notification_label,
+                                       account_line=self.current_account_handle(), readable=readable, screenshot_attached=bool(shot),
+                                       more=[(q.title, q.body, q.button_labels) for q in due[1:6]], suppressed=self._review_suppressed)
+        self._review_suppressed = 0
+        payload["popup"] = p.to_dict()
+        payload["popups"] = [q.to_dict() for q in due]
+        # a review notice is a one-shot observation, not a fault: no durable incident, no reminders, nothing to /ack
+        self.dispatch(eid, KIND_INCIDENT, CAT_POPUPS, payload, shot, label="New Studio popup", event_type="UNKNOWN_POPUP",
+                      extra_detail={"popups": [q.to_dict() for q in due]})
+        self.on_event(f"unrecognised Studio popup reported for review -> {eid}: {p.title or p.body or '(unreadable)'}"[:160])
+
+    def latency_report(self) -> dict:
+        rep = self.queue.latency_stats()
+        if self.frame_analyses:
+            v = sorted(a["capture_to_analysis_ms"] for a in self.frame_analyses)
+            rep["capture_to_analysis_ms"] = {"n": len(v), "median": v[len(v) // 2], "p95": v[min(len(v) - 1, int(len(v) * 0.95))]}
+        return rep
+
     # ---- automatic perception -----------------------------------------------
     def _layout_region(self, element: str, kind: str, name: str, min_conf: float = 0.0):
         """A Region derived from the current layout element (frame-relative), or None."""
@@ -989,8 +1136,12 @@ class Monitor:
         shot = self._save_evidence(eid, cap.image if cap is not None else None)   # already-redacted frame
         account_line = self.current_account_handle() or ("unavailable" if self.account.status != DISABLED_STATUS else
                                                          "not detected (automatic detection disabled)")
+        pop = self._last_end_popup
         payload = format_end_requested(self.cfg.machine_label, ts, account_line, label=self.cfg.notification_label,
-                                       screenshot_attached=bool(shot))
+                                       screenshot_attached=bool(shot),
+                                       title=(pop.title if pop and pop.title else "End streaming?"),
+                                       body=(pop.body if pop and pop.body else "End LIVE? Share your LIVE for more viewers."),
+                                       buttons=(" / ".join(pop.button_labels) if pop and pop.button_labels else "End now / Cancel"))
         change = self.incident_engine.open_or_update(
             self.device_id, CAT_BROADCAST, "end_requested", Severity.INFO,
             "End streaming? dialog open (LIVE is being ended; not yet confirmed)", session_id=self.sessions.session_id,

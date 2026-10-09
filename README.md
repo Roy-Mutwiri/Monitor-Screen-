@@ -162,6 +162,49 @@ and a mode: `standalone` (local Telegram delivery) or `managed` (a hub owns deli
 recorded locally and delivered by the hub, so there are no duplicate notifications). Local bot
 settings are kept in both modes.
 
+## Popup classification before broadcast transitions (root-cause fix)
+
+**Bug**: opening the *End streaming?* dialog could produce "HAS GONE LIVE" / "ALREADY LIVE". **Root cause**: the live-state
+engine scored *phrases anywhere in the frame*: "End LIVE?" inside the dialog counted as the End-LIVE *control*, while
+"Lets Go LIVE!" in the title chip and "go LIVE" in the LIVE-chat welcome text counted as the Go-LIVE control. Depending on
+what the OCR read on a given frame (a dimmed backdrop, scrolled chat), the balance flipped and a NOT_LIVE/LIVE transition was
+manufactured from text that is not the control. Popups were also recognised *after* the broadcast update.
+
+**Fix** (`frame_analysis.py`, `popups.py`, `broadcast.LiveRules.classify_frame`): every frame is analysed as one record
+(frame id, capture time, OCR text + boxes). Popups are classified first from spatially grouped blocks on a uniform panel
+(title / body / button row); the chat panel, title bar, side panels and the control bar are negative regions. Only then is the
+broadcast state scored on the *unobscured* text, and the Go/End LIVE evidence comes from the label read inside the located
+red control on **this** frame — never from phrases elsewhere, never from the cached layout. The end dialog is evidence of
+an end *request*; it cannot start a broadcast, reset the episode or combine with another frame. Without OCR geometry the
+dialog's own lines are removed from the evidence before classification. A post-LIVE summary never counts as LIVE.
+A dialog panel whose full-frame OCR lost a button (white-on-red "End now" is the usual casualty) is rescanned once at 2x
+on the panel crop only (same backend, ~15-100 ms); tiles, counters and badges never qualify as unknown dialogs, and the
+cards of the post-LIVE summary are never reported as new popups.
+
+**What an unrecognised dialog must look like** (learned from a real session on 2026-10-09, when the sign-in page, the
+empty home panels and the docked sources panel each produced a review alert): a block with a button row, a title of at
+least two words and a body or a second button, floating centred like a Studio modal (never touching the window edge),
+seen only after the layout has been located. The sign-in page (QR / Google / email-password / confirm on mobile) is one
+`sign_in_screen` observation and is not alerted. Review alerts carry every unrecognised block of the frame, are sent at
+most once per `detection.review_cooldown_seconds` (default 300 s; later distinct blocks are counted into the next
+alert) and are one-shot notices: no incident, no reminders, nothing to `/ack`.
+
+**Typed popup result**: `popup_type` (end_stream_confirmation, live_restriction, live_access_suspension, account_suspension,
+verification_challenge, reconnecting, missing_source, post_live_summary, informational, unknown), title, body,
+button_labels, bounding_box, observed_at, frame_id, confidence, classification_reason, evidence. LIVE-access suspensions are
+never upgraded to account suspensions. Unknown dialogs produce `💬 NEW STUDIO POPUP — NEEDS REVIEW` with the readable
+title/body/buttons and the screenshot (bot category *popups*), never a guessed restriction.
+
+**End dialog caption**: `🟠 <owner>’s Live — END-LIVE CONFIRMATION OPENED`, TikTok account, Title / Message / Buttons as
+read, "The broadcast has not yet been confirmed ended.", "Observed: <time>", exact triggering screenshot.
+
+**Latency**: every alert payload carries `timing` (frame id, capture time, analysis ms, persisted time); deliveries record
+request start / response (monotonic). `studio-monitor latency` and Diagnostics `[latency]` show median / p95 of
+detection→persist, queue delay and Telegram API time plus queue depth. Credible dialogs with a known category alert on the
+first poll (`detection.immediate_strong_evidence`); weaker evidence still needs `confirm_polls`. Default poll interval is
+now 1 s. Urgent kinds are dequeued first; a rate-limited bot only blocks itself (`retry_after` honoured per bot). Delayed
+deliveries carry "Observed at …; delivery delayed by …; not the current status".
+
 ## Automatic perception (no regions to draw)
 
 Select the Studio window, press **Start**, and the monitor discovers the layout itself (`perception/`):
@@ -691,6 +734,7 @@ src/studio_monitor/
   pc_health.py / watchdog.py / clips.py / engagement.py  PC health sampling, stall detector + supervisor, GIF clips, viewer counts
   end_request.py  End streaming? dialog detection (rules/end_dialog_rules.json) and persisted end-request episodes
   perception/     automatic layout discovery (ocr_boxes, clusters, anchors, uia, layout, tracker, optional omniparser)
+  popups.py / frame_analysis.py  typed popup classification first, then origin-aware broadcast evidence per frame
   audio/          AudioSourceResolver, process loopback, levels/VAD, optional transcription, AudioWorker
 src/hub/        the central hub: FastAPI app, SQLAlchemy models, services, Telegram routing, dashboard templates
 deploy/         Dockerfile, docker-compose.yml (PostgreSQL + hub), .env.example, deployment README

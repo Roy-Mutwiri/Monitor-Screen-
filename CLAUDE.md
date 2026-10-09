@@ -52,6 +52,9 @@ src/studio_monitor/
                                   thread with latest-frame slot; LayoutStore caches validated profiles. Never hardcode boxes.
   audio/                          AudioSourceResolver -> process loopback (works on this PC via comtypes + IAgileObject
                                   handler) / session meter / input / visual; analyzer never records; no routing changes.
+  popups.py / frame_analysis.py   per-frame record: popups (spatial blocks on panels; chat/title/control bar are negative)
+                                  BEFORE broadcast scoring; control evidence = label inside the located red button on THIS
+                                  frame; dialog text never scores. Timing stamps in payload['timing'] + deliveries columns.
 src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy), services (framework-free logic),
                                   delivery (Telegram routes by token_env), app (API + Jinja dashboard); deploy/ has compose
   account.py                      @username discovery: Interactor protocol (Win32Interactor real), perform_lookup,
@@ -77,7 +80,7 @@ src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy
 
 ## Commands
 ```
-.venv\Scripts\python -m pytest -q
+.venv\Scripts\python -m pytest -q --ignore=tests/test_gui.py ; .venv\Scripts\python -m pytest -q tests/test_gui.py
 .venv\Scripts\python -m studio_monitor list-windows | run --once | calibrate X | calibrate-live X
 .venv\Scripts\python packaging\build_exe.py --clean --zip   -> dist\StudioMonitor\
 ```
@@ -111,5 +114,12 @@ src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy
 - Automatic perception verified on the operator's real frame (private fixture): all core elements located; audio process
   loopback verified to deliver frames from Studio's media process (silence at the time). Not verified: live state on a real
   broadcast, non-English Studio, light theme, OmniParser integration beyond the benchmark. The energy VAD is a fallback only.
+- Root cause of 'Has gone LIVE' on the end dialog: phrase-anywhere live scoring (dialog 'End LIVE?', title chip 'Lets Go
+  LIVE!', chat 'go LIVE'). Never reintroduce frame-wide control phrases; use LiveRules.classify_frame with exclusions.
+- Unknown-popup review (real session 2026-10-09): main UI (sign-in page, empty home panels, docked sources panel) is not
+  a dialog. Review needs: button row + >=2-word title + body/second button, centred floating panel, layout located;
+  one alert per review cooldown, one-shot (never an incident). Sign-in page = sign_in_screen, not alerted.
+- tests/test_gui.py must run in its own pytest process: in the same process as the rest of the suite a later hub
+  dashboard test dies with Windows fatal exception 0x80000003 (Tk + Jinja/starlette interaction; gui+hub alone pass).
 - Detectors never evaluate when the broadcast is not LIVE; a 'reconnecting' overlay keeps the LIVE episode open (UNKNOWN,
   not NOT_LIVE) so RECONNECTING can be reported.

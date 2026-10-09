@@ -115,6 +115,19 @@ def run_migrations(cfg: AppConfig, cfg_path: Path, registry: BotRegistry, queue:
         cfg.save(cfg_path)
         if added:
             notes.append(f"subscribed {added} enabled bot(s) to the new 'Stream health' category")
+    if cfg.config_version < 6:
+        from .bots import CAT_POPUPS
+        added = 0
+        for b in registry.bots:
+            if b.enabled and CAT_POPUPS not in b.subscriptions:
+                b.subscriptions.append(CAT_POPUPS)
+                added += 1
+        if cfg.detection.poll_interval_seconds == 2.0:
+            cfg.detection.poll_interval_seconds = 1.0           # faster popup detection (measured; see latency diagnostics)
+        cfg.config_version = 6
+        cfg.save(cfg_path)
+        if added:
+            notes.append(f"subscribed {added} enabled bot(s) to the new 'Unrecognised popups' category")
     if queue.legacy_pending_count() or not queue.get_state("legacy_alerts_migrated"):
         target = None
         default = registry.by_name("Default Bot") or (registry.bots[0] if registry.bots else None)

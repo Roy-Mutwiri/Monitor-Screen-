@@ -299,7 +299,7 @@ def discover_layout(frame: Image.Image, boxes: list[OcrBox], uia: list[UiaElemen
     blocks = group_blocks(boxes)
     band_all = (lx, top_bar_bottom, rx, status_top)
     for blk in dialog_candidates(blocks, band_all):
-        kind = "banner" if (blk.y2 - blk.y) < h * 0.12 and blk.y < h * 0.3 else "dialog"
+        kind = "banner" if (blk.y2 - blk.y) < h * 0.2 and blk.y < h * 0.3 else "dialog"   # a top notice (audio/source warning) with its icon row
         panel = grow_panel(frame, (blk.x - 4, blk.y - 4, blk.x2 + 4, blk.y2 + 4))
         if (panel[2] - panel[0]) > w * 0.9 or (panel[3] - panel[1]) > h * 0.9:
             panel = (blk.x - 12, blk.y - 10, blk.x2 + 12, blk.y2 + 10)         # grew into the canvas: keep the text box
