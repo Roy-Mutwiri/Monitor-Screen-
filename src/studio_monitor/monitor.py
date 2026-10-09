@@ -843,7 +843,9 @@ class Monitor:
 
     # ---- per-frame analysis: popups first, then broadcast evidence --------------
     def _retire_review_incidents(self) -> None:
-        """Review notices opened as incidents by earlier builds keep sending 'STILL OPEN' reminders: resolve them."""
+        """Review notices opened as incidents by earlier builds keep sending 'STILL OPEN' reminders: resolve them.
+        Stream-health incidents left OPEN by a previous monitor process are orphans too (their conditions live in
+        memory): resolve them at start; a condition that still holds is re-confirmed and re-opened by the detectors."""
         try:
             rows = self.incident_engine.conn.execute(
                 "SELECT incident_id FROM incidents_v2 WHERE problem_key='unknown_popup' AND status='OPEN'").fetchall()
@@ -851,6 +853,14 @@ class Monitor:
                 self.incident_engine.resolve(iid, "review notice retired: unrecognised popups are one-shot observations", actor="system")
             if rows:
                 self.on_event(f"retired {len(rows)} open popup-review incident(s); reminders stop")
+            tracked = {i["incident_id"] for i in list(self._stream_incidents.values()) + list(self._audio_incidents.values())}
+            rows = self.incident_engine.conn.execute(
+                "SELECT incident_id FROM incidents_v2 WHERE category=? AND status='OPEN'", (CAT_STREAM,)).fetchall()
+            orphans = [iid for (iid,) in rows if iid not in tracked]
+            for iid in orphans:
+                self.incident_engine.resolve(iid, "monitor restarted; stream-health conditions are re-evaluated from scratch", actor="system")
+            if orphans:
+                self.on_event(f"resolved {len(orphans)} stream-health incident(s) orphaned by a previous monitor process")
         except Exception as exc:  # pragma: no cover - defensive
             log.debug("retire review incidents failed: %s", exc)
 
