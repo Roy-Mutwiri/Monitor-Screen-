@@ -554,14 +554,34 @@ class App:
         tb.Label(left, textvariable=self.target_var, wraplength=380, justify="left", font=self.fonts["caption"]).pack(
             fill="x", pady=(8, 0))
 
-        right = tb.Labelframe(top, text="  Live preview and regions", padding=10)
+        right = tb.Labelframe(top, text="  Live preview — automatic detection", padding=10)
         top.add(right, weight=2)
+        strip = tb.Frame(right)
+        strip.pack(fill="x", pady=(0, 6))
+        self.auto_vars = {k: tk.StringVar(value=v) for k, v in (("layout", "Studio layout: not started"), ("presenter", "Presenter: —"),
+                                                                 ("audio", "Audio: —"), ("detectors", "Detectors: —"))}
+        for key in ("layout", "presenter", "audio", "detectors"):
+            tb.Label(strip, textvariable=self.auto_vars[key], font=self.fonts["caption"], bootstyle="secondary").pack(anchor="w")
+        tools = tb.Frame(right)
+        tools.pack(fill="x", pady=(0, 4))
+        self.show_areas_var = tk.BooleanVar(value=self.cfg.perception.show_detected_areas)
+        self.show_areas_cb = tb.Checkbutton(tools, text="Show detected areas", variable=self.show_areas_var, bootstyle="round-toggle",
+                                            command=self._draw_preview)
+        self.show_areas_cb.pack(side="left")
+        self.redetect_btn = tb.Button(tools, text="Re-detect layout", command=self.redetect_layout, bootstyle="info-outline",
+                                      image=ico("arrow-repeat"), compound="left")
+        self.redetect_btn.pack(side="left", padx=8)
+        self.advanced_btn = tb.Button(tools, text="Advanced: override automatic detection", command=self.toggle_advanced,
+                                      bootstyle="secondary-link")
+        self.advanced_btn.pack(side="right")
         self.canvas = tk.Canvas(right, bg=self.style.colors.inputbg, highlightthickness=0, cursor="crosshair", height=330)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<ButtonPress-1>", self._drag_begin)
         self.canvas.bind("<B1-Motion>", self._drag_move)
         self.canvas.bind("<ButtonRelease-1>", self._drag_end)
-        rrow = tb.Frame(right)
+        self.advanced = tb.Labelframe(right, text="  Manual regions (override automatic detection)", padding=6)
+        # packed only when the operator opens it; existing manual regions keep working either way
+        rrow = tb.Frame(self.advanced)
         rrow.pack(fill="x", pady=(8, 4))
         self.region_kind = tk.StringVar(value="detect")
         tb.Label(rrow, text="Draw:", font=self.fonts["strong"]).pack(side="left")
@@ -575,10 +595,10 @@ class App:
         self.region_remove_btn = tb.Button(rrow, text="Remove selected", command=self.remove_region,
                                            bootstyle="secondary-outline", image=ico("eraser"), compound="left")
         self.region_remove_btn.pack(side="right", padx=4)
-        self.region_list = tk.Listbox(right, height=3, font=self.fonts["mono"], bg=self.style.colors.inputbg,
+        self.region_list = tk.Listbox(self.advanced, height=3, font=self.fonts["mono"], bg=self.style.colors.inputbg,
                                       fg=self.style.colors.inputfg, highlightthickness=0, relief="flat")
         self.region_list.pack(fill="x")
-        tb.Label(right, font=self.fonts["caption"], bootstyle="secondary", wraplength=720, justify="left",
+        tb.Label(self.advanced, font=self.fonts["caption"], bootstyle="secondary", wraplength=720, justify="left",
                  text="Drag on the preview to add a region. No detection regions = scan the whole window; no live-status "
                       "regions = classify from the whole window (less reliable). Draw a small 'Profile control' box around "
                       "Studio’s top-right avatar to calibrate account detection. 'Presenter' = camera preview area for face/"
@@ -822,6 +842,32 @@ class App:
                 ("smtp_to", "To addresses (comma separated)", "str", lambda: ", ".join(c.smtp.to_addrs),
                  lambda v: setattr(c.smtp, "to_addrs", [a.strip() for a in v.split(",") if a.strip()]), ""),
                 ("smtp_tls", "Use STARTTLS", "bool", lambda: c.smtp.starttls, lambda v: setattr(c.smtp, "starttls", v), "Off = implicit TLS (SMTPS)."),
+            ]),
+            ("Automatic detection", [
+                ("perc_enabled", "Discover Studio's layout automatically", "bool", lambda: c.perception.enabled,
+                 lambda v: setattr(c.perception, "enabled", v), "Accessibility + OCR geometry + visual anchors. Manual regions (Advanced) always take precedence."),
+                ("perc_interval", "Re-discovery interval (s)", "float", lambda: c.perception.discovery_interval_seconds,
+                 lambda v: setattr(c.perception, "discovery_interval_seconds", max(15.0, v)), "Also re-runs on resize, panel/scene changes, restart and anchor loss."),
+                ("perc_profile", "Require a located profile control before the account lookup click", "bool", lambda: c.perception.require_located_profile,
+                 lambda v: setattr(c.perception, "require_located_profile", v), "Low-confidence localisation never clicks."),
+                ("perc_show", "Show detected areas on the preview", "bool", lambda: c.perception.show_detected_areas,
+                 lambda v: setattr(c.perception, "show_detected_areas", v), ""),
+                ("perc_chat", "Automatically mask the detected LIVE chat panel", "bool", lambda: c.perception.auto_mask_chat,
+                 lambda v: setattr(c.perception, "auto_mask_chat", v), "Viewer names are personal data. Manual masks are never removed."),
+                ("omni_enabled", "Use the optional external screen parser (OmniParser)", "bool", lambda: c.perception.omniparser_enabled,
+                 lambda v: setattr(c.perception, "omniparser_enabled", v), "Runs in a separate process from your own Python environment; see docs/perception."),
+                ("omni_python", "Parser Python executable", "str", lambda: c.perception.omniparser_python, lambda v: setattr(c.perception, "omniparser_python", v.strip()), ""),
+                ("omni_model", "Parser model path (.pt)", "str", lambda: c.perception.omniparser_model, lambda v: setattr(c.perception, "omniparser_model", v.strip()), ""),
+            ]),
+            ("Audio listening", [
+                ("al_enabled", "Listen to Studio's audio", "bool", lambda: c.listening.enabled, lambda v: setattr(c.listening, "enabled", v),
+                 "Process loopback of Studio's rendered audio when available; never changes routing or captures other apps."),
+                ("al_pref", "Source", ("choice", ["auto", "studio_loopback", "studio_session", "visual", "off"]), lambda: c.listening.preference if not c.listening.preference.startswith("input:") else "auto",
+                 lambda v: setattr(c.listening, "preference", v), "Choose an input device via the CLI (`audio status` lists them) when the association is ambiguous."),
+                ("al_silence", "Silence alert after (s)", "float", lambda: c.listening.silence_seconds, lambda v: setattr(c.listening, "silence_seconds", max(5.0, v)), "Music without speech is not silence."),
+                ("al_vad", "Speech detector", ("choice", ["auto", "webrtcvad", "energy"]), lambda: c.listening.vad, lambda v: setattr(c.listening, "vad", v), ""),
+                ("al_tx", "Optional local transcription (faster-whisper, if installed)", "bool", lambda: c.listening.transcription_enabled,
+                 lambda v: setattr(c.listening, "transcription_enabled", v), "VAD-gated, chunked; shown locally only, never uploaded or executed."),
             ]),
             ("PC health & clips", [
                 ("pch_enabled", "PC health monitoring (CPU, memory, disk, battery, upload)", "bool", lambda: c.pc_health.enabled,
@@ -1073,6 +1119,7 @@ class App:
                            (s.last_transition or s.live_evidence or s.last_observation or "")[:120], LIVE_STYLE.get(s.live_state, "secondary"))
         self.pill_live.set(f"Broadcast: {s.live_state.replace('_', ' ').lower()}", LIVE_STYLE.get(s.live_state, "secondary"))
         self._show_stream(s.stream)
+        self._show_auto(s)
         if s.episode_id:
             off = format_duration(s.offline_seconds) + ("  (counting)" if s.accumulating else "  (paused)")
             if s.remaining_seconds is None:
@@ -1392,6 +1439,18 @@ class App:
             lines += ["", "[pc health]", f"cpu={sm.cpu_percent:.0f}% memory={sm.memory_percent:.0f}% disk_free={sm.disk_free_percent:.0f}% "
                       f"battery={sm.battery_percent} on_battery={sm.on_battery} studio_cpu={sm.studio_cpu_percent} "
                       f"upload_kbps={sm.upload_kbps} problems={self.monitor.pc_health.snapshot()['problems']}"]
+        if a is not None and a.perception:
+            p = a.perception
+            lines += ["", "[perception]", f"state={p.get('state')} reason={p.get('reason')} discoveries={p.get('discoveries')} "
+                      f"last_ms={p.get('last_ms')} avg_ms={p.get('avg_ms')} ocr_geometry={p.get('ocr_geometry')} uia={p.get('uia')} "
+                      f"cache={p.get('from_cache')} notes={p.get('notes')}"]
+            for k, el in (p.get("elements") or {}).items():
+                lines.append(f"  {k}: box={el['box']} conf={el['confidence']} src={el['source']} {el.get('detail', '')}")
+        if a is not None and a.audio:
+            au = a.audio; b = au.get("binding") or {}
+            lines += ["", "[audio]", f"source={b.get('kind')} label={b.get('label')} detail={b.get('detail')} confidence={b.get('confidence')} "
+                      f"available={au.get('available')} rms={au.get('rms_dbfs')} peak={au.get('peak')} speech={au.get('speech')} "
+                      f"silent_s={au.get('silent_seconds')} problems={au.get('problems')} note={au.get('note')}"]
         if a is not None and a.end_request:
             er = a.end_request
             lines += ["", "[end dialog]", f"episode={er.get('episode_id')} visible={er.get('dialog_visible')} open={er.get('open')} "
@@ -1522,6 +1581,69 @@ class App:
         else:
             self.pill_stream.set("Stream: unknown (no fresh frame)", "secondary")
 
+    def _draw_layout_overlay(self, dw: int, dh: int) -> None:
+        a = self._last_activity
+        if a is None or not a.perception:
+            return
+        els = a.perception.get("elements") or {}
+        src = self.preview_image.size if self.preview_image is not None else None
+        if not src:
+            return
+        sx, sy = dw / src[0], dh / src[1]
+        colors = {"program_preview": "#20c997", "presenter_search": "#20c997", "live_control": "#e35d6a", "live_status": "#ffcd39",
+                  "profile_control": "#3dd5f3", "audio_meter": "#6f42c1", "mixer": "#6f42c1", "chat_panel": "#fd7e14"}
+        for name, el in els.items():
+            if name not in colors:
+                continue
+            x, y, x2, y2 = el["box"]
+            self.canvas.create_rectangle(x * sx, y * sy, x2 * sx, y2 * sy, outline=colors[name], width=1, dash=(3, 2))
+            self.canvas.create_text(x * sx + 3, y2 * sy - 12, anchor="nw", text=f"{name} {el['confidence']:.2f}", fill=colors[name],
+                                    font=self.fonts["caption"])
+        for t in a.perception.get("transient") or []:
+            x, y, x2, y2 = t["box"]
+            self.canvas.create_rectangle(x * sx, y * sy, x2 * sx, y2 * sy, outline="#ff00ff", width=1)
+
+    def redetect_layout(self) -> None:
+        if self.monitor is None:
+            self.log_line("start monitoring first; layout is discovered automatically after Start")
+            return
+        ok = self.monitor.redetect_layout()
+        self.log_line("layout re-detection requested" if ok else "no fresh frame to re-detect from")
+
+    def toggle_advanced(self) -> None:
+        if self.advanced.winfo_manager():
+            self.advanced.pack_forget()
+            self.advanced_btn.configure(text="Advanced: override automatic detection")
+        else:
+            self.advanced.pack(fill="x", pady=(6, 0))
+            self.advanced_btn.configure(text="Hide manual region tools")
+
+    def _show_auto(self, s: ActivitySnapshot) -> None:
+        if not hasattr(self, "auto_vars"):
+            return
+        p = s.perception or {}
+        state = s.layout_state or "off"
+        text = {"detected": "Studio layout: detected", "partly": "Studio layout: partly detected", "locating": "Studio layout: locating…",
+                "failed": "Studio layout: not detected", "off": "Studio layout: automatic detection off", "idle": "Studio layout: waiting for a frame"}.get(state, f"Studio layout: {state}")
+        if p.get("from_cache"):
+            text += " (cached profile, validated)"
+        if p.get("last_ms"):
+            text += f" · {p['last_ms']:.0f} ms"
+        self.auto_vars["layout"].set(text)
+        pres = s.presenter or "—"
+        self.auto_vars["presenter"].set("Presenter: " + {"detected": "detected", "absent": "absent", "unavailable": "region unavailable", "off": "off"}.get(pres, pres))
+        au = s.audio or {}
+        b = au.get("binding") or {}
+        if not au:
+            self.auto_vars["audio"].set("Audio: not listening")
+        else:
+            act = "speech" if au.get("speech") else ("sound" if au.get("rms_dbfs", -100) > -55 else "silent")
+            self.auto_vars["audio"].set(f"Audio: {b.get('kind', 'unavailable').replace('_', ' ')} · {act} ({au.get('rms_dbfs', -100):.0f} dBFS)"
+                                        + (f" · choose: {', '.join(b['choices'])}" if b.get("choices") else ""))
+        stream = s.stream or {}
+        avail = sum(1 for v in stream.values() if v.get("state") in ("OK", "PROBLEM"))
+        self.auto_vars["detectors"].set(f"Detectors: {avail} active of {len(stream)}" + (" · " + "; ".join(sorted({v.get('detail', '') for v in stream.values() if 'unavailable' in v.get('detail', '') or 'Locating' in v.get('detail', '')})) if stream else ""))
+
     def _draw_preview(self) -> None:
         img = self.preview_image
         if img is None:
@@ -1538,6 +1660,8 @@ class App:
             color = REGION_COLORS.get(r.kind, "#fff")
             self.canvas.create_rectangle(l, t, rt, b, outline=color, width=2)
             self.canvas.create_text(l + 4, t + 4, anchor="nw", text=r.name, fill=color, font=self.fonts["caption"])
+        if getattr(self, "show_areas_var", None) is not None and self.show_areas_var.get():
+            self._draw_layout_overlay(disp.width, disp.height)
 
     def _drag_begin(self, event) -> None:
         if self.preview_image is None:

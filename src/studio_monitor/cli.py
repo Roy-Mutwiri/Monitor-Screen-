@@ -469,6 +469,69 @@ def _utf8_console() -> None:
             pass
 
 
+def _perception(cfg: AppConfig, action: str, overlay: str) -> int:
+    from .app import make_layout_tracker
+    from .perception.layout import LayoutStore
+    store = LayoutStore(cfg.data_path / "layout_profiles.json")
+    if action == "clear-cache":
+        store.clear(); print("cached layout profiles removed"); return 0
+    print(f"automatic detection enabled={cfg.perception.enabled} cached profiles={store.count()} manual regions={len(cfg.regions)} "
+          f"require_located_profile={cfg.perception.require_located_profile} omniparser={cfg.perception.omniparser_enabled}")
+    if action == "status":
+        return 0
+    if not cfg.target.is_set or not cfg.target.hwnd:
+        print("select the Studio window first"); return 2
+    from .app import make_capture_service
+    import time
+    svc = make_capture_service(cfg)
+    svc.bind(cfg.target.hwnd)
+    cap = None; t0 = time.time()
+    while time.time() - t0 < 8 and cap is None:
+        cap = svc.frame(10); time.sleep(0.3)
+    svc.stop()
+    if cap is None:
+        print("no frame from the Studio window (minimized?)"); return 1
+    tracker = make_layout_tracker(cfg, on_event=print)
+    if tracker is None:
+        print("perception disabled or OCR unavailable"); return 1
+    from .privacy import redact
+    frame = redact(cap.image, cfg.regions)
+    tracker.request(frame, cap.captured_at, "cli"); tracker.run_pending()
+    st = tracker.status
+    print(f"state={st.state} ocr_geometry={st.ocr_geometry} uia={st.uia_note} {st.last_ms:.0f} ms notes={st.notes}")
+    for k, el in st.elements.items():
+        print(f"  {k:18s} box={el['box']} conf={el['confidence']} src={el['source']} {el.get('detail', '')}")
+    for t in st.transient:
+        print(f"  [{t['type']}] {t['box']} {t['detail'][:80]!r}")
+    if overlay:
+        from PIL import ImageDraw
+        img = frame.copy(); d = ImageDraw.Draw(img)
+        for k, el in st.elements.items():
+            d.rectangle(el["box"], outline=(0, 255, 0), width=2); d.text((el["box"][0] + 3, el["box"][1] + 3), k, fill=(0, 255, 0))
+        img.save(overlay); print(f"overlay written to {overlay} (redacted frame)")
+    return 0
+
+
+def _audio(cfg: AppConfig, action: str) -> int:
+    from .audio import process_loopback as pl
+    from .audio.resolver import AudioSourceResolver, pycaw_endpoints, pycaw_sessions, studio_process_tree
+    from .audio.levels import make_vad
+    print(f"listening enabled={cfg.listening.enabled} preference={cfg.listening.preference} process-loopback supported={pl.supported()} "
+          f"vad={make_vad(cfg.listening.vad).name}")
+    try:
+        eps = pycaw_endpoints(); sess = pycaw_sessions()
+    except Exception as exc:
+        print(f"audio enumeration failed: {exc}"); return 1
+    print("input endpoints: " + (", ".join(e.name for e in eps if e.is_input and e.active) or "none active"))
+    print("Studio audio sessions: " + (", ".join(f"{s.process_name}({s.pid}, {'active' if s.active else 'idle'})" for s in sess if 'tiktok' in s.process_name.lower() or 'mediasdk' in s.process_name.lower()) or "none"))
+    if action == "probe":
+        pids = studio_process_tree([cfg.target.pid]) if cfg.target.pid else []
+        r = AudioSourceResolver(sessions=pycaw_sessions, endpoints=pycaw_endpoints, loopback_probe=lambda p: pl.probe(p, 1.0)[0])
+        b = r.resolve(pids, [], cfg.listening.preference)
+        print(f"binding: {b.kind} — {b.label} ({b.detail}); confidence {b.confidence}; choices={b.choices}")
+    return 0
+
+
 def _memory(cfg: AppConfig, action: str, query: str) -> int:
     from .app import make_memory_provider
     from .credentials import default_store
@@ -656,6 +719,10 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("hub", help="fleet hub: enroll --url URL --code CODE [--mode managed|standalone] | status | unenroll | sync-once")
     p.add_argument("action", choices=["enroll", "status", "unenroll", "sync-once"])
     p.add_argument("--url", default=""); p.add_argument("--code", default=""); p.add_argument("--mode", default="")
+    p = sub.add_parser("perception", help="automatic layout discovery: status | discover [--overlay PATH] | clear-cache")
+    p.add_argument("action", choices=["status", "discover", "clear-cache"]); p.add_argument("--overlay", default="")
+    p = sub.add_parser("audio", help="audio source resolution: status | probe")
+    p.add_argument("action", choices=["status", "probe"])
     p = sub.add_parser("supervise", help="run the monitor under a restarting supervisor (watchdog): supervise [--gui]")
     p.add_argument("--gui", action="store_true", help="supervise the GUI with --autostart instead of the headless runner")
     sub.add_parser("doctor", help="environment checks (credential store, OCR, capture, model, disk, target, bots, hub)")
@@ -719,6 +786,10 @@ def main(argv: list[str] | None = None) -> int:
         return _smtp(cfg, args.action)
     if args.cmd == "memory":
         return _memory(cfg, args.action, args.query)
+    if args.cmd == "perception":
+        return _perception(cfg, args.action, args.overlay)
+    if args.cmd == "audio":
+        return _audio(cfg, args.action)
     if args.cmd == "doctor":
         from .app import doctor
         worst = 0

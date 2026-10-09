@@ -73,18 +73,25 @@ class MarkerFaceBackend:
     name = "marker"
 
     def detect(self, image: Image.Image) -> list[Face]:
-        small = image.convert("RGB").resize((image.width // 4, image.height // 4))
-        px = small.load()
-        xs, ys = [], []
-        for y in range(small.height):
-            for x in range(small.width):
-                r, g, b = px[x, y]
-                if r > 200 and b > 200 and g < 60:
-                    xs.append(x); ys.append(y)
-        if not xs:
+        import numpy as np
+        small = np.asarray(image.convert("RGB").resize((max(1, image.width // 4), max(1, image.height // 4))), dtype=np.int16)
+        mask = (small[..., 0] > 200) & (small[..., 2] > 200) & (small[..., 1] < 60)
+        if not mask.any():
             return []
-        x0, x1, y0, y1 = min(xs) * 4, (max(xs) + 1) * 4, min(ys) * 4, (max(ys) + 1) * 4
-        return [Face((x0, y0, x1 - x0, y1 - y0), [(0.0, 0.0)] * 5, 0.9)]
+        # one face per horizontally separated magenta blob (so several markers = several faces)
+        cols = np.nonzero(mask.any(axis=0))[0]
+        runs, start, prev = [], cols[0], cols[0]
+        for c in list(cols[1:]) + [None]:
+            if c is None or c - prev > 2:
+                runs.append((start, prev))
+                if c is not None:
+                    start = c
+            prev = c if c is not None else prev
+        faces = []
+        for s, e in runs:
+            rows = np.nonzero(mask[:, s:e + 1].any(axis=1))[0]
+            faces.append(Face((int(s) * 4, int(rows[0]) * 4, (int(e) - int(s) + 1) * 4, (int(rows[-1]) - int(rows[0]) + 1) * 4), [(0.0, 0.0)] * 5, 0.9))
+        return faces
 
 
 def suite(clock, **over) -> DetectorSuite:

@@ -31,4 +31,11 @@ class WindowsOcr:
             raise OcrError(f"Windows OCR failed: {exc}") from exc
         lines = [ln.get("text", "") for ln in data.get("lines", [])]
         text = data.get("text") or "\n".join(lines)
-        return OcrResult(text=text, lines=[ln for ln in lines if ln], backend=self.name)
+        from ..perception.ocr_boxes import boxes_from_winocr
+        scale = img.width / max(1, image.width)
+        boxes = boxes_from_winocr(data, scale)
+        return OcrResult(text=text, lines=[ln for ln in lines if ln], backend=self.name, boxes=boxes)
+
+    def recognize_boxes(self, image: Image.Image) -> OcrResult:
+        """Same as recognize(); Windows OCR always carries word geometry."""
+        return self.recognize(image)

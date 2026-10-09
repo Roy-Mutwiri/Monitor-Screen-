@@ -162,6 +162,68 @@ and a mode: `standalone` (local Telegram delivery) or `managed` (a hub owns deli
 recorded locally and delivered by the hub, so there are no duplicate notifications). Local bot
 settings are kept in both modes.
 
+## Automatic perception (no regions to draw)
+
+Select the Studio window, press **Start**, and the monitor discovers the layout itself (`perception/`):
+
+1. **Accessibility first**: the window's UI Automation tree is probed (bounded). The Studio build on the development PC
+   exposes *no* accessible children (verified: 0 descendants), so this path is empty there; a build that enables
+   accessibility is used automatically and takes precedence (named Go LIVE / chat / profile controls).
+2. **OCR with geometry**: Windows OCR returns word boxes; anchor words (Studio view, Add source, Tools, LIVE chat,
+   LIVE performance, Go LIVE / End LIVE, CPU/Memory/Upload/FPS, LIVE Center) establish the top bar, the side panels
+   (also when rearranged or closed), the control bar and the status row.
+3. **Visual anchors** inside those bands: the red Go/End LIVE button blob, the program preview as the largest
+   non-canvas rectangle between the panels (the portrait video column on the real frame, not thumbnails, not chat
+   avatars), slider tracks and the green level segment in the control row (mixer / audio meter), a circular control
+   right of "LIVE Center" in the top bar (profile), the LIVE badge/timer text, and spatially grouped text blocks with
+   button words floating over the preview band (dialogs and banners).
+
+Every element is a structured observation: type, bounding box, confidence, evidence source (`uia`, `ocr`, `visual`,
+`ocr+visual`, `cache`, `omniparser`), frame timestamp, layout version and validity. Nothing is a hard-coded
+percentage: cached relative coordinates (`layout_profiles.json`, scoped by Studio version, language, window-size
+bucket, DPI and the panel column split) are written only after an evidence-based discovery and are revalidated
+against the current frame before use; a cached profile contradicted by fresh evidence is ignored.
+
+**Relocalization**: a cheap validation runs every 5 s (red button still at its box, preview still non-uniform, left
+anchors still on the left) and discovery re-runs on window resize, Studio restart, wholesale frame change (scene or
+panel change), anchor contradiction, the 60 s periodic refresh, or *Re-detect layout*. Discovery runs on its own
+worker thread with a latest-frame slot (no backlog); measured on the real frame: OCR 67 ms + discovery ~55 ms (CPU).
+Stale elements are invalidated; while nothing is located the UI says *Studio layout: locating…*, *Presenter region
+unavailable* or *Locating audio meter* instead of reporting an absent face or silence.
+
+**Presenter**: faces are searched only inside the verified program preview; several comparable faces or a tiny face
+are reported as *unclear* (no silent choice); FACE_ABSENT, FACE_MOTION_LOW, PREVIEW_FROZEN and UNKNOWN stay separate
+with the existing thresholds and hysteresis. Movement is never taken as proof of a real human.
+
+**Audio** (`audio/`): `AudioSourceResolver` enumerates Studio's process tree, its Windows audio sessions and the
+endpoints, reads device names from Studio's own UI text, checks OS support, and binds — in order — Windows **process
+loopback** of Studio's rendered audio (verified on this PC: activation succeeds and frames flow from Studio's media
+process; what Studio plays locally, so microphone audio that Studio uploads but does not play may be missing — never
+described as complete broadcast audio), the Studio **session level meter** (level only), an **input device** named
+by Studio's UI when exactly one endpoint matches (otherwise one simple choice is offered), or the **visual meter**.
+Analysis runs in ≤3 s buffers that never touch disk: RMS/peak, sustained silence (music without speech is not
+silence; "no speech" never raises an alert), clipping, speech activity (webrtcvad, energy fallback), recovery.
+Optional local transcription (faster-whisper, operator-installed) is VAD-gated, chunked with overlap de-duplication
+and hallucination suppression, and never delays audio-health alerts. Routing, monitoring and mute states are never
+changed.
+
+**Dialogs**: the end-stream confirmation and other modals are now found by spatial grouping of OCR boxes (heading,
+body and button row as one block floating over the preview) in addition to the line-adjacency rule. No discovered
+control is ever clicked; the profile-menu lookup remains the only automatic interaction and is refused when the
+profile control is not located with enough confidence.
+
+**Privacy**: manual masks are kept and always applied first; the detected LIVE chat panel is masked automatically
+(viewer names) unless disabled; automatic discovery never removes a mask; overlays and CLI dumps use redacted frames;
+no screen or audio content is sent to any cloud perception service (the optional OmniParser runs locally).
+
+**UI**: Monitor page shows *Studio layout / Presenter / Audio / Detectors* status, a *Show detected areas* overlay
+and *Re-detect layout*; manual region tools live under *Advanced: override automatic detection* and existing manual
+regions keep precedence until cleared. CLI: `perception status|discover [--overlay PATH]|clear-cache`,
+`audio status|probe`.
+
+**Evaluation**: see `docs/perception/SOURCE_MANIFEST.md` (references, licences, tested combinations) and
+`docs/perception/OMNIPARSER_EVALUATION.md` (licence review and the GPU/CPU benchmark on this PC). No model was trained.
+
 ## End-LIVE confirmation alert ("End streaming?")
 
 When the operator clicks *End LIVE*, Studio shows a confirmation dialog (heading **End streaming?**, body
@@ -628,6 +690,8 @@ src/studio_monitor/
   memory.py / session_report.py  Supermemory provider (scoped, key-hygienic) and broadcast/session reports
   pc_health.py / watchdog.py / clips.py / engagement.py  PC health sampling, stall detector + supervisor, GIF clips, viewer counts
   end_request.py  End streaming? dialog detection (rules/end_dialog_rules.json) and persisted end-request episodes
+  perception/     automatic layout discovery (ocr_boxes, clusters, anchors, uia, layout, tracker, optional omniparser)
+  audio/          AudioSourceResolver, process loopback, levels/VAD, optional transcription, AudioWorker
 src/hub/        the central hub: FastAPI app, SQLAlchemy models, services, Telegram routing, dashboard templates
 deploy/         Dockerfile, docker-compose.yml (PostgreSQL + hub), .env.example, deployment README
   reminders.py  offline episodes + not-live reminders

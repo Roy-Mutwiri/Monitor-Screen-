@@ -219,6 +219,37 @@ class SmtpConfig:
 
 
 @dataclass
+class PerceptionSettings:
+    """Automatic layout discovery (accessibility + OCR geometry + visual anchors). Manual regions always win."""
+    enabled: bool = True
+    discovery_interval_seconds: float = 60.0
+    validate_interval_seconds: float = 5.0
+    require_located_profile: bool = True      # no profile-menu click unless the control is located with confidence
+    profile_min_confidence: float = 0.7
+    presenter_min_confidence: float = 0.5
+    show_detected_areas: bool = True
+    auto_mask_chat: bool = True               # automatic privacy mask over the detected LIVE chat panel
+    omniparser_enabled: bool = False
+    omniparser_python: str = ""
+    omniparser_model: str = ""
+    omniparser_timeout_seconds: float = 20.0
+
+
+@dataclass
+class AudioListenSettings:
+    """Real-time listening on the automatically resolved Studio audio source. Never changes routing."""
+    enabled: bool = True
+    preference: str = "auto"                  # auto | studio_loopback | studio_session | input:<endpoint> | visual | off
+    silence_seconds: float = 30.0
+    silence_dbfs: float = -55.0
+    clipping_seconds: float = 5.0
+    vad: str = "auto"                         # auto | webrtcvad | energy
+    transcription_enabled: bool = False
+    transcription_model: str = "tiny"
+    transcription_log: bool = False           # keep a local transcript log (off: transcripts stay in memory only)
+
+
+@dataclass
 class PcHealthSettings:
     """PC health sampling (psutil): sustained thresholds become PC_HEALTH incidents."""
     enabled: bool = True
@@ -311,6 +342,8 @@ class AppConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     pc_health: PcHealthSettings = field(default_factory=PcHealthSettings)
     clips: ClipsSettings = field(default_factory=ClipsSettings)
+    perception: PerceptionSettings = field(default_factory=PerceptionSettings)
+    listening: AudioListenSettings = field(default_factory=AudioListenSettings)
     config_version: int = CONFIG_VERSION
 
     # -- serialisation ----------------------------------------------------
@@ -349,6 +382,8 @@ class AppConfig:
         cfg.memory = MemoryConfig(**_known(MemoryConfig, data.get("memory", {})))
         cfg.pc_health = PcHealthSettings(**_known(PcHealthSettings, data.get("pc_health", {})))
         cfg.clips = ClipsSettings(**_known(ClipsSettings, data.get("clips", {})))
+        cfg.perception = PerceptionSettings(**_known(PerceptionSettings, data.get("perception", {})))
+        cfg.listening = AudioListenSettings(**_known(AudioListenSettings, data.get("listening", {})))
         if cfg.device.mode not in ("standalone", "managed"):
             cfg.device.mode = "standalone"
         cfg.device = DeviceConfig(**_known(DeviceConfig, data.get("device", {})))

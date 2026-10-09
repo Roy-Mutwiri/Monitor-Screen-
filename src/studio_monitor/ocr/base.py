@@ -15,6 +15,7 @@ class OcrResult:
     text: str
     lines: list[str] = field(default_factory=list)
     backend: str = ""
+    boxes: list = field(default_factory=list)   # perception.ocr_boxes.OcrBox per line (backends with geometry only)
 
 
 class OcrBackend(Protocol):

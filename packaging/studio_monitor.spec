@@ -16,13 +16,26 @@ hidden = ["studio_monitor.gui.app", "PIL.ImageTk"]
 datas = [(os.path.join(ROOT, "rules", name), "rules") for name in ("studio_rules.json", "live_state_rules.json", "connection_rules.json", "end_dialog_rules.json")]
 datas += [(os.path.join(ROOT, "models", "face_detection_yunet_2023mar.onnx"), "models")]
 binaries = []
-for pkg in ("winrt", "winocr", "windows_capture", "numpy", "ttkbootstrap", "uiautomation", "comtypes", "tzdata", "cv2", "psutil", "httpx", "httpcore", "h11", "anyio", "sniffio", "certifi", "idna"):
+for pkg in ("winrt", "winocr", "windows_capture", "numpy", "ttkbootstrap", "uiautomation", "comtypes", "tzdata", "cv2", "psutil", "httpx", "httpcore", "h11", "anyio", "sniffio", "certifi", "idna", "pycaw"):
     try:
         hidden += collect_submodules(pkg)
         datas += collect_data_files(pkg)
         binaries += collect_dynamic_libs(pkg)
     except Exception:
         pass
+
+# webrtcvad-wheels: ship the wrapper module and its extension explicitly (its contrib hook expects the 'webrtcvad' dist name)
+try:
+    import importlib.util as _ilu
+    _spec = _ilu.find_spec("webrtcvad")
+    if _spec and _spec.origin:
+        _site = os.path.dirname(_spec.origin)
+        datas.append((_spec.origin, "."))
+        for _f in os.listdir(_site):
+            if _f.startswith("_webrtcvad") and _f.endswith(".pyd"):
+                binaries.append((os.path.join(_site, _f), "."))
+except Exception:
+    pass
 
 a = Analysis(
     [os.path.join(ROOT, "packaging", "entry_gui.py")],

@@ -318,6 +318,70 @@ def doctor(cfg: AppConfig, cfg_path: Path) -> list[tuple[str, str, str]]:
     return out
 
 
+def make_layout_tracker(cfg: AppConfig, on_event=None, hwnd_provider=None):
+    """LayoutTracker with its own OCR instance (word boxes), the UIA probe and optional external parser."""
+    import time
+    from .perception.layout import LayoutStore
+    from .perception.tracker import LayoutTracker
+    from .perception.uia import uia_elements
+    if not cfg.perception.enabled:
+        return None
+    try:
+        from .ocr import create_backend
+        ocr = create_backend(cfg.detection.ocr_backend, cfg.detection.ocr_language, cfg.detection.ocr_upscale)
+    except Exception as exc:
+        log.warning("perception OCR unavailable: %s", exc)
+        return None
+
+    def probe():
+        hwnd, origin = (hwnd_provider() if hwnd_provider else (cfg.target.hwnd, (0, 0)))
+        return uia_elements(hwnd, origin) if hwnd else ([], "no window")
+
+    extra = None
+    p = cfg.perception
+    if p.omniparser_enabled:
+        from .perception.omniparser import OmniParserBackend
+        if OmniParserBackend.available(p.omniparser_python, p.omniparser_model):
+            extra = OmniParserBackend(p.omniparser_python, p.omniparser_model, p.omniparser_timeout_seconds)
+        else:
+            log.warning("OmniParser enabled but its environment/model path is not valid; ignored")
+    ensure_dirs(cfg)
+    return LayoutTracker(ocr, LayoutStore(cfg.data_path / "layout_profiles.json"), uia_probe=probe,
+                         discovery_interval=p.discovery_interval_seconds, validate_interval=p.validate_interval_seconds,
+                         on_event=on_event, extra_parser=extra)
+
+
+def make_audio_worker(cfg: AppConfig, on_event=None):
+    from .audio.levels import AudioAnalyzer, AudioConfig
+    from .audio.resolver import AudioSourceResolver, pycaw_endpoints, pycaw_sessions
+    from .audio.worker import AudioWorker, session_peak_reader
+    from .audio import process_loopback as pl
+    a = cfg.listening
+    if not a.enabled or a.preference == "off":
+        return None
+    resolver = AudioSourceResolver(sessions=pycaw_sessions, endpoints=pycaw_endpoints, loopback_probe=lambda pid: pl.probe(pid, 1.0)[0])
+    analyzer = AudioAnalyzer(AudioConfig(a.silence_seconds, a.silence_dbfs, 0.985, a.clipping_seconds, 5.0, 3.0, a.vad))
+    transcriber = None
+    if a.transcription_enabled:
+        try:
+            from .audio.transcribe import ChunkedTranscriber, FasterWhisperTranscriber
+            transcriber = ChunkedTranscriber(FasterWhisperTranscriber(a.transcription_model))
+        except Exception as exc:
+            log.warning("transcription unavailable: %s", exc)
+    return AudioWorker(resolver, analyzer, preference=a.preference,
+                       loopback_factory=lambda pid, cb: pl.ProcessLoopbackCapture(pid, cb), meter_reader=session_peak_reader,
+                       transcriber=transcriber, on_event=on_event)
+
+
+def _window_origin(cfg: AppConfig) -> tuple[int, int]:
+    try:
+        from .win32.windows import Win32WindowSystem
+        w = Win32WindowSystem().get_window(cfg.target.hwnd)
+        return (w.rect.left, w.rect.top) if w else (0, 0)
+    except Exception:
+        return (0, 0)
+
+
 def make_capture_service(cfg: AppConfig, system=None):
     from .win32.capture import CaptureService
     from .win32.windows import Win32WindowSystem
@@ -354,6 +418,11 @@ def build_monitor(cfg: AppConfig, cfg_path: Path, registry: Optional[BotRegistry
     callbacks.setdefault("memory", make_memory_provider(cfg))
     callbacks.setdefault("pc_health", make_pc_health(cfg))
     callbacks.setdefault("clips", make_clips(cfg))
+    if "layout_tracker" not in callbacks:
+        callbacks["layout_tracker"] = make_layout_tracker(cfg, callbacks.get("on_event"),
+                                                          hwnd_provider=lambda: (cfg.target.hwnd, _window_origin(cfg)))
+    if "audio_worker" not in callbacks:
+        callbacks["audio_worker"] = make_audio_worker(cfg, callbacks.get("on_event"))
     monitor = Monitor(cfg, system, capturer, ocr, rules, queue, registry, factory,
                       live_rules=load_live_rules(cfg), **callbacks)
     if monitor.command_poller is None:

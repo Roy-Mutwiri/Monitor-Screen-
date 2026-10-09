@@ -48,6 +48,8 @@ from .engagement import EngagementStats, parse_engagement
 from .watchdog import StallDetector
 from .alerts import format_pc_health_alert, format_end_requested, format_end_outcome
 from .end_request import EndDialogRules, EndRequestEvent, EndRequestTracker
+from .perception.tracker import LayoutTracker
+from .audio.worker import AudioWorker
 from .session_report import build_report
 from .ocr.base import OcrBackend, OcrError
 from .privacy import purge_old_screenshots, redact
@@ -103,6 +105,10 @@ class ActivitySnapshot:
     stream_end_hint: str = ""
     hub: dict = field(default_factory=dict)         # HubStatus.to_dict() when a hub is configured
     end_request: dict = field(default_factory=dict) # end-LIVE confirmation dialog episode
+    perception: dict = field(default_factory=dict)  # LayoutTracker status
+    audio: dict = field(default_factory=dict)       # AudioWorker status
+    presenter: str = ""                             # detected | absent | unclear: ... | unavailable
+    layout_state: str = ""                          # detected | partly | locating | failed | off
 
 
 def _event_id(prefix: str, ts: float) -> str:
@@ -145,7 +151,9 @@ class Monitor:
                  memory: Optional[MemoryProvider] = None,
                  pc_health: Optional[PcHealthSampler] = None,
                  clips: Optional[ClipBuffer] = None,
-                 end_rules: Optional[EndDialogRules] = None) -> None:
+                 end_rules: Optional[EndDialogRules] = None,
+                 layout_tracker: Optional[LayoutTracker] = None,
+                 audio_worker: Optional[AudioWorker] = None) -> None:
         self.cfg = cfg
         self.system = system
         self.capturer = capturer                 # dialogs only (PrintWindow, no desktop fallback)
@@ -244,6 +252,12 @@ class Monitor:
         self.end_rules = end_rules
         self.end_requests = EndRequestTracker(end_rules, queue.get_state, queue.set_state, clock)
         self._ocr_views: list = []
+        # automatic perception (layout) + real-time audio listening; both optional, both bounded workers
+        self.perception: Optional[LayoutTracker] = layout_tracker
+        self.audio_worker: Optional[AudioWorker] = audio_worker
+        self._derived_masks: list = []
+        self._audio_incidents: dict[str, dict] = {}
+        self.perception_notes: dict[str, str] = {}
         self._stalled = False
         self._watchdog_thread: Optional[threading.Thread] = None
         self._stream_episode_counts: dict[str, int] = {}
@@ -433,7 +447,7 @@ class Monitor:
                     if c is main_cap and not fresh_frame:
                         continue
                     # Redaction happens before OCR so redacted areas are never read, stored or sent.
-                    c.image = redact(c.image, self.cfg.regions)
+                    c.image = redact(c.image, self.cfg.regions + (self._derived_masks if not c.is_dialog else []))
                     regions = [] if c.is_dialog else [r for r in self.cfg.regions if r.kind == "detect"]
                     try:
                         det = self.detector.detect(c, regions)
@@ -455,7 +469,10 @@ class Monitor:
                     if det is not None:
                         detections.append(det)
             elif main_cap is not None:
-                main_cap.image = redact(main_cap.image, self.cfg.regions)
+                main_cap.image = redact(main_cap.image, self.cfg.regions + self._derived_masks)
+            if main_cap is not None and self.perception is not None:
+                self.perception.observe(main_cap.image, main_cap.captured_at, fresh_frame, self.tracker.identity.pid)
+                self._refresh_derived_masks()
 
             for det in detections:
                 decision = self.incidents.observe(
@@ -502,6 +519,7 @@ class Monitor:
         self._check_email_backup()
         self._observe_engagement(fresh_frame and screenshot_ok)
         self._run_pc_health()
+        self._run_audio()
         self.stall.beat()
         self._maybe_purge()
         return detections
@@ -535,7 +553,10 @@ class Monitor:
             suite.suspend(max(2.0, self.cfg.detectors.scene_change_grace_seconds))
         suppressed = self.incident_engine.is_suppressed(self.device_id, CAT_STREAM) or self._blocking_detection
         frame = main_cap.image if (main_cap is not None and fresh) else None
-        out = suite.evaluate(frame, fresh and frame is not None, True, text or "", self.cfg.regions, suppressed=suppressed)
+        regions = self.effective_regions()
+        if self.audio_worker is not None and self.audio_worker.binding.kind in ("studio_loopback", "studio_session", "input_device"):
+            suite.cfg.audio_enabled = False                      # a measured source replaces the visual meter
+        out = suite.evaluate(frame, fresh and frame is not None, True, text or "", regions, suppressed=suppressed)
         if fresh and text:
             ended = suite.classify_text(text).get("ended")
             if ended and not self._stream_end_hint:
@@ -547,6 +568,7 @@ class Monitor:
         for name, detail in out.recovered:
             self._resolve_stream_incident(name, detail)
         self.activity.stream = {k: {"state": c.state, "detail": c.detail, "since": c.since} for k, c in out.conditions.items()}
+        self._annotate_perception_gaps(regions)
 
     def _open_stream_incident(self, name: str, detail: str, main_cap: Optional[Capture]) -> None:
         now = self.clock()
@@ -780,10 +802,167 @@ class Monitor:
         hits = self.memory.search(query, {"device_id": self.device_id}, self.cfg.memory.retrieval_limit)
         return format_hits(hits, "Similar past incidents / sessions")
 
+    # ---- automatic perception -----------------------------------------------
+    def _layout_region(self, element: str, kind: str, name: str, min_conf: float = 0.0):
+        """A Region derived from the current layout element (frame-relative), or None."""
+        if self.perception is None or self.perception.layout is None:
+            return None
+        el = self.perception.layout.get(element)
+        if el is None or el.confidence < min_conf:
+            return None
+        from .regions import Region
+        x, y, w, h = el.rel(self.perception.layout.size)
+        try:
+            return Region(name, x, y, w, h, kind)
+        except ValueError:
+            return None
+
+    def effective_regions(self) -> list:
+        """Manual regions first; automatically discovered ones fill only the kinds the operator did not draw."""
+        regions = list(self.cfg.regions) + list(self._derived_masks)
+        kinds = {r.kind for r in self.cfg.regions}
+        if self.perception is not None and self.cfg.perception.enabled:
+            if "face" not in kinds:
+                r = self._layout_region("presenter_search", "face", "auto presenter", self.cfg.perception.presenter_min_confidence)
+                if r is not None:
+                    regions.append(r)
+            if "audio" not in kinds:
+                r = self._layout_region("audio_meter", "audio", "auto audio meter")
+                if r is not None:
+                    regions.append(r)
+            if "profile" not in kinds:
+                r = self._layout_region("profile_control", "profile", "auto profile", self.cfg.perception.profile_min_confidence)
+                if r is not None:
+                    regions.append(r)
+        return regions
+
+    def _refresh_derived_masks(self) -> None:
+        self._derived_masks = []
+        if not self.cfg.perception.auto_mask_chat:
+            return
+        r = self._layout_region("chat_panel", "redact", "auto chat mask")
+        if r is not None:
+            self._derived_masks = [r]
+
+    def _profile_target(self):
+        """(region, allowed, why): manual region always allowed; otherwise the located profile control with enough
+        confidence; otherwise no click at all when perception requires a located control."""
+        manual = self.cfg.profile_region
+        if manual is not None:
+            return manual, True, "manual profile region"
+        if self.perception is None or not self.cfg.perception.enabled:
+            return None, True, "legacy offset (perception off)"
+        r = self._layout_region("profile_control", "profile", "auto profile", self.cfg.perception.profile_min_confidence)
+        if r is not None:
+            return r, True, "profile control located automatically"
+        if self.cfg.perception.require_located_profile:
+            return None, False, "profile control not located with enough confidence; no click performed"
+        return None, True, "legacy offset (located profile not required)"
+
+    def _annotate_perception_gaps(self, regions: list) -> None:
+        kinds = {r.kind for r in regions}
+        notes = {}
+        if "face" not in kinds:
+            notes["presenter"] = "Presenter region unavailable" + (" (locating layout)" if self.layout_state() in ("locating", "partly") else "")
+            for k in ("FACE_ABSENT", "FACE_MOTION_LOW", "PREVIEW_FROZEN"):
+                if k in self.activity.stream:
+                    self.activity.stream[k]["detail"] = notes["presenter"]
+        if "audio" not in kinds and (self.audio_worker is None or not self.audio_worker.status().get("available")):
+            notes["audio"] = "Locating audio meter"
+            if "AUDIO_SILENCE" in self.activity.stream:
+                self.activity.stream["AUDIO_SILENCE"]["detail"] = notes["audio"]
+        self.perception_notes = notes
+
+    def presenter_state(self) -> str:
+        if self.detectors is None:
+            return "off"
+        st = getattr(self.detectors, "presenter_state", "unavailable")
+        if st == "unavailable" and "face" not in {r.kind for r in self.effective_regions()}:
+            return "unavailable"
+        return st
+
+    def layout_state(self) -> str:
+        if self.perception is None or not self.cfg.perception.enabled:
+            return "off"
+        return self.perception.status.state or "locating"
+
+    def redetect_layout(self, reason: str = "operator request") -> bool:
+        f = self.frames.frame()
+        if self.perception is None or f is None:
+            return False
+        self.perception.request(redact(f.image.copy(), self.cfg.regions + self._derived_masks), f.captured_at, reason)
+        if self.perception._thread is None:
+            self.perception.run_pending()
+        return True
+
+    # ---- real-time audio listening ------------------------------------------
+    def _run_audio(self) -> None:
+        w = self.audio_worker
+        if w is None:
+            return
+        pids = []
+        if self.sessions.running and self.tracker.identity.pid:
+            try:
+                from .audio.resolver import studio_process_tree
+                pids = studio_process_tree([self.tracker.identity.pid])
+            except Exception:
+                pids = [self.tracker.identity.pid]
+        labels = []
+        if self.perception is not None and self.perception.last_text:
+            labels = [ln for ln in self.perception.last_text.splitlines() if "audio" in ln.lower() or "mic" in ln.lower()][:6]
+        w.set_context(pids, labels)
+        if w._thread is None:                                    # inline mode (tests / --once); production runs a thread
+            w.rebind()
+            w.tick()
+        confirmed, recovered = w.drain()
+        live = self.broadcast.state.state == LiveState.LIVE and self.sessions.running
+        # a problem that was already confirmed before the broadcast started is raised once we are LIVE
+        if live and w.analyzer.silence.confirmed and "AUDIO_SILENCE" not in self._audio_incidents and not any(n == "AUDIO_SILENCE" for n, _ in confirmed):
+            confirmed.append(("AUDIO_SILENCE", f"No audio from {w.binding.label} since before the broadcast started "
+                                               f"({w.analyzer.state.silent_seconds:.0f} s silent)."))
+        for name, text in confirmed:
+            if not live:
+                continue                                        # audio problems matter while broadcasting
+            cond = "AUDIO_SILENCE" if name == "AUDIO_SILENCE" else "AUDIO_CLIPPING"
+            if cond in self._audio_incidents:
+                continue
+            now = self.clock()
+            eid = _event_id("STRAUD", now)
+            src = w.binding.label
+            payload = format_stream_alert(cond if cond in STREAM_CATEGORY_OF else "AUDIO_SILENCE", f"{text} Source: {src}.",
+                                          self.cfg.machine_label, now, now, label=self.cfg.notification_label,
+                                          account=self.current_account_handle(), screenshot_attached=False)
+            change = self.incident_engine.open_or_update(self.device_id, CAT_STREAM, cond, Severity.WARNING, text,
+                                                         session_id=self.sessions.session_id, owner_label=self.cfg.notification_label,
+                                                         incident_id=eid)
+            self._audio_incidents[cond] = {"incident_id": change.incident.incident_id, "event_id": eid, "since": now}
+            self.dispatch(eid, KIND_INCIDENT, CAT_STREAM, payload, "", label=f"Audio {cond}", incident_id=change.incident.incident_id,
+                          event_type="AUDIO_SILENCE", extra_detail={"source": w.binding.to_dict()})
+            self.on_event(f"audio: {cond} confirmed on {src} -> {eid}")
+        for name, text in recovered:
+            cond = "AUDIO_SILENCE" if name == "AUDIO_SILENCE" else "AUDIO_CLIPPING"
+            info = self._audio_incidents.pop(cond, None)
+            if info is None:
+                continue
+            now = self.clock()
+            self.incident_engine.resolve(info["incident_id"], text, observed_utc=_utc(now))
+            payload = format_stream_recovered("AUDIO_SILENCE", text, self.cfg.machine_label, now, now - info["since"], label=self.cfg.notification_label)
+            payload["thread_of"] = info["incident_id"]
+            self.dispatch(f"{info['event_id']}-RES", KIND_INCIDENT, CAT_STREAM, payload, "", label=f"Audio {cond} cleared",
+                          incident_id=info["incident_id"], event_type="INCIDENT_RESOLVED")
+            self.on_event(f"audio: {cond} cleared")
+        if not live and self._audio_incidents:
+            for cond, info in list(self._audio_incidents.items()):
+                self.incident_engine.resolve(info["incident_id"], "broadcast no longer LIVE", observed_utc=_utc(self.clock()))
+            self._audio_incidents.clear()
+
     # ---- end-LIVE confirmation dialog ---------------------------------------
     def _observe_end_dialog(self, ocr_views: list, fresh: bool) -> None:
         bs = self.broadcast.state
         views = [(text, lines) for _c, text, lines in ocr_views]
+        if self.perception is not None and self.perception.layout is not None and fresh:
+            for t in self.perception.layout.transient:      # spatially grouped dialog/banner blocks
+                views.append((t.detail, t.detail.splitlines()))
         events = self.end_requests.observe(views, fresh, bs.state.value, bool(bs.fresh), self.sessions.running,
                                            self.episodes.state.episode_id, self.sessions.session_id)
         for ev in events:
@@ -1226,13 +1405,20 @@ class Monitor:
             self.identity_store.save(a)
             self._dispatch_broadcast(pend)
             return
+        profile_region, allowed, why = self._profile_target()
+        if not allowed:
+            a.status, a.error = FAILED, why
+            self.identity_store.save(a)
+            self.on_event(f"account lookup skipped: {why}")
+            self._dispatch_broadcast(pend)
+            return
         a.status, a.attempts = IN_PROGRESS, a.attempts + 1
         self.identity_store.save(a)
         self._pending_broadcast = pend
         self.broadcast.paused = True
         ctx = LookupContext(
             system=self.system, interactor=self.interactor, identity=self.tracker.identity,
-            ocr=self.detector.ocr_text, fresh_frame=self._fresh_image, profile_region=self.cfg.profile_region,
+            ocr=self.detector.ocr_text, fresh_frame=self._fresh_image, profile_region=profile_region,
             offset_right=act.profile_offset_right, offset_top=act.profile_offset_top, idle_required=act.idle_seconds,
             timeout=act.timeout_seconds, blocked=lambda: self._blocking_detection, allow_physical=act.allow_physical_click,
             clock=self.clock, mono=self.mono, sleep=self._lookup_sleep, log=self.on_event,
@@ -1313,6 +1499,12 @@ class Monitor:
             return False
         act = self.cfg.account
         a = self.account
+        profile_region, allowed, why = self._profile_target()
+        if not allowed:
+            a.status, a.error = FAILED, why
+            self.identity_store.save(a)
+            self.on_event(f"manual account lookup refused: {why}")
+            return False
         a.status, a.attempts, a.error = IN_PROGRESS, a.attempts + 1, ""
         a.episode_id = self.episodes.state.episode_id or a.episode_id
         a.session_id = self.sessions.session_id
@@ -1320,7 +1512,7 @@ class Monitor:
         self.broadcast.paused = True
         ctx = LookupContext(
             system=self.system, interactor=self.interactor, identity=self.tracker.identity,
-            ocr=self.detector.ocr_text, fresh_frame=self._fresh_image, profile_region=self.cfg.profile_region,
+            ocr=self.detector.ocr_text, fresh_frame=self._fresh_image, profile_region=profile_region,
             offset_right=act.profile_offset_right, offset_top=act.profile_offset_top, idle_required=act.idle_seconds,
             timeout=act.timeout_seconds, blocked=lambda: self._blocking_detection, allow_physical=act.allow_physical_click,
             clock=self.clock, mono=self.mono, sleep=self._lookup_sleep, log=self.on_event,
@@ -1409,6 +1601,9 @@ class Monitor:
             stream=dict(self.activity.stream), stream_end_hint=self._stream_end_hint,
             hub=self.hub_sync.status.to_dict() if self.hub_sync is not None else {},
             end_request=self.end_request_snapshot(),
+            perception=self.perception.status.to_dict() if self.perception is not None else {},
+            audio=self.audio_worker.status() if self.audio_worker is not None else {},
+            presenter=self.presenter_state(), layout_state=self.layout_state(),
         )
         self.on_activity(self.activity)
 
@@ -1442,6 +1637,10 @@ class Monitor:
         if self._watchdog_thread is None:
             self._watchdog_thread = threading.Thread(target=self._watchdog_loop, name="studio-monitor-watchdog", daemon=True)
             self._watchdog_thread.start()
+        if self.perception is not None:
+            self.perception.start()
+        if self.audio_worker is not None:
+            self.audio_worker.start()
         try:
             while not self._stop.is_set():
                 started = self.clock()
@@ -1464,6 +1663,10 @@ class Monitor:
                 self.hub_sync.stop()
             if self.command_poller is not None:
                 self.command_poller.stop()
+            if self.perception is not None:
+                self.perception.stop()
+            if self.audio_worker is not None:
+                self.audio_worker.stop()
             self._emit_status(Status.STOPPED, "")
             self.on_event("monitoring stopped")
 

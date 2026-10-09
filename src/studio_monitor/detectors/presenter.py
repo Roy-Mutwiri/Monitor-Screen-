@@ -100,6 +100,8 @@ class PresenterObservation:
     region_changed: bool = True    # presenter region pixels differ from the previous fresh frame
     frame_changed_elsewhere: bool = True   # rest of the frame changed (so a frozen region is meaningful)
     note: str = ""
+    faces: int = 0
+    ambiguous: str = ""                    # "multiple faces" | "face too small" | "" — presence not judged when set
 
 
 class PresenterAnalyzer:
@@ -107,8 +109,10 @@ class PresenterAnalyzer:
 
     FROZEN_EPSILON = 0.0015   # mean abs luminance diff (0..1) below which the region counts as pixel-identical
 
-    def __init__(self, backend: FaceDetectorBackend, motion_threshold: float = 0.035, noise_floor: float = 0.012) -> None:
+    def __init__(self, backend: FaceDetectorBackend, motion_threshold: float = 0.035, noise_floor: float = 0.012,
+                 min_face_px: int = 24) -> None:
         self.backend = backend
+        self.min_face_px = min_face_px
         self.motion_threshold = motion_threshold
         self.noise_floor = noise_floor
         self._prev_region: Optional[np.ndarray] = None
@@ -148,6 +152,13 @@ class PresenterAnalyzer:
 
         faces = self.backend.detect(region)
         face = max(faces, key=lambda f: f.box[2] * f.box[3]) if faces else None
+        ambiguous = ""
+        if face is not None and (face.box[2] < self.min_face_px or face.box[3] < self.min_face_px):
+            ambiguous = "face too small for reliable evaluation"
+        elif len(faces) > 1:
+            second = sorted(faces, key=lambda f: f.box[2] * f.box[3])[-2]
+            if second.box[2] * second.box[3] >= 0.5 * face.box[2] * face.box[3]:
+                ambiguous = f"multiple faces ({len(faces)}); presenter ambiguous"
         motion = 0.0
         if face is not None:
             x, y, w, h = face.box
@@ -163,7 +174,7 @@ class PresenterAnalyzer:
         else:
             self._prev_face = self._prev_face_box = None
         return PresenterObservation(valid=True, face=face, motion=motion, region_changed=region_changed,
-                                    frame_changed_elsewhere=frame_changed)
+                                    frame_changed_elsewhere=frame_changed, faces=len(faces), ambiguous=ambiguous)
 
     def reset(self) -> None:
         self._prev_region = self._prev_face = None

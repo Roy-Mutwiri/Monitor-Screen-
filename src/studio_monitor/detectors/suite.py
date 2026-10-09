@@ -107,6 +107,7 @@ class DetectorSuite:
             "AUDIO_SILENCE": SustainedCondition("AUDIO_SILENCE", c.audio_silence_seconds, c.recover_seconds),
         }
         self._grace_until = 0.0
+        self.presenter_state = "unavailable"
         self._last_frame: Optional[np.ndarray] = None
         self.scene_changes = 0
         self.reconnect_episodes = 0
@@ -169,10 +170,18 @@ class DetectorSuite:
                     luma = black_level(frame, box)
                     self._apply(out, "BLACK_PREVIEW", luma < self.cfg.black_luma, True, now, f"luma {luma:.0f}")
                     expected = self.cfg.presenter_expected
-                    absent = obs.face is None and expected and luma >= self.cfg.black_luma
-                    self._apply(out, "FACE_ABSENT", absent, True, now, "no face")
-                    still = obs.face is not None and obs.motion < self.cfg.motion_threshold
-                    self._apply(out, "FACE_MOTION_LOW", still, True, now, f"motion {obs.motion:.3f}")
+                    if obs.ambiguous:
+                        # several comparable faces or a tiny face: report the uncertainty, never pick one silently
+                        self._apply(out, "FACE_ABSENT", False, False, now)
+                        self._apply(out, "FACE_MOTION_LOW", False, False, now)
+                        self.cond["FACE_ABSENT"].last_evidence = obs.ambiguous
+                        self.presenter_state = "unclear: " + obs.ambiguous
+                    else:
+                        absent = obs.face is None and expected and luma >= self.cfg.black_luma
+                        self._apply(out, "FACE_ABSENT", absent, True, now, "no face")
+                        still = obs.face is not None and obs.motion < self.cfg.motion_threshold
+                        self._apply(out, "FACE_MOTION_LOW", still, True, now, f"motion {obs.motion:.3f}")
+                        self.presenter_state = "absent" if obs.face is None else "detected"
                     # a black source repeats identical buffers too; that is BLACK_PREVIEW, not a frozen preview
                     frozen = (not obs.region_changed) and obs.frame_changed_elsewhere and luma >= self.cfg.black_luma
                     self._apply(out, "PREVIEW_FROZEN", frozen, True, now, "region unchanged while frame changed")
@@ -188,6 +197,7 @@ class DetectorSuite:
         else:
             for k in ("BLACK_PREVIEW", "FACE_ABSENT", "FACE_MOTION_LOW", "PREVIEW_FROZEN"):
                 self.cond[k].unknown = True
+            self.presenter_state = "unavailable"
 
         # audio meter
         if self.cfg.audio_enabled and audio_region is not None and frame is not None and valid_frame:

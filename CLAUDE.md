@@ -47,6 +47,11 @@ src/studio_monitor/
   end_request.py                  End-LIVE confirmation dialog: spatial OCR match (heading + End now + body/Cancel within
                                   6 lines), 2-frame confirm, episodes persisted in kv_state; outcomes only from trusted evidence
                                   (engine NOT_LIVE -> ended; fresh LIVE after close -> continued; exit/no capture -> unknown)
+  perception/                     layout discovery = UIA probe (empty for Studio) + OCR word boxes + visual anchors;
+                                  LayoutTracker relocalizes (resize/restart/wholesale change/anchor loss/periodic), worker
+                                  thread with latest-frame slot; LayoutStore caches validated profiles. Never hardcode boxes.
+  audio/                          AudioSourceResolver -> process loopback (works on this PC via comtypes + IAgileObject
+                                  handler) / session meter / input / visual; analyzer never records; no routing changes.
 src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy), services (framework-free logic),
                                   delivery (Telegram routes by token_env), app (API + Jinja dashboard); deploy/ has compose
   account.py                      @username discovery: Interactor protocol (Win32Interactor real), perform_lookup,
@@ -103,5 +108,8 @@ src/hub/                          FastAPI hub: config (env only), db (SQLAlchemy
   PC. VERIFICATION.md is the single place that lists real-world vs synthetic status; keep it current.
 - End-dialog phrases verified with Windows OCR on the operator's real dialog crop (tests/fixtures/private/, git-ignored);
   the committed fixture is synthetic. Never commit private screenshots. Full-window capture with the dialog: unverified.
+- Automatic perception verified on the operator's real frame (private fixture): all core elements located; audio process
+  loopback verified to deliver frames from Studio's media process (silence at the time). Not verified: live state on a real
+  broadcast, non-English Studio, light theme, OmniParser integration beyond the benchmark. The energy VAD is a fallback only.
 - Detectors never evaluate when the broadcast is not LIVE; a 'reconnecting' overlay keeps the LIVE episode open (UNKNOWN,
   not NOT_LIVE) so RECONNECTING can be reported.

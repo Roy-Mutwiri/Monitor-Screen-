@@ -281,6 +281,12 @@ def selectable_windows(system: WindowSystem, own_pid: Optional[int] = None) -> l
 
 
 def looks_like_studio(window: WindowInfo) -> bool:
-    """Heuristic used only to *highlight* likely candidates in the picker."""
-    text = f"{window.title} {window.exe_name}".lower()
-    return "tiktok" in text and ("live" in text or "studio" in text)
+    """Heuristic used only to *highlight* likely candidates in the picker. The monitor's own window carries the
+    Studio name in its title, so the process name decides first and our own process is never a candidate."""
+    if window.pid == os.getpid() or "monitor screen" in (window.title or "").lower():
+        return False
+    exe = (window.exe_name or "").lower()
+    if "tiktok" in exe and ("studio" in exe or "live" in exe):
+        return True
+    text = f"{window.title} {exe}".lower()
+    return "tiktok" in text and ("live" in text or "studio" in text) and not exe.startswith(("python", "studiomonitor"))
